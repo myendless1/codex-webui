@@ -7,23 +7,7 @@
       "endpoint": "127.0.0.1",
       "status": "ready",
       "notes": "Uses the codex command available on this machine."
-    },
-    {
-      "id": "remote-codex",
-      "name": "Remote Codex Host",
-      "kind": "codex-remote",
-      "endpoint": "ws://host:port",
-      "status": "planned",
-      "notes": "Designed for codex app-server or remote-control endpoints."
     }
   ],
-  "hostSettings": {
-    "remote-codex": {
-      "mcp": [],
-      "plugins": {
-        "installed": [],
-        "available": []
-      }
-    }
-  }
+  "hostSettings": {}
 }

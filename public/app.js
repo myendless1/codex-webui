@@ -56,6 +56,7 @@ const state = {
   codexSessions: [],
   attachments: [],
   selectedHost: localStorage.getItem("codex-webui:host") || "local-codex",
+  theme: localStorage.getItem("codex-webui:theme") === "dark" ? "dark" : "light",
   selectedModel: localStorage.getItem("codex-webui:model") || "",
   models: [],
   selectedApproval: localStorage.getItem("codex-webui:approval") || "on-request",
@@ -88,16 +89,16 @@ if (!["mcp", "skills"].includes(state.settingsTab)) {
   localStorage.setItem("codex-webui:settings-tab", state.settingsTab);
 }
 
-if (!["connections", "mcp", "skills"].includes(state.settingsSection)) {
-  state.settingsSection = "connections";
+if (!["mcp", "skills"].includes(state.settingsSection)) {
+  state.settingsSection = "mcp";
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
 }
 
 state.sessions.forEach((session) => {
-  if (!session.hostId) {
-    session.hostId = session.source === "codex" ? "local-codex" : "local-codex";
-  }
+  session.hostId = "local-codex";
 });
+state.selectedHost = "local-codex";
+localStorage.setItem("codex-webui:host", state.selectedHost);
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -244,9 +245,39 @@ function applyBusyState() {
 function renderShell() {
   const settingsView = views.find((view) => view.id === "settings");
   $("[data-nav]").innerHTML = "";
-  $("[data-bottom-nav]").innerHTML = settingsView ? navButton(settingsView) : "";
+  $("[data-bottom-nav]").innerHTML = `${settingsView ? navButton(settingsView) : ""}${renderThemeToggle("rail")}`;
   $("[data-mobile-nav]").innerHTML = views.map((view) => navButton(view)).join("");
+  applyTheme();
   applySidebarState();
+}
+
+function renderThemeToggle(placement = "") {
+  const dark = state.theme === "dark";
+  return `
+    <label class="theme-toggle ${placement ? `theme-toggle-${placement}` : ""}">
+      <span>深色模式</span>
+      <input type="checkbox" data-theme-toggle ${dark ? "checked" : ""}>
+      <span class="theme-switch" aria-hidden="true"><span></span></span>
+    </label>
+  `;
+}
+
+function applyTheme() {
+  const shell = $("[data-app-shell]");
+  if (!shell) {
+    return;
+  }
+  const dark = state.theme === "dark";
+  shell.classList.toggle("theme-dark", dark);
+  shell.classList.toggle("theme-light", !dark);
+  document.body.classList.toggle("theme-dark", dark);
+}
+
+function setTheme(theme) {
+  state.theme = theme === "dark" ? "dark" : "light";
+  localStorage.setItem("codex-webui:theme", state.theme);
+  applyTheme();
+  renderAll();
 }
 
 function navButton(view) {
@@ -265,11 +296,11 @@ function setView(viewId) {
   const view = views.find((item) => item.id === viewId) || views[0];
   state.activeView = view.id;
   localStorage.setItem("codex-webui:view", view.id);
+  $("[data-app-shell]")?.classList.toggle("settings-open", view.id === "settings");
   if (window.location.hash !== `#${view.id}`) {
     history.replaceState(null, "", `#${view.id}`);
   }
-  $("[data-active-title]").textContent = view.title;
-  $("[data-active-kicker]").textContent = view.kicker;
+  renderTopbar();
   $$(".view").forEach((section) => section.classList.toggle("active", section.dataset.view === view.id));
   $$(".nav-button").forEach((button) => button.classList.toggle("active", button.dataset.navTarget === view.id));
   renderSidebarContent();
@@ -378,6 +409,10 @@ function renderAll() {
 function renderTopbar() {
   $("[data-codex-version]").textContent = state.status?.version || "checking";
   $("[data-codex-health]").textContent = state.status?.available ? "ready" : "needs attention";
+  const view = views.find((item) => item.id === state.activeView) || views[0];
+  const session = state.activeView === "console" ? activeSession() : null;
+  $("[data-active-title]").textContent = session?.title || (state.activeView === "console" ? "新对话" : view.title);
+  $("[data-active-kicker]").textContent = session ? selectedHostName() : view.kicker;
 }
 
 function renderSummary() {
@@ -398,6 +433,7 @@ function renderConsole() {
   const session = activeSession();
   const container = $('[data-view="console"]');
   const canRun = hostCanRunCodex(state.selectedHost);
+  renderTopbar();
 
   if (!session) {
     disconnectTerminal();
@@ -411,43 +447,21 @@ function renderConsole() {
       <div class="mobile-session-panel">${renderSessionManager(session)}</div>
       <section class="workbench-surface">
         <div class="workbench-header">
-          <div class="session-heading">
-            <h3 title="${escapeHtml(session.title)}">${escapeHtml(session.title)}</h3>
-            <p>${escapeHtml(selectedHostName())} · ${escapeHtml(session.source === "codex" ? "native Codex session" : "web session")}</p>
-          </div>
-          <div class="toolbar-row">
-            <button class="button ghost slim" type="button" data-action="clear-session">清空</button>
-            <button class="button warn slim" type="button" data-delete-session="${escapeHtml(session.id)}">${session.source === "codex" ? "归档" : "删除"}</button>
+          <p class="session-location" title="${escapeHtml(session.cwd || locationWorkspace())}">${escapeHtml(session.cwd || locationWorkspace())}</p>
+          <div class="toolbar-row session-actions">
+            <button class="header-action" type="button" data-action="clear-session" title="清空会话" aria-label="清空会话">⌫</button>
+            <button class="header-action danger" type="button" data-delete-session="${escapeHtml(session.id)}" title="${session.source === "codex" ? "归档会话" : "删除会话"}" aria-label="${session.source === "codex" ? "归档会话" : "删除会话"}">×</button>
           </div>
         </div>
 
         <div class="workbench-body ${state.terminalCollapsed ? "terminal-collapsed" : ""}">
           <div class="conversation-column">
             <div class="transcript" data-transcript>
-              ${renderTranscript(session)}
+              <div class="transcript-inner">${renderTranscript(session)}</div>
             </div>
 
             <form class="composer" data-composer>
-              <div class="composer-controls">
-                <label>模型
-                  <select name="model" data-preference="model">
-                    ${modelOptions().map((model) => `<option value="${escapeHtml(model)}" ${model === state.selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
-                  </select>
-                </label>
-                <label>审批
-                  <select name="approval" data-preference="approval" ${session.source === "codex" ? "disabled" : ""}>
-                    ${approvalOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedApproval ? "selected" : ""}>${item.label}</option>`).join("")}
-                  </select>
-                </label>
-                <label>沙箱
-                  <select name="sandbox" data-preference="sandbox" ${session.source === "codex" ? "disabled" : ""}>
-                    ${sandboxOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedSandbox ? "selected" : ""}>${item.label}</option>`).join("")}
-                  </select>
-                </label>
-                <label>工作目录
-                  <input name="cwd" value="${escapeHtml(session.cwd || locationWorkspace())}" aria-label="工作目录" ${session.source === "codex" ? "readonly" : ""}>
-                </label>
-              </div>
+              <input type="hidden" name="cwd" value="${escapeHtml(session.cwd || locationWorkspace())}">
               <div class="prompt-box">
                 <textarea name="prompt" placeholder="${canRun ? (session.source === "codex" ? "继续这个会话..." : "输入任务...") : "该主机的执行适配器尚未接入。"}" ${canRun ? "required" : "disabled"}></textarea>
                 <div class="prompt-actions">
@@ -457,6 +471,24 @@ function renderConsole() {
                   </label>
                   <button class="round-action send-action" type="submit" title="发送" aria-label="发送" ${canRun ? "" : "disabled"}>↑</button>
                 </div>
+              </div>
+              <div class="composer-controls" aria-label="会话选项">
+                <label class="compact-control"><span>模型</span>
+                  <select name="model" data-preference="model">
+                    ${modelOptions().map((model) => `<option value="${escapeHtml(model)}" ${model === state.selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
+                  </select>
+                </label>
+                <label class="compact-control"><span>审批</span>
+                  <select name="approval" data-preference="approval" ${session.source === "codex" ? "disabled" : ""}>
+                    ${approvalOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedApproval ? "selected" : ""}>${item.label}</option>`).join("")}
+                  </select>
+                </label>
+                <label class="compact-control"><span>沙箱</span>
+                  <select name="sandbox" data-preference="sandbox" ${session.source === "codex" ? "disabled" : ""}>
+                    ${sandboxOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedSandbox ? "selected" : ""}>${item.label}</option>`).join("")}
+                  </select>
+                </label>
+                <span class="composer-directory" title="${escapeHtml(session.cwd || locationWorkspace())}">${escapeHtml(session.cwd || locationWorkspace())}</span>
               </div>
               <div class="attachment-tray">
                 ${state.attachments.map((attachment) => `
@@ -478,9 +510,9 @@ function renderConsole() {
                   <strong>终端</strong>
                   <span data-terminal-status>${escapeHtml(terminalStatusText(session))}</span>
                 </div>
-                <div class="toolbar-row">
-                  <button class="button ghost slim" type="button" data-action="toggle-terminal">隐藏</button>
-                  <button class="button ghost slim" type="button" data-action="restart-terminal">重连</button>
+                <div class="terminal-actions">
+                  <button class="terminal-action" type="button" data-action="restart-terminal" title="重新连接终端" aria-label="重新连接终端">↻</button>
+                  <button class="terminal-action" type="button" data-action="toggle-terminal" title="隐藏终端" aria-label="隐藏终端">→</button>
                 </div>
               </div>
               <div class="terminal-body">
@@ -514,26 +546,8 @@ function renderNewSessionSurface(canRun) {
       <div class="mobile-session-panel">${renderSessionManager(null)}</div>
       <section class="new-session-surface">
         <div class="new-session-shell">
-          <p class="eyebrow">New Session</p>
-          <h3>新会话</h3>
+          <h3>新对话</h3>
           <form class="composer new-session-form" data-new-session-form>
-            <div class="composer-controls">
-              <label>模型
-                <select name="model" data-preference="model">
-                  ${modelOptions().map((model) => `<option value="${escapeHtml(model)}" ${model === state.selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
-                </select>
-              </label>
-              <label>审批
-                <select name="approval" data-preference="approval">
-                  ${approvalOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedApproval ? "selected" : ""}>${item.label}</option>`).join("")}
-                </select>
-              </label>
-              <label>沙箱
-                <select name="sandbox" data-preference="sandbox">
-                  ${sandboxOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedSandbox ? "selected" : ""}>${item.label}</option>`).join("")}
-                </select>
-              </label>
-            </div>
             <label class="cwd-field">工作目录
               <input type="hidden" name="cwd" value="${escapeHtml(state.newSessionCwd)}" required>
               <button class="directory-select" type="button" data-action="open-directory-picker" ${canRun ? "" : "disabled"}>
@@ -541,8 +555,25 @@ function renderNewSessionSurface(canRun) {
                 <span class="directory-select-action">选择</span>
               </button>
             </label>
+            <div class="composer-controls">
+              <label class="compact-control"><span>模型</span>
+                <select name="model" data-preference="model">
+                  ${modelOptions().map((model) => `<option value="${escapeHtml(model)}" ${model === state.selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
+                </select>
+              </label>
+              <label class="compact-control"><span>审批</span>
+                <select name="approval" data-preference="approval">
+                  ${approvalOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedApproval ? "selected" : ""}>${item.label}</option>`).join("")}
+                </select>
+              </label>
+              <label class="compact-control"><span>沙箱</span>
+                <select name="sandbox" data-preference="sandbox">
+                  ${sandboxOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedSandbox ? "selected" : ""}>${item.label}</option>`).join("")}
+                </select>
+              </label>
+            </div>
             <div class="composer-row">
-              <button class="button primary" type="submit" ${canRun ? "" : "disabled"}>创建会话</button>
+              <button class="button primary create-session-button" type="submit" ${canRun ? "" : "disabled"}>创建会话</button>
             </div>
           </form>
         </div>
@@ -671,30 +702,33 @@ function renderSessionItem(item, active) {
 }
 
 function renderSettingsSidebar() {
+  const host = hostById();
   return `
     <section class="settings-sidebar-panel">
-      <div class="settings-sidebar-header">
-        <div>
-          <h3>设置</h3>
-          <p>${state.hosts.length} connections</p>
-        </div>
+      <button class="settings-back-link" type="button" data-action="back-to-console"><span aria-hidden="true">←</span> 返回应用</button>
+      <div class="settings-host-selector">
+        <span class="settings-host-icon" aria-hidden="true">◎</span>
+        <strong>${escapeHtml(host.name)}</strong>
+        <span class="settings-ready-dot" aria-hidden="true"></span>
       </div>
       <div class="settings-sidebar-list">
-        <button class="settings-connection-button ${state.settingsSection === "connections" ? "active" : ""}" type="button" data-settings-section="connections">
-          <span class="nav-icon">↔</span>
-          <span>
-            <strong>连接</strong>
-            <small>Hosts and adapters</small>
-          </span>
+        <p class="settings-nav-label">集成</p>
+        <button class="settings-connection-button ${state.settingsSection === "mcp" ? "active" : ""}" type="button" data-settings-section="mcp">
+          <span class="nav-icon">M</span>
+          <span><strong>MCP</strong></span>
         </button>
-        ${state.hosts.map((host) => renderSettingsHostGroup(host)).join("")}
+        <button class="settings-connection-button ${state.settingsSection === "skills" ? "active" : ""}" type="button" data-settings-section="skills">
+          <span class="nav-icon">S</span>
+          <span><strong>Skill</strong></span>
+        </button>
       </div>
+      <div class="settings-sidebar-footer">${renderThemeToggle("settings")}</div>
     </section>
   `;
 }
 
 function renderSettingsHostGroup(host) {
-  const collapsed = state.collapsedHostSettings[host.id] === true;
+  const collapsed = state.collapsedHostSettings[host.id] !== false;
   const isActiveHost = host.id === state.selectedHost && state.settingsSection !== "connections";
   return `
     <section class="settings-sidebar-group ${collapsed ? "collapsed" : ""}">
@@ -717,13 +751,13 @@ async function toggleSettingsHost(hostId) {
   if (!state.hosts.some((host) => host.id === hostId)) {
     return;
   }
-  state.collapsedHostSettings[hostId] = state.collapsedHostSettings[hostId] !== true;
+  state.collapsedHostSettings[hostId] = state.collapsedHostSettings[hostId] === false;
   saveCollapsedHostSettings();
   renderSidebarContent();
 }
 
 async function selectSettingsSection(section, hostId = state.selectedHost) {
-  const nextSection = ["connections", "mcp", "skills"].includes(section) ? section : "connections";
+  const nextSection = ["mcp", "skills"].includes(section) ? section : "mcp";
   state.settingsSection = nextSection;
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
   if (nextSection !== "connections" && state.hosts.some((host) => host.id === hostId) && hostId !== state.selectedHost) {
@@ -1289,19 +1323,14 @@ function renderSettings() {
     return;
   }
   const host = hostById();
-  const sectionTitle = state.settingsSection === "connections" ? "连接" : state.settingsSection === "skills" ? "Skill" : "MCP";
-  const sectionSubtitle = state.settingsSection === "connections"
-    ? "Host adapters and connection profiles"
-    : `${host.name} · ${host.kind} · ${host.endpoint || ""}`;
+  const sectionTitle = state.settingsSection === "skills" ? "Skill" : "MCP";
+  const sectionSubtitle = `${host.name} · ${host.endpoint || ""}`;
   container.innerHTML = `
-    ${renderSummary()}
     <div class="mobile-settings-panel">${renderSettingsSidebar()}</div>
     <section class="settings-stage">
       <div class="settings-stage-header">
         <div class="settings-title-row">
-          <button class="button ghost slim" type="button" data-action="back-to-console">返回</button>
           <div>
-            <p class="eyebrow">Settings</p>
             <h3>${escapeHtml(sectionTitle)}</h3>
             <p class="fine">${escapeHtml(sectionSubtitle)}</p>
           </div>
@@ -1357,9 +1386,6 @@ function settingsTabLabel(tab) {
 }
 
 function renderSettingsContent() {
-  if (state.settingsSection === "connections") {
-    return renderConnectionSettingsContent();
-  }
   if (state.settingsSection === "skills") {
     return renderSkillSettingsContent();
   }
@@ -1368,7 +1394,7 @@ function renderSettingsContent() {
 
 function renderConnectionSettingsContent() {
   return `
-    <section class="panel connection-panel">
+    <section class="panel connection-panel settings-section-block">
       <div class="panel-header">
         <div>
           <h3>连接</h3>
@@ -1391,8 +1417,8 @@ function renderMcpSettingsContent() {
   const host = hostById();
   const local = hostCanRunCodex(host.id);
   return `
-    <div class="manager-grid">
-      <section class="panel">
+    <div class="manager-grid settings-manager-grid">
+      <section class="panel settings-section-block">
         <div class="panel-header">
           <div>
             <h3>添加 MCP</h3>
@@ -1414,7 +1440,7 @@ function renderMcpSettingsContent() {
           </form>
         </div>
       </section>
-      <section class="panel">
+      <section class="panel settings-section-block">
         <div class="panel-header">
           <div>
             <h3>已配置服务器</h3>
@@ -1434,7 +1460,7 @@ function renderSkillSettingsContent() {
   const plugins = filteredPlugins();
   const localSkills = filteredLocalSkills();
   return `
-    <section class="panel">
+    <section class="panel settings-section-block skill-settings-block">
       <div class="panel-header">
         <div>
           <h3>Skill 与 Plugin</h3>
@@ -2107,6 +2133,11 @@ async function handleDocumentSubmit(event) {
 
 function handleDocumentInput(event) {
   const target = event.target;
+  if (target.matches("[data-theme-toggle]")) {
+    setTheme(target.checked ? "dark" : "light");
+    return;
+  }
+
   if (target.matches("[data-file-input]")) {
     uploadFiles(target.files).catch(reportClientError);
     target.value = "";

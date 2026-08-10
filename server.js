@@ -43,22 +43,6 @@ const defaultState = {
       endpoint: "127.0.0.1",
       status: "ready",
       notes: "Uses the codex command available on this machine."
-    },
-    {
-      id: "claude-code",
-      name: "Claude Code",
-      kind: "planned",
-      endpoint: "local adapter",
-      status: "planned",
-      notes: "Reserved adapter slot for a later Claude Code bridge."
-    },
-    {
-      id: "remote-codex",
-      name: "Remote Codex Host",
-      kind: "codex-remote",
-      endpoint: "ws://host:port",
-      status: "planned",
-      notes: "Designed for codex app-server or remote-control endpoints."
     }
   ],
   hostSettings: {}
@@ -269,10 +253,12 @@ async function saveState(state) {
 }
 
 function normalizeWebuiState(state) {
-  state.hosts = asArray(state.hosts).length ? state.hosts : structuredClone(defaultState.hosts);
-  state.hostSettings = state.hostSettings && typeof state.hostSettings === "object" && !Array.isArray(state.hostSettings)
-    ? state.hostSettings
-    : {};
+  const configuredLocal = asArray(state.hosts).find((hostEntry) => hostEntry?.id === "local-codex");
+  state.hosts = [{ ...defaultState.hosts[0], ...(configuredLocal || {}), id: "local-codex", kind: "codex-local" }];
+  const storedSettings = state.hostSettings && typeof state.hostSettings === "object" && !Array.isArray(state.hostSettings)
+    ? state.hostSettings["local-codex"]
+    : undefined;
+  state.hostSettings = storedSettings ? { "local-codex": storedSettings } : {};
   return state;
 }
 
@@ -1258,9 +1244,8 @@ async function route(req, res) {
     if (req.method === "POST" && pathname === "/api/plugins/remove") return mutatePlugin(req, res, "remove");
     if (req.method === "GET" && pathname === "/api/skills/local") return listLocalSkills(res);
     if (req.method === "GET" && pathname === "/api/hosts") return listHosts(res);
-    if (req.method === "POST" && pathname === "/api/hosts") return addHost(req, res);
-    if (req.method === "DELETE" && pathname.startsWith("/api/hosts/")) {
-      return removeHost(res, decodeURIComponent(pathname.slice("/api/hosts/".length)));
+    if ((req.method === "POST" && pathname === "/api/hosts") || (req.method === "DELETE" && pathname.startsWith("/api/hosts/"))) {
+      return sendError(res, 410, "Remote host adapters are temporarily disabled.");
     }
     if (req.method === "POST" && pathname === "/api/terminal/run") return runTerminalCommand(req, res);
     if (req.method === "POST" && pathname === "/api/codex/run") return runCodexStream(req, res);
