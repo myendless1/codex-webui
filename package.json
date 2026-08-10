@@ -26,7 +26,8 @@
     "dev:lan": "HOST=0.0.0.0 node server.js",
     "start": "node server.js",
     "check": "node --check server.js && node --check public/app.js",
-    "prepack": "npm run check"
+    "test": "npm run check",
+    "prepack": "npm test"
   },
   "engines": {
     "node": ">=20"
