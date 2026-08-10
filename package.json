@@ -1,6 +1,6 @@
 {
   "name": "@zxm-bupt/codex-webui",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Browser-based local console for Codex CLI, MCP, skills, and terminal sessions.",
   "type": "module",
   "bin": {
