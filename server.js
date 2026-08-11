@@ -1095,6 +1095,9 @@ async function runCodexStream(req, res) {
   if (body.model) {
     args.push("-m", String(body.model));
   }
+  if (["minimal", "low", "medium", "high", "xhigh"].includes(body.effort)) {
+    args.push("-c", `model_reasoning_effort="${body.effort}"`);
+  }
   if (body.profile) {
     args.push("-p", String(body.profile));
   }

@@ -1,5 +1,21 @@
 import { Terminal } from "/vendor/@xterm/xterm/lib/xterm.mjs";
 import { FitAddon } from "/vendor/@xterm/addon-fit/lib/addon-fit.mjs";
+import { marked } from "/vendor/marked/lib/marked.esm.js";
+import DOMPurify from "/vendor/dompurify/dist/purify.es.mjs";
+
+marked.setOptions({ gfm: true, breaks: true });
+
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A" && node.getAttribute("href")) {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
+function renderMarkdown(content) {
+  const html = marked.parse(String(content || ""));
+  return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+}
 
 const views = [
   { id: "console", icon: "C", title: "Codex 会话", subtitle: "浏览器工作台", kicker: "Workspace" },
@@ -61,6 +77,10 @@ const state = {
   models: [],
   selectedApproval: localStorage.getItem("codex-webui:approval") || "on-request",
   selectedSandbox: localStorage.getItem("codex-webui:sandbox") || "workspace-write",
+  selectedEffort: localStorage.getItem("codex-webui:effort") || "",
+  composerMenu: null,
+  modelMenuPanel: "root",
+  modelMenuAdvanced: false,
   skillFilter: "all",
   skillQuery: "",
   mcpTransport: "http",
@@ -448,10 +468,6 @@ function renderConsole() {
       <section class="workbench-surface">
         <div class="workbench-header">
           <p class="session-location" title="${escapeHtml(session.cwd || locationWorkspace())}">${escapeHtml(session.cwd || locationWorkspace())}</p>
-          <div class="toolbar-row session-actions">
-            <button class="header-action" type="button" data-action="clear-session" title="清空会话" aria-label="清空会话">⌫</button>
-            <button class="header-action danger" type="button" data-delete-session="${escapeHtml(session.id)}" title="${session.source === "codex" ? "归档会话" : "删除会话"}" aria-label="${session.source === "codex" ? "归档会话" : "删除会话"}">×</button>
-          </div>
         </div>
 
         <div class="workbench-body ${state.terminalCollapsed ? "terminal-collapsed" : ""}">
@@ -462,34 +478,6 @@ function renderConsole() {
 
             <form class="composer" data-composer>
               <input type="hidden" name="cwd" value="${escapeHtml(session.cwd || locationWorkspace())}">
-              <div class="prompt-box">
-                <textarea name="prompt" placeholder="${canRun ? (session.source === "codex" ? "继续这个会话..." : "输入任务...") : "该主机的执行适配器尚未接入。"}" ${canRun ? "required" : "disabled"}></textarea>
-                <div class="prompt-actions">
-                  <label class="round-action file-button" title="上传文件" aria-label="上传文件">
-                    +
-                    <input type="file" data-file-input multiple ${canRun ? "" : "disabled"}>
-                  </label>
-                  <button class="round-action send-action" type="submit" title="发送" aria-label="发送" ${canRun ? "" : "disabled"}>↑</button>
-                </div>
-              </div>
-              <div class="composer-controls" aria-label="会话选项">
-                <label class="compact-control"><span>模型</span>
-                  <select name="model" data-preference="model">
-                    ${modelOptions().map((model) => `<option value="${escapeHtml(model)}" ${model === state.selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
-                  </select>
-                </label>
-                <label class="compact-control"><span>审批</span>
-                  <select name="approval" data-preference="approval" ${session.source === "codex" ? "disabled" : ""}>
-                    ${approvalOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedApproval ? "selected" : ""}>${item.label}</option>`).join("")}
-                  </select>
-                </label>
-                <label class="compact-control"><span>沙箱</span>
-                  <select name="sandbox" data-preference="sandbox" ${session.source === "codex" ? "disabled" : ""}>
-                    ${sandboxOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedSandbox ? "selected" : ""}>${item.label}</option>`).join("")}
-                  </select>
-                </label>
-                <span class="composer-directory" title="${escapeHtml(session.cwd || locationWorkspace())}">${escapeHtml(session.cwd || locationWorkspace())}</span>
-              </div>
               <div class="attachment-tray">
                 ${state.attachments.map((attachment) => `
                   <span class="file-chip">
@@ -497,6 +485,12 @@ function renderConsole() {
                     <button type="button" title="移除附件" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
                   </span>
                 `).join("")}
+              </div>
+              <div class="prompt-shell">
+                <textarea name="prompt" placeholder="${canRun ? "随心输入" : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "required" : "disabled"}></textarea>
+                <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="${session.source === "codex"}">
+                  ${renderComposerFooter({ canRun, lockPermissions: session.source === "codex" })}
+                </div>
               </div>
             </form>
           </div>
@@ -546,34 +540,25 @@ function renderNewSessionSurface(canRun) {
       <div class="mobile-session-panel">${renderSessionManager(null)}</div>
       <section class="new-session-surface">
         <div class="new-session-shell">
-          <h3>新对话</h3>
           <form class="composer new-session-form" data-new-session-form>
-            <label class="cwd-field">工作目录
-              <input type="hidden" name="cwd" value="${escapeHtml(state.newSessionCwd)}" required>
-              <button class="directory-select" type="button" data-action="open-directory-picker" ${canRun ? "" : "disabled"}>
-                <span class="directory-select-path">${escapeHtml(state.newSessionCwd || "选择工作目录")}</span>
-                <span class="directory-select-action">选择</span>
-              </button>
-            </label>
-            <div class="composer-controls">
-              <label class="compact-control"><span>模型</span>
-                <select name="model" data-preference="model">
-                  ${modelOptions().map((model) => `<option value="${escapeHtml(model)}" ${model === state.selectedModel ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}
-                </select>
-              </label>
-              <label class="compact-control"><span>审批</span>
-                <select name="approval" data-preference="approval">
-                  ${approvalOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedApproval ? "selected" : ""}>${item.label}</option>`).join("")}
-                </select>
-              </label>
-              <label class="compact-control"><span>沙箱</span>
-                <select name="sandbox" data-preference="sandbox">
-                  ${sandboxOptions().map((item) => `<option value="${item.value}" ${item.value === state.selectedSandbox ? "selected" : ""}>${item.label}</option>`).join("")}
-                </select>
-              </label>
+            <input type="hidden" name="cwd" value="${escapeHtml(state.newSessionCwd)}">
+            <button class="project-select" type="button" data-action="open-directory-picker" ${canRun ? "" : "disabled"}>
+              <span class="project-select-icon">${iconFolder}</span>
+              <span class="project-select-path">${escapeHtml(state.newSessionCwd || "选择项目")}</span>
+            </button>
+            <div class="attachment-tray">
+              ${state.attachments.map((attachment) => `
+                <span class="file-chip">
+                  <span>${escapeHtml(attachment.name)}</span>
+                  <button type="button" title="移除附件" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
+                </span>
+              `).join("")}
             </div>
-            <div class="composer-row">
-              <button class="button primary create-session-button" type="submit" ${canRun ? "" : "disabled"}>创建会话</button>
+            <div class="prompt-shell">
+              <textarea name="prompt" placeholder="${canRun ? "随心输入" : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "" : "disabled"}></textarea>
+              <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="false">
+                ${renderComposerFooter({ canRun, lockPermissions: false })}
+              </div>
             </div>
           </form>
         </div>
@@ -692,12 +677,17 @@ function renderSessionManager(active, placement = "content") {
 }
 
 function renderSessionItem(item, active) {
+  const isCodex = item.source === "codex";
+  const actionLabel = isCodex ? "归档聊天" : "删除聊天";
   return `
-    <button class="session-item ${item.id === active?.id ? "active" : ""}" type="button" data-session-id="${item.id}" title="${escapeHtml(item.title)}">
-      <span class="badge ${item.source === "codex" ? "ok" : ""}">${item.source === "codex" ? "codex" : "webui"}</span>
-      <strong class="session-title">${escapeHtml(item.title)}</strong>
-      <span class="session-meta">${item.messageCount ?? item.messages.length} · ${escapeHtml(formatDate(item.updatedAt || item.createdAt))}</span>
-    </button>
+    <div class="session-item ${item.id === active?.id ? "active" : ""}">
+      <button class="session-item-select" type="button" data-session-id="${item.id}" title="${escapeHtml(item.title)}">
+        <span class="session-title">${escapeHtml(item.title)}</span>
+      </button>
+      <button class="session-item-action" type="button" data-delete-session="${escapeHtml(item.id)}" title="${actionLabel}" aria-label="${actionLabel}">
+        ${isCodex ? iconArchive : iconTrash}
+      </button>
+    </div>
   `;
 }
 
@@ -770,10 +760,13 @@ async function selectSettingsSection(section, hostId = state.selectedHost) {
 
 function renderMessage(message) {
   const content = message.content || (message.role === "assistant" && state.busy ? "..." : "");
+  const body = message.role === "assistant"
+    ? `<div class="markdown-body">${renderMarkdown(content)}</div>`
+    : `<pre>${escapeHtml(content)}</pre>`;
   return `
     <article class="message ${message.role}">
       <strong>${escapeHtml(roleName(message.role))}</strong>
-      <pre>${escapeHtml(content)}</pre>
+      ${body}
     </article>
   `;
 }
@@ -788,20 +781,188 @@ function modelOptions() {
   return [...new Set([state.selectedModel, ...state.models, ...fallbackModels].filter(Boolean))];
 }
 
+const iconHand = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 12V5.5a1.5 1.5 0 0 1 3 0V11m0-6.5v-1a1.5 1.5 0 0 1 3 0V11m0-5.5a1.5 1.5 0 0 1 3 0V13m0-4a1.5 1.5 0 0 1 3 0v5a7 7 0 0 1-7 7h-1.2a7 7 0 0 1-5.9-3.2L4.2 14a1.6 1.6 0 0 1 2.6-1.8L8 14"/></svg>`;
+const iconAuto = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.5c.4-1.2 2.4-1.4 3.4-.4s.4 2.4-.9 2.9c-1 .4-1.5 1-1.5 2"/><circle cx="10.5" cy="16.5" r="0.3" fill="currentColor"/></svg>`;
+const iconNever = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8.5 12.5 2.4 2.4 4.6-5.4"/></svg>`;
+const iconCheck = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m5 12.5 4.5 4.5L19 7.5"/></svg>`;
+const iconChevron = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>`;
+const iconFolder = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>`;
+const iconArchive = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="4.5" rx="1"/><path d="M5 9v8.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/></svg>`;
+const iconTrash = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6.5h15M9.5 6.5v-1a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v1M6.5 6.5l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9l.8-12M10 10.5v6M14 10.5v6"/></svg>`;
+
 function approvalOptions() {
   return [
-    { value: "on-request", label: "on-request" },
-    { value: "untrusted", label: "untrusted" },
-    { value: "never", label: "never" }
+    { value: "on-request", label: "请求批准", description: "编辑外部文件和使用互联网时始终询问", icon: iconHand },
+    { value: "untrusted", label: "帮我批准", description: "仅对检测到的风险操作请求批准", icon: iconAuto },
+    { value: "never", label: "从不询问", description: "不再询问，自动执行所有操作", icon: iconNever }
   ];
+}
+
+function approvalMeta(value = state.selectedApproval) {
+  return approvalOptions().find((item) => item.value === value) || approvalOptions()[0];
 }
 
 function sandboxOptions() {
   return [
-    { value: "workspace-write", label: "workspace-write" },
-    { value: "read-only", label: "read-only" },
-    { value: "danger-full-access", label: "danger-full-access" }
+    { value: "workspace-write", label: "工作区可写", description: "允许在工作目录内修改文件" },
+    { value: "read-only", label: "只读", description: "只允许读取，不允许修改文件" },
+    { value: "danger-full-access", label: "完全访问", description: "无沙箱限制，谨慎使用" }
   ];
+}
+
+function effortOptions() {
+  return [
+    { value: "", label: "默认" },
+    { value: "low", label: "低" },
+    { value: "medium", label: "中" },
+    { value: "high", label: "高" },
+    { value: "xhigh", label: "极高" }
+  ];
+}
+
+function effortLabel(value = state.selectedEffort) {
+  return (effortOptions().find((item) => item.value === value) || effortOptions()[0]).label;
+}
+
+function modelDisplayName(model = state.selectedModel) {
+  const raw = String(model || "").trim();
+  if (!raw) {
+    return "默认模型";
+  }
+  const segments = raw.replace(/^gpt-/, "").split("-").filter(Boolean);
+  const pretty = segments
+    .map((segment) => (/^[a-z]/i.test(segment) && segment.length > 2 ? segment[0].toUpperCase() + segment.slice(1) : segment))
+    .join(" ");
+  return pretty || raw;
+}
+
+function composerTriggerLabel() {
+  const effort = state.selectedEffort ? ` ${effortLabel()}` : "";
+  return `${modelDisplayName()}${effort}`;
+}
+
+function renderApprovalMenu(lockPermissions) {
+  return `
+    <div class="composer-menu approval-menu" data-composer-menu>
+      <p class="composer-menu-title">应如何批准 Codex 操作？</p>
+      ${approvalOptions().map((option) => `
+        <button class="menu-option" type="button" data-approval-option="${option.value}" ${lockPermissions ? "disabled" : ""}>
+          <span class="menu-option-icon">${option.icon}</span>
+          <span class="menu-option-copy">
+            <strong>${escapeHtml(option.label)}</strong>
+            <small>${escapeHtml(option.description)}</small>
+          </span>
+          <span class="menu-option-check">${option.value === state.selectedApproval ? iconCheck : ""}</span>
+        </button>
+      `).join("")}
+      ${lockPermissions ? `<p class="composer-menu-note">Codex 原生会话继续沿用创建时的批准策略。</p>` : ""}
+    </div>
+  `;
+}
+
+function renderModelMenu(lockPermissions) {
+  if (state.modelMenuPanel === "models") {
+    return `
+      <div class="composer-menu model-menu" data-composer-menu>
+        <button class="menu-row menu-back" type="button" data-action="model-menu-root"><span class="menu-back-arrow">${iconChevron}</span>模型</button>
+        <div class="menu-scroll">
+          ${modelOptions().map((model) => `
+            <button class="menu-option compact" type="button" data-model-option="${escapeHtml(model)}" title="${escapeHtml(model)}">
+              <span class="menu-option-copy"><strong>${escapeHtml(modelDisplayName(model))}</strong><small>${escapeHtml(model)}</small></span>
+              <span class="menu-option-check">${model === state.selectedModel ? iconCheck : ""}</span>
+            </button>
+          `).join("")}
+        </div>
+      </div>
+    `;
+  }
+  if (state.modelMenuPanel === "effort") {
+    return `
+      <div class="composer-menu model-menu" data-composer-menu>
+        <button class="menu-row menu-back" type="button" data-action="model-menu-root"><span class="menu-back-arrow">${iconChevron}</span>推理强度</button>
+        ${effortOptions().map((option) => `
+          <button class="menu-option compact" type="button" data-effort-option="${option.value}">
+            <span class="menu-option-copy"><strong>${escapeHtml(option.label)}</strong></span>
+            <span class="menu-option-check">${option.value === state.selectedEffort ? iconCheck : ""}</span>
+          </button>
+        `).join("")}
+      </div>
+    `;
+  }
+  return `
+    <div class="composer-menu model-menu" data-composer-menu>
+      <button class="menu-row" type="button" data-action="model-menu-models">
+        <span>模型</span>
+        <span class="menu-row-value">${escapeHtml(modelDisplayName())}${iconChevron}</span>
+      </button>
+      <button class="menu-row" type="button" data-action="model-menu-effort">
+        <span>推理强度</span>
+        <span class="menu-row-value">${escapeHtml(effortLabel())}${iconChevron}</span>
+      </button>
+      <div class="menu-divider"></div>
+      <button class="menu-row subtle" type="button" data-action="model-menu-advanced">
+        <span>高级</span>
+        <span class="menu-row-value">${state.modelMenuAdvanced ? "⌃" : "⌄"}</span>
+      </button>
+      ${state.modelMenuAdvanced ? `
+        <p class="composer-menu-caption">沙箱</p>
+        ${sandboxOptions().map((option) => `
+          <button class="menu-option compact" type="button" data-sandbox-option="${option.value}" ${lockPermissions ? "disabled" : ""}>
+            <span class="menu-option-copy"><strong>${escapeHtml(option.label)}</strong><small>${escapeHtml(option.description)}</small></span>
+            <span class="menu-option-check">${option.value === state.selectedSandbox ? iconCheck : ""}</span>
+          </button>
+        `).join("")}
+      ` : ""}
+    </div>
+  `;
+}
+
+function renderComposerFooter(flags = {}) {
+  const canRun = flags.canRun !== false;
+  const lockPermissions = flags.lockPermissions === true;
+  const meta = approvalMeta();
+  return `
+    <input type="hidden" name="model" value="${escapeHtml(state.selectedModel)}">
+    <input type="hidden" name="approval" value="${escapeHtml(state.selectedApproval)}">
+    <input type="hidden" name="sandbox" value="${escapeHtml(state.selectedSandbox)}">
+    <input type="hidden" name="effort" value="${escapeHtml(state.selectedEffort)}">
+    <div class="composer-toolbar">
+      <div class="composer-toolbar-side">
+        <label class="round-action file-button" title="上传文件" aria-label="上传文件">
+          +
+          <input type="file" data-file-input multiple ${canRun ? "" : "disabled"}>
+        </label>
+        <button class="approval-pill ${state.composerMenu === "approval" ? "open" : ""}" type="button" data-action="toggle-approval-menu" title="${lockPermissions ? "Codex 原生会话沿用创建时的批准策略" : "批准策略"}" ${canRun ? "" : "disabled"}>
+          <span class="approval-pill-icon">${meta.icon}</span>
+          <span>${escapeHtml(meta.label)}</span>
+        </button>
+      </div>
+      <div class="composer-toolbar-side">
+        <button class="model-trigger ${state.composerMenu === "model" ? "open" : ""}" type="button" data-action="toggle-model-menu" title="${escapeHtml(state.selectedModel || "模型")}" ${canRun ? "" : "disabled"}>${escapeHtml(composerTriggerLabel())}</button>
+        <button class="round-action send-action" type="submit" title="发送" aria-label="发送" ${canRun ? "" : "disabled"}>↑</button>
+      </div>
+    </div>
+    ${state.composerMenu === "approval" ? renderApprovalMenu(lockPermissions) : ""}
+    ${state.composerMenu === "model" ? renderModelMenu(lockPermissions) : ""}
+  `;
+}
+
+function updateComposerFooters() {
+  $$("[data-composer-footer]").forEach((footer) => {
+    footer.innerHTML = renderComposerFooter({
+      canRun: footer.dataset.canRun !== "false",
+      lockPermissions: footer.dataset.lockPermissions === "true"
+    });
+  });
+  applyBusyState();
+}
+
+function closeComposerMenu() {
+  if (state.composerMenu === null) {
+    return;
+  }
+  state.composerMenu = null;
+  updateComposerFooters();
 }
 
 function formatDate(value) {
@@ -918,38 +1079,37 @@ async function submitNewSession(event, form = event.target) {
     await openDirectoryPicker("");
     return;
   }
-  const sandbox = String(values.sandbox || state.selectedSandbox);
-  const approval = String(values.approval || state.selectedApproval);
-  const model = String(values.model || state.selectedModel).trim();
-  state.selectedSandbox = sandbox;
-  state.selectedApproval = approval;
-  state.selectedModel = model;
-  localStorage.setItem("codex-webui:sandbox", sandbox);
-  localStorage.setItem("codex-webui:approval", approval);
-  localStorage.setItem("codex-webui:model", model);
-  localStorage.setItem("codex-webui:cwd", cwd);
+  const preferences = persistPreferences(values, cwd);
+  const prompt = String(values.prompt || "").trim();
   const name = cwd.split("/").filter(Boolean).pop() || `Session ${state.sessions.length + 1}`;
   const session = createLocalSession(name, state.selectedHost, { cwd });
   state.sessions.unshift(session);
-  state.activeSessionId = null;
+  state.activeSessionId = session.id;
+  state.composerMenu = null;
   saveSessions();
   renderAll();
-  toast("会话已创建，请从左侧选择进入。");
+  if (prompt) {
+    await sendPrompt({ prompt, cwd, ...preferences });
+  }
 }
 
-function clearSession() {
-  const session = activeSession();
-  if (!session) {
-    return;
+function persistPreferences(values, cwd) {
+  const sandbox = String(values.sandbox || state.selectedSandbox);
+  const approval = String(values.approval || state.selectedApproval);
+  const model = String(values.model || state.selectedModel).trim();
+  const effort = String(values.effort ?? state.selectedEffort).trim();
+  state.selectedSandbox = sandbox;
+  state.selectedApproval = approval;
+  state.selectedModel = model;
+  state.selectedEffort = effort;
+  localStorage.setItem("codex-webui:sandbox", sandbox);
+  localStorage.setItem("codex-webui:approval", approval);
+  localStorage.setItem("codex-webui:model", model);
+  localStorage.setItem("codex-webui:effort", effort);
+  if (cwd) {
+    localStorage.setItem("codex-webui:cwd", cwd);
   }
-  if (session.source === "codex") {
-    toast("Codex 原生历史不能在 WebUI 中清空。");
-    return;
-  }
-  session.messages = [];
-  session.updatedAt = new Date().toISOString();
-  saveSessions();
-  renderConsole();
+  return { sandbox, approval, model, effort };
 }
 
 async function deleteSession(sessionId) {
@@ -1143,16 +1303,12 @@ async function submitPrompt(event, form = event.target) {
   const prompt = String(values.prompt || "").trim();
   if (!prompt) return;
   const cwd = String(values.cwd || "").trim();
-  const sandbox = String(values.sandbox || state.selectedSandbox);
-  const approval = String(values.approval || state.selectedApproval);
-  const model = String(values.model || state.selectedModel).trim();
-  state.selectedSandbox = sandbox;
-  state.selectedApproval = approval;
-  state.selectedModel = model;
-  localStorage.setItem("codex-webui:sandbox", sandbox);
-  localStorage.setItem("codex-webui:approval", approval);
-  localStorage.setItem("codex-webui:model", model);
-  localStorage.setItem("codex-webui:cwd", cwd);
+  const preferences = persistPreferences(values, cwd);
+  state.composerMenu = null;
+  await sendPrompt({ prompt, cwd, ...preferences });
+}
+
+async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
   const session = activeSession();
   if (!session) {
     toast("请先从左侧选择会话。");
@@ -1175,6 +1331,7 @@ async function submitPrompt(event, form = event.target) {
       sandbox,
       approval,
       model,
+      effort,
       hostId: state.selectedHost,
       sessionId: session.source === "codex" ? session.id : null,
       attachments: state.attachments,
@@ -1199,11 +1356,11 @@ async function submitPrompt(event, form = event.target) {
   }
 }
 
-async function streamCodex({ prompt, cwd, sandbox, approval, model, hostId, sessionId, attachments, onEvent }) {
+async function streamCodex({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, attachments, onEvent }) {
   const response = await fetch("/api/codex/run", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ prompt, cwd, sandbox, approval, model, hostId, sessionId, attachments })
+    body: JSON.stringify({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, attachments })
   });
   if (!response.ok || !response.body) {
     const payload = await response.json().catch(() => ({}));
@@ -1958,8 +2115,43 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  if (state.composerMenu !== null && !target.closest("[data-composer-footer]")) {
+    closeComposerMenu();
+  }
+
   const button = target.closest("button");
   if (!button || button.disabled) {
+    return;
+  }
+
+  if (button.dataset.approvalOption) {
+    state.selectedApproval = button.dataset.approvalOption;
+    localStorage.setItem("codex-webui:approval", state.selectedApproval);
+    state.composerMenu = null;
+    updateComposerFooters();
+    return;
+  }
+
+  if (button.dataset.modelOption) {
+    state.selectedModel = button.dataset.modelOption;
+    localStorage.setItem("codex-webui:model", state.selectedModel);
+    state.modelMenuPanel = "root";
+    updateComposerFooters();
+    return;
+  }
+
+  if (button.dataset.effortOption !== undefined) {
+    state.selectedEffort = button.dataset.effortOption;
+    localStorage.setItem("codex-webui:effort", state.selectedEffort);
+    state.modelMenuPanel = "root";
+    updateComposerFooters();
+    return;
+  }
+
+  if (button.dataset.sandboxOption) {
+    state.selectedSandbox = button.dataset.sandboxOption;
+    localStorage.setItem("codex-webui:sandbox", state.selectedSandbox);
+    updateComposerFooters();
     return;
   }
 
@@ -2053,6 +2245,31 @@ async function handleDocumentClick(event) {
   }
 
   switch (button.dataset.action) {
+    case "toggle-approval-menu":
+      state.composerMenu = state.composerMenu === "approval" ? null : "approval";
+      updateComposerFooters();
+      break;
+    case "toggle-model-menu":
+      state.composerMenu = state.composerMenu === "model" ? null : "model";
+      state.modelMenuPanel = "root";
+      updateComposerFooters();
+      break;
+    case "model-menu-root":
+      state.modelMenuPanel = "root";
+      updateComposerFooters();
+      break;
+    case "model-menu-models":
+      state.modelMenuPanel = "models";
+      updateComposerFooters();
+      break;
+    case "model-menu-effort":
+      state.modelMenuPanel = "effort";
+      updateComposerFooters();
+      break;
+    case "model-menu-advanced":
+      state.modelMenuAdvanced = !state.modelMenuAdvanced;
+      updateComposerFooters();
+      break;
     case "refresh":
       await refreshAll();
       toast("已刷新");
@@ -2068,9 +2285,6 @@ async function handleDocumentClick(event) {
       break;
     case "select-directory":
       selectDirectory();
-      break;
-    case "clear-session":
-      clearSession();
       break;
     case "restart-terminal":
       restartTerminal();
@@ -2179,7 +2393,7 @@ document.addEventListener("submit", (event) => {
 document.addEventListener("input", handleDocumentInput);
 document.addEventListener("keydown", (event) => {
   const target = event.target instanceof Element ? event.target : null;
-  const composer = target?.closest("[data-composer]");
+  const composer = target?.closest("[data-composer], [data-new-session-form]");
   if (
     target instanceof HTMLTextAreaElement
     && target.name === "prompt"
