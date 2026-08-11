@@ -8,6 +8,7 @@ pnpm-debug.log*
 .env.*
 !.env.example
 .DS_Store
+CLAUDE.md
 coverage/
 dist/
 tmp/
