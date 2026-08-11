@@ -83,7 +83,10 @@ const state = {
   modelMenuAdvanced: false,
   skillFilter: "all",
   skillQuery: "",
-  mcpTransport: "http",
+  mcpView: "list",
+  mcpEditName: null,
+  mcpQuery: "",
+  mcpForm: null,
   settingsTab: localStorage.getItem("codex-webui:settings-tab") || "mcp",
   settingsSection: localStorage.getItem("codex-webui:settings-section") || "connections",
   hostFormOpen: false,
@@ -498,15 +501,16 @@ function renderConsole() {
             <button class="terminal-restore" type="button" data-action="toggle-terminal">终端</button>
           ` : `
             <section class="terminal-dock" aria-label="终端">
-              <div class="terminal-dock-bar">
-                <div class="terminal-meta">
-                  <span class="terminal-dot" aria-hidden="true"></span>
-                  <strong>终端</strong>
-                  <span data-terminal-status>${escapeHtml(terminalStatusText(session))}</span>
+              <div class="terminal-tabbar">
+                <div class="terminal-tab active" data-terminal-status="${state.terminalConnected ? "connected" : "disconnected"}">
+                  <span class="terminal-tab-icon">${iconTerminal}</span>
+                  <span class="terminal-tab-title" title="${escapeHtml(terminalCwd(session))}">${escapeHtml(terminalTabTitle(session))}</span>
+                  <button class="terminal-tab-close" type="button" data-action="toggle-terminal" title="关闭终端面板" aria-label="关闭终端面板">×</button>
                 </div>
-                <div class="terminal-actions">
-                  <button class="terminal-action" type="button" data-action="restart-terminal" title="重新连接终端" aria-label="重新连接终端">↻</button>
-                  <button class="terminal-action" type="button" data-action="toggle-terminal" title="隐藏终端" aria-label="隐藏终端">→</button>
+                <button class="terminal-tab-new" type="button" data-action="restart-terminal" title="新建终端（重新连接）" aria-label="新建终端">+</button>
+                <div class="terminal-tabbar-actions">
+                  <button class="terminal-tab-action" type="button" data-action="restart-terminal" title="重新连接终端" aria-label="重新连接终端">↻</button>
+                  <button class="terminal-tab-action" type="button" data-action="toggle-terminal" title="隐藏终端面板" aria-label="隐藏终端面板">${iconPanelHide}</button>
                 </div>
               </div>
               <div class="terminal-body">
@@ -749,6 +753,9 @@ async function toggleSettingsHost(hostId) {
 async function selectSettingsSection(section, hostId = state.selectedHost) {
   const nextSection = ["mcp", "skills"].includes(section) ? section : "mcp";
   state.settingsSection = nextSection;
+  state.mcpView = "list";
+  state.mcpEditName = null;
+  state.mcpForm = null;
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
   if (nextSection !== "connections" && state.hosts.some((host) => host.id === hostId) && hostId !== state.selectedHost) {
     state.selectedHost = hostId;
@@ -788,6 +795,11 @@ const iconCheck = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" s
 const iconChevron = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>`;
 const iconFolder = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>`;
 const iconArchive = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="4.5" rx="1"/><path d="M5 9v8.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/></svg>`;
+const iconGear = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 12a7.2 7.2 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7.3 7.3 0 0 0-2.1-1.2L14.3 3h-4l-.4 2.7a7.3 7.3 0 0 0-2.1 1.2l-2.3-1-2 3.4 2 1.5a7.2 7.2 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1a7.3 7.3 0 0 0 2.1 1.2l.4 2.7h4l.4-2.7a7.3 7.3 0 0 0 2.1-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>`;
+const iconSearch = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.8-3.8"/></svg>`;
+const iconTerminal = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="m7.5 9.5 3 2.5-3 2.5M12.5 15h4"/></svg>`;
+const iconPanelHide = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>`;
+const iconBackArrow = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5m6-7-7 7 7 7"/></svg>`;
 const iconTrash = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6.5h15M9.5 6.5v-1a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v1M6.5 6.5l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9l.8-12M10 10.5v6M14 10.5v6"/></svg>`;
 
 function approvalOptions() {
@@ -1148,14 +1160,15 @@ function terminalCwd(session = activeSession()) {
   return session?.cwd || locationWorkspace() || "";
 }
 
-function terminalStatusText(session = activeSession()) {
-  return state.terminalConnected ? "connected" : "disconnected";
+function terminalTabTitle(session = activeSession()) {
+  const cwd = String(terminalCwd(session));
+  return cwd.split("/").filter(Boolean).pop() || cwd || "shell";
 }
 
 function updateTerminalStatus() {
   const status = $("[data-terminal-status]");
   if (status) {
-    status.textContent = terminalStatusText();
+    status.dataset.terminalStatus = state.terminalConnected ? "connected" : "disconnected";
   }
 }
 
@@ -1570,46 +1583,168 @@ function renderConnectionSettingsContent() {
   `;
 }
 
+function emptyMcpForm() {
+  return { name: "", transport: "stdio", command: "", args: [], env: [], url: "" };
+}
+
+function mcpTransportInfo(server) {
+  const transport = server.transport && typeof server.transport === "object" ? server.transport : server;
+  const url = transport.url || "";
+  return {
+    type: url || transport.type === "streamable_http" || transport.type === "http" ? "http" : "stdio",
+    command: transport.command || "",
+    args: asClientArray(transport.args).map(String),
+    env: transport.env || {},
+    url
+  };
+}
+
+function asClientArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function mcpFormFromServer(server) {
+  const info = mcpTransportInfo(server);
+  const envRows = Array.isArray(info.env)
+    ? info.env.map((line) => {
+        const index = String(line).indexOf("=");
+        return index === -1 ? { key: String(line), value: "" } : { key: String(line).slice(0, index), value: String(line).slice(index + 1) };
+      })
+    : Object.entries(info.env).map(([key, value]) => ({ key, value: String(value) }));
+  return {
+    name: server.name || server.id || "",
+    transport: info.type,
+    command: info.command,
+    args: info.args,
+    env: envRows,
+    url: info.url
+  };
+}
+
+function mcpServerByName(name) {
+  return state.mcp.find((server) => (server.name || server.id) === name) || null;
+}
+
+function mcpServerSummary(server) {
+  const info = mcpTransportInfo(server);
+  return info.url || [info.command, ...info.args].filter(Boolean).join(" ") || "已配置";
+}
+
+function filteredMcpServers() {
+  const query = state.mcpQuery.trim().toLowerCase();
+  if (!query) {
+    return state.mcp;
+  }
+  return state.mcp.filter((server) => {
+    const haystack = `${server.name || server.id || ""} ${mcpServerSummary(server)}`.toLowerCase();
+    return haystack.includes(query);
+  });
+}
+
 function renderMcpSettingsContent() {
-  const host = hostById();
-  const local = hostCanRunCodex(host.id);
+  if (state.mcpView === "form" && state.mcpForm) {
+    return renderMcpFormView();
+  }
+  return renderMcpListView();
+}
+
+function renderMcpListView() {
+  const servers = filteredMcpServers();
   return `
-    <div class="manager-grid settings-manager-grid">
-      <section class="panel settings-section-block">
-        <div class="panel-header">
-          <div>
-            <h3>添加 MCP</h3>
-            <p>${local ? "写入当前 Codex CLI 配置" : "保存为该主机的预留配置"}</p>
-          </div>
+    <section class="mcp-page">
+      <div class="mcp-toolbar">
+        <div class="mcp-search">
+          <span class="mcp-search-icon">${iconSearch}</span>
+          <input data-mcp-query placeholder="搜索 MCP 服务器" value="${escapeHtml(state.mcpQuery)}">
         </div>
-        <div class="panel-body">
-          <form class="form-grid" data-mcp-form>
-            <input type="hidden" name="hostId" value="${escapeHtml(host.id)}">
-            <label>名称<input name="name" placeholder="github-tools" required></label>
-            <div class="segmented" role="tablist" aria-label="MCP transport">
-              <button type="button" class="${state.mcpTransport === "http" ? "active" : ""}" data-transport="http">HTTP</button>
-              <button type="button" class="${state.mcpTransport === "stdio" ? "active" : ""}" data-transport="stdio">stdio</button>
-            </div>
-            <label class="${state.mcpTransport === "http" ? "" : "hidden"}" data-http-field>URL<input name="url" placeholder="https://example.com/mcp"></label>
-            <label class="${state.mcpTransport === "stdio" ? "" : "hidden"}" data-stdio-field>命令<input name="commandLine" placeholder="npx -y @modelcontextprotocol/server-filesystem ."></label>
-            <label>环境变量<textarea name="env" rows="4" placeholder="TOKEN_ENV=VALUE"></textarea></label>
-            <button class="button primary" type="submit">保存 MCP</button>
-          </form>
-        </div>
-      </section>
-      <section class="panel settings-section-block">
-        <div class="panel-header">
-          <div>
-            <h3>已配置服务器</h3>
-            <p>${local ? "来自 codex mcp list" : "来自 WebUI host registry"}</p>
-          </div>
+        <div class="mcp-toolbar-actions">
           <button class="button ghost slim" type="button" data-action="refresh-mcp">刷新</button>
+          <button class="button primary slim" type="button" data-action="mcp-add">添加</button>
         </div>
-        <div class="panel-body item-grid">
-          ${state.mcp.length ? state.mcp.map(renderMcpCard).join("") : `<div class="empty-state">这个主机没有 MCP server。</div>`}
+      </div>
+      <p class="mcp-section-label">服务器</p>
+      ${servers.length ? `
+        <div class="mcp-server-card">
+          ${servers.map((server) => {
+            const name = server.name || server.id || "mcp-server";
+            return `
+              <button class="mcp-server-row" type="button" data-mcp-edit="${escapeHtml(name)}" title="${escapeHtml(mcpServerSummary(server))}">
+                <span class="mcp-server-name">${escapeHtml(name)}</span>
+                <span class="mcp-server-meta">${escapeHtml(mcpTransportInfo(server).type === "http" ? "流式 HTTP" : "STDIO")}</span>
+                <span class="mcp-server-gear">${iconGear}</span>
+              </button>
+            `;
+          }).join("")}
         </div>
-      </section>
-    </div>
+      ` : `<div class="empty-state">${state.mcpQuery ? "没有匹配的 MCP 服务器。" : "这个主机还没有 MCP 服务器，点击右上角「添加」接入。"}</div>`}
+    </section>
+  `;
+}
+
+function renderMcpFormView() {
+  const form = state.mcpForm;
+  const editing = state.mcpEditName !== null;
+  const isStdio = form.transport === "stdio";
+  return `
+    <section class="mcp-page mcp-form-page">
+      <button class="mcp-back" type="button" data-action="mcp-back"><span class="mcp-back-icon">${iconBackArrow}</span>返回</button>
+      <div class="mcp-form-title-row">
+        <h2>${editing ? `更新 ${escapeHtml(state.mcpEditName)}` : "连接至自定义 MCP"}</h2>
+        ${editing ? `<button class="button danger-pill" type="button" data-action="mcp-uninstall">${iconTrash}卸载</button>` : ""}
+      </div>
+      ${editing ? `<p class="mcp-form-note">如需切换 MCP 服务器类型，请先卸载当前配置。</p>` : ""}
+      <form data-mcp-form>
+        ${editing ? "" : `
+          <div class="mcp-card">
+            <label class="mcp-field">名称
+              <input data-mcp-field="name" placeholder="MCP server name" value="${escapeHtml(form.name)}" required>
+            </label>
+            <div class="mcp-type-row">
+              <span>类型</span>
+              <div class="mcp-type-segmented" role="tablist" aria-label="MCP transport">
+                <button type="button" class="${isStdio ? "active" : ""}" data-mcp-transport="stdio">STDIO</button>
+                <button type="button" class="${isStdio ? "" : "active"}" data-mcp-transport="http">流式 HTTP</button>
+              </div>
+            </div>
+          </div>
+        `}
+        <div class="mcp-card">
+          ${isStdio ? `
+            <label class="mcp-field">启动命令
+              <input data-mcp-field="command" placeholder="npx -y @modelcontextprotocol/server-filesystem" value="${escapeHtml(form.command)}" required>
+            </label>
+            <div class="mcp-field-group">
+              <span class="mcp-field-label">参数</span>
+              ${form.args.map((arg, index) => `
+                <div class="mcp-row">
+                  <input data-mcp-field="arg" data-arg-index="${index}" value="${escapeHtml(arg)}">
+                  <button class="mcp-row-remove" type="button" data-action="mcp-remove-arg" data-arg-index="${index}" title="删除参数" aria-label="删除参数">${iconTrash}</button>
+                </div>
+              `).join("")}
+              <button class="mcp-row-add" type="button" data-action="mcp-add-arg">+ 添加参数</button>
+            </div>
+            <div class="mcp-field-group">
+              <span class="mcp-field-label">环境变量</span>
+              ${form.env.map((row, index) => `
+                <div class="mcp-row mcp-row-pair">
+                  <input data-mcp-field="env-key" data-env-index="${index}" placeholder="键" value="${escapeHtml(row.key)}">
+                  <input data-mcp-field="env-value" data-env-index="${index}" placeholder="值" value="${escapeHtml(row.value)}">
+                  <button class="mcp-row-remove" type="button" data-action="mcp-remove-env" data-env-index="${index}" title="删除环境变量" aria-label="删除环境变量">${iconTrash}</button>
+                </div>
+              `).join("")}
+              <button class="mcp-row-add" type="button" data-action="mcp-add-env">+ 添加环境变量</button>
+            </div>
+          ` : `
+            <label class="mcp-field">URL
+              <input data-mcp-field="url" placeholder="https://example.com/mcp" value="${escapeHtml(form.url)}" required>
+            </label>
+          `}
+        </div>
+        <div class="mcp-form-footer">
+          <button class="button primary" type="submit">保存</button>
+        </div>
+      </form>
+    </section>
   `;
 }
 
@@ -1686,92 +1821,56 @@ function renderHostSettingsContent() {
   `;
 }
 
-function renderMcp() {
-  const container = $('[data-view="mcp"]');
-  if (!container) {
+function quoteCommandPart(part) {
+  return /[\s"'\\]/.test(part) ? `"${part.replace(/([\\"])/g, "\\$1")}"` : part;
+}
+
+async function submitMcp(event) {
+  event.preventDefault();
+  const form = state.mcpForm;
+  if (!form) {
     return;
   }
-  container.innerHTML = `
-    ${renderSummary()}
-    <div class="manager-grid">
-      <section class="panel">
-        <div class="panel-header">
-          <div>
-            <h3>添加 MCP</h3>
-            <p>HTTP stream 或 stdio command</p>
-          </div>
-        </div>
-        <div class="panel-body">
-          <form class="form-grid" data-mcp-form>
-            <label>名称<input name="name" placeholder="github-tools" required></label>
-            <div class="segmented" role="tablist" aria-label="MCP transport">
-              <button type="button" class="${state.mcpTransport === "http" ? "active" : ""}" data-transport="http">HTTP</button>
-              <button type="button" class="${state.mcpTransport === "stdio" ? "active" : ""}" data-transport="stdio">stdio</button>
-            </div>
-            <label class="${state.mcpTransport === "http" ? "" : "hidden"}" data-http-field>URL<input name="url" placeholder="https://example.com/mcp"></label>
-            <label class="${state.mcpTransport === "stdio" ? "" : "hidden"}" data-stdio-field>命令<input name="commandLine" placeholder="npx -y @modelcontextprotocol/server-filesystem ."></label>
-            <label>环境变量<textarea name="env" rows="4" placeholder="TOKEN_ENV=VALUE"></textarea></label>
-            <button class="button primary" type="submit">保存 MCP</button>
-          </form>
-        </div>
-      </section>
-      <section class="panel">
-        <div class="panel-header">
-          <div>
-            <h3>已配置服务器</h3>
-            <p>来自 codex mcp list</p>
-          </div>
-          <button class="button ghost slim" type="button" data-action="refresh-mcp">刷新</button>
-        </div>
-        <div class="panel-body item-grid">
-          ${state.mcp.length ? state.mcp.map(renderMcpCard).join("") : `<div class="empty-state">没有 MCP server。</div>`}
-        </div>
-      </section>
-    </div>
-  `;
-}
-
-function renderMcpCard(server) {
-  const name = server.name || server.id || "mcp-server";
-  const meta = server.url || [server.command, ...(server.args || [])].filter(Boolean).join(" ") || "configured";
-  return `
-    <article class="item-card">
-      <div>
-        <div class="item-meta">
-          <span class="badge ok">MCP</span>
-          <span class="badge">${escapeHtml(server.url ? "http" : "stdio")}</span>
-        </div>
-        <h3>${escapeHtml(name)}</h3>
-        <p class="fine">${escapeHtml(meta)}</p>
-      </div>
-      <div class="card-actions">
-        <button class="button ghost slim" type="button" data-remove-mcp="${escapeHtml(name)}">移除</button>
-      </div>
-    </article>
-  `;
-}
-
-async function submitMcp(event, form = event.target) {
-  event.preventDefault();
-  const values = formValues(form);
+  const name = (state.mcpEditName ?? form.name).trim();
+  if (!name) {
+    toast("MCP 名称不能为空。");
+    return;
+  }
+  const commandLine = [form.command.trim(), ...form.args.map((arg) => arg.trim()).filter(Boolean)]
+    .filter(Boolean)
+    .map(quoteCommandPart)
+    .join(" ");
+  if (form.transport === "stdio" && !commandLine) {
+    toast("STDIO MCP 需要启动命令。");
+    return;
+  }
   const payload = {
-    hostId: String(values.hostId || state.selectedHost).trim(),
-    transport: state.mcpTransport,
-    name: String(values.name || "").trim(),
-    url: String(values.url || "").trim(),
-    commandLine: String(values.commandLine || "").trim(),
-    env: String(values.env || "")
+    hostId: state.selectedHost,
+    transport: form.transport,
+    name,
+    url: form.url.trim(),
+    commandLine,
+    env: form.env
+      .filter((row) => row.key.trim())
+      .map((row) => `${row.key.trim()}=${row.value}`)
+      .join("\n")
   };
   setBusy(true);
   try {
+    if (state.mcpEditName !== null) {
+      await api(`/api/mcp/${encodeURIComponent(name)}?hostId=${encodeURIComponent(state.selectedHost)}`, { method: "DELETE" });
+    }
     await api("/api/mcp", { method: "POST", body: JSON.stringify(payload) });
     toast("MCP 已保存");
-    await refreshMcp();
-    renderAll();
+    state.mcpView = "list";
+    state.mcpEditName = null;
+    state.mcpForm = null;
   } catch (error) {
     toast(error.message);
   } finally {
+    await refreshMcp();
     setBusy(false);
+    renderAll();
   }
 }
 
@@ -2180,8 +2279,19 @@ async function handleDocumentClick(event) {
     return;
   }
 
-  if (button.dataset.transport) {
-    state.mcpTransport = button.dataset.transport;
+  if (button.dataset.mcpEdit) {
+    const server = mcpServerByName(button.dataset.mcpEdit);
+    if (server) {
+      state.mcpView = "form";
+      state.mcpEditName = server.name || server.id;
+      state.mcpForm = mcpFormFromServer(server);
+      renderSettings();
+    }
+    return;
+  }
+
+  if (button.dataset.mcpTransport && state.mcpForm) {
+    state.mcpForm.transport = button.dataset.mcpTransport === "http" ? "http" : "stdio";
     renderSettings();
     return;
   }
@@ -2302,6 +2412,45 @@ async function handleDocumentClick(event) {
     case "back-to-console":
       setView("console");
       break;
+    case "mcp-add":
+      state.mcpView = "form";
+      state.mcpEditName = null;
+      state.mcpForm = emptyMcpForm();
+      renderSettings();
+      break;
+    case "mcp-back":
+      state.mcpView = "list";
+      state.mcpEditName = null;
+      state.mcpForm = null;
+      renderSettings();
+      break;
+    case "mcp-add-arg":
+      state.mcpForm?.args.push("");
+      renderSettings();
+      break;
+    case "mcp-remove-arg":
+      state.mcpForm?.args.splice(Number(button.dataset.argIndex), 1);
+      renderSettings();
+      break;
+    case "mcp-add-env":
+      state.mcpForm?.env.push({ key: "", value: "" });
+      renderSettings();
+      break;
+    case "mcp-remove-env":
+      state.mcpForm?.env.splice(Number(button.dataset.envIndex), 1);
+      renderSettings();
+      break;
+    case "mcp-uninstall": {
+      const name = state.mcpEditName;
+      if (name && window.confirm(`卸载 MCP 服务器 ${name}？`)) {
+        await removeMcp(name);
+        state.mcpView = "list";
+        state.mcpEditName = null;
+        state.mcpForm = null;
+        renderSettings();
+      }
+      break;
+    }
     case "refresh-mcp":
       await refreshMcp();
       renderAll();
@@ -2365,6 +2514,34 @@ function handleDocumentInput(event) {
     if (key === "model") state.selectedModel = target.value;
     if (key === "approval") state.selectedApproval = target.value;
     if (key === "sandbox") state.selectedSandbox = target.value;
+    return;
+  }
+
+  if (target.matches("[data-mcp-field]")) {
+    const form = state.mcpForm;
+    if (!form) {
+      return;
+    }
+    const field = target.dataset.mcpField;
+    if (field === "arg") {
+      form.args[Number(target.dataset.argIndex)] = target.value;
+    } else if (field === "env-key" || field === "env-value") {
+      const row = form.env[Number(target.dataset.envIndex)];
+      if (row) {
+        row[field === "env-key" ? "key" : "value"] = target.value;
+      }
+    } else if (field in form) {
+      form[field] = target.value;
+    }
+    return;
+  }
+
+  if (target.matches("[data-mcp-query]")) {
+    state.mcpQuery = target.value;
+    renderSettings();
+    const queryInput = $("[data-mcp-query]");
+    queryInput.focus();
+    queryInput.setSelectionRange(queryInput.value.length, queryInput.value.length);
     return;
   }
 
