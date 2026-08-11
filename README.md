@@ -61,6 +61,26 @@ CODEX_BIN=/path/to/codex CODEX_WEBUI_DATA_DIR=/path/to/state codex-webui
 CODEX_WEBUI_DIRECTORY_ROOTS=/home/euler/workspace:/mnt/projects codex-webui
 ```
 
+## Automated npm releases
+
+The repository includes a GitHub Actions workflow at `.github/workflows/publish.yml`. It publishes only when a `v*` tag is pushed, and runs `npm test` before publishing.
+
+Before the first automated release, configure npm Trusted Publishing in the package settings:
+
+- Publisher: GitHub Actions
+- Organization or user: `zxm-bupt`
+- Repository: `codex-webui`
+- Workflow filename: `publish.yml`
+- Allowed action: `npm publish`
+
+After that, create and push a release tag with `np` without publishing locally:
+
+```bash
+np patch --no-publish
+```
+
+The resulting `vX.Y.Z` tag triggers the workflow. npm Trusted Publishing uses GitHub's OIDC token, so no npm token needs to be stored in GitHub Secrets. The npm package must remain public and the workflow must run on a GitHub-hosted runner.
+
 ## Current scope
 
 - Codex 会话：浏览器提交 prompt，后端通过 `codex exec --json` 执行并以 NDJSON 流返回。
