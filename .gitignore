@@ -9,6 +9,10 @@ pnpm-debug.log*
 !.env.example
 .DS_Store
 CLAUDE.md
+.claude/
+.codex/
+.agent/
+.agents/
 coverage/
 dist/
 tmp/
