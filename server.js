@@ -3,10 +3,11 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createReadStream, existsSync, promises as fs } from "node:fs";
+import { createInterface } from "node:readline";
 import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer } from "ws";
 import pty from "node-pty";
 
@@ -16,13 +17,23 @@ const nodeModulesDir = path.join(__dirname, "node_modules");
 const dataDir = process.env.CODEX_WEBUI_DATA_DIR || path.join(os.homedir(), ".codex-webui");
 const stateFile = path.join(dataDir, "webui-state.json");
 const uploadDir = path.join(dataDir, "uploads");
+const previewDir = path.join(dataDir, "previews");
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const codexSessionsDir = path.join(codexHome, "sessions");
 const codexBin = process.env.CODEX_BIN || "codex";
-const terminalEnabled = process.env.ENABLE_TERMINAL === "1";
+const terminalEnabled = process.env.ENABLE_TERMINAL !== "0";
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 8787);
+const accessUser = process.env.CODEX_WEBUI_USER || "codex";
+const accessPassword = process.env.CODEX_WEBUI_PASSWORD || "";
 const defaultModels = ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.1-codex", "gpt-5", "o3", "o4-mini"];
+const codexRuns = new Map();
+const pendingCodexApprovals = new Map();
+const codexSessionSummaryCache = new Map();
+const codexSessionPathCache = new Map();
+const activeRunStatuses = new Set(["starting", "running", "pausing"]);
+const runRetentionMs = 6 * 60 * 60 * 1000;
+const approvalTimeoutMs = 10 * 60 * 1000;
 
 const mimeTypes = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -33,6 +44,33 @@ const mimeTypes = new Map([
   [".svg", "image/svg+xml"],
   [".ico", "image/x-icon"]
 ]);
+
+const previewMimeTypes = new Map([
+  [".txt", "text/plain; charset=utf-8"],
+  [".md", "text/markdown; charset=utf-8"],
+  [".csv", "text/csv; charset=utf-8"],
+  [".pdf", "application/pdf"],
+  [".json", "application/json; charset=utf-8"],
+  [".svg", "image/svg+xml"],
+  [".png", "image/png"],
+  [".jpg", "image/jpeg"],
+  [".jpeg", "image/jpeg"],
+  [".gif", "image/gif"],
+  [".webp", "image/webp"],
+  [".avif", "image/avif"],
+  [".mp4", "video/mp4"],
+  [".webm", "video/webm"],
+  [".mov", "video/quicktime"],
+  [".m4v", "video/x-m4v"],
+  [".ogv", "video/ogg"]
+]);
+
+const defaultFilePreviewSettings = {
+  extensions: ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
+  maxFileSizeMb: 20,
+  cleanupIntervalMinutes: 30
+};
+let lastPreviewCacheCleanup = Date.now();
 
 const defaultState = {
   hosts: [
@@ -45,7 +83,8 @@ const defaultState = {
       notes: "Uses the codex command available on this machine."
     }
   ],
-  hostSettings: {}
+  hostSettings: {},
+  filePreview: defaultFilePreviewSettings
 };
 
 function sendJson(res, status, payload) {
@@ -59,6 +98,136 @@ function sendJson(res, status, payload) {
 
 function sendError(res, status, message, details = undefined) {
   sendJson(res, status, { error: message, details });
+}
+
+function publicCodexRun(run) {
+  return {
+    id: run.id,
+    sessionKey: run.sessionKey,
+    threadId: run.threadId,
+    status: run.status,
+    approval: run.approval,
+    cwd: run.cwd,
+    startedAt: run.startedAt,
+    updatedAt: run.updatedAt,
+    finishedAt: run.finishedAt || null,
+    lastSequence: run.sequence
+  };
+}
+
+function listCodexRuns(res) {
+  const runs = [...codexRuns.values()]
+    .sort((left, right) => String(right.updatedAt).localeCompare(String(left.updatedAt)))
+    .map(publicCodexRun);
+  sendJson(res, 200, { runs });
+}
+
+function publicCodexApproval(approval) {
+  return {
+    id: approval.id,
+    runId: approval.runId,
+    sessionKey: approval.sessionKey,
+    threadId: approval.threadId,
+    method: approval.method,
+    params: approval.params,
+    createdAt: approval.createdAt,
+    expiresAt: approval.expiresAt
+  };
+}
+
+function listCodexApprovals(res) {
+  const approvals = [...pendingCodexApprovals.values()]
+    .sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)))
+    .map(publicCodexApproval);
+  sendJson(res, 200, { approvals });
+}
+
+async function resolveCodexApproval(req, res, approvalId) {
+  const approval = pendingCodexApprovals.get(approvalId);
+  if (!approval) return sendError(res, 404, "Approval request was not found or has expired.");
+  const body = await readBody(req, 16 * 1024);
+  const decision = String(body.decision || "");
+  if (!["accept", "acceptForSession", "decline"].includes(decision)) {
+    return sendError(res, 400, "Invalid approval decision.");
+  }
+  approval.resolve(decision);
+  sendJson(res, 200, { ok: true });
+}
+
+function attachCodexRun(req, res, runId) {
+  const run = codexRuns.get(runId);
+  if (!run) return sendError(res, 404, "Codex run was not found.");
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const after = Math.max(0, Number(url.searchParams.get("after")) || 0);
+  res.writeHead(200, {
+    "content-type": "application/x-ndjson; charset=utf-8",
+    "cache-control": "no-store",
+    "x-accel-buffering": "no",
+    connection: "keep-alive"
+  });
+  res.flushHeaders();
+  for (const event of run.events) {
+    if (event.sequence > after) res.write(`${JSON.stringify(event)}\n`);
+  }
+  if (activeRunStatuses.has(run.status)) {
+    run.subscribers.add(res);
+    res.on("close", () => run.subscribers.delete(res));
+  } else {
+    res.end();
+  }
+}
+
+function pauseCodexRun(res, runId) {
+  const run = codexRuns.get(runId);
+  if (!run) return sendError(res, 404, "Codex run was not found.");
+  if (!activeRunStatuses.has(run.status)) {
+    return sendJson(res, 200, { ok: true, run: publicCodexRun(run) });
+  }
+  run.status = "pausing";
+  run.updatedAt = new Date().toISOString();
+  run.emit?.({ type: "webui.status", status: "pausing" });
+  run.stop?.();
+  sendJson(res, 202, { ok: true, run: publicCodexRun(run) });
+}
+
+function safeEqual(left, right) {
+  const leftBuffer = Buffer.from(String(left));
+  const rightBuffer = Buffer.from(String(right));
+  return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer);
+}
+
+function requestIsAuthorized(req) {
+  if (!accessPassword) return true;
+  const header = String(req.headers.authorization || "");
+  if (!header.startsWith("Basic ")) return false;
+  let decoded;
+  try {
+    decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+  } catch {
+    return false;
+  }
+  const separator = decoded.indexOf(":");
+  if (separator < 0) return false;
+  return safeEqual(decoded.slice(0, separator), accessUser) && safeEqual(decoded.slice(separator + 1), accessPassword);
+}
+
+function requestOriginIsAllowed(req) {
+  const origin = req.headers.origin;
+  if (!origin) return true;
+  try {
+    return new URL(origin).host === req.headers.host;
+  } catch {
+    return false;
+  }
+}
+
+function sendUnauthorized(res) {
+  res.writeHead(401, {
+    "www-authenticate": 'Basic realm="Codex WebUI", charset="UTF-8"',
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  res.end("Authentication required.");
 }
 
 function isValidName(value) {
@@ -130,6 +299,15 @@ async function resolveBrowsableDirectory(value) {
   return { directoryPath, roots };
 }
 
+async function checkWorkingDirectory(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const directoryPath = sanitizeCwd(url.searchParams.get("path"));
+  if (!(await directoryExists(directoryPath))) {
+    return sendError(res, 404, `Working directory does not exist: ${directoryPath}`);
+  }
+  sendJson(res, 200, { path: directoryPath, exists: true });
+}
+
 async function listDirectories(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const { directoryPath, roots } = await resolveBrowsableDirectory(url.searchParams.get("path"));
@@ -143,6 +321,115 @@ async function listDirectories(req, res) {
     ? parentCandidate
     : null;
   sendJson(res, 200, { path: directoryPath, parent, roots, directories });
+}
+
+function normalizeFilePreviewSettings(value) {
+  const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const extensions = [...new Set(asArray(source.extensions)
+    .flatMap((entry) => String(entry || "").split(/[\s,，;；]+/))
+    .map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""))
+    .filter((entry) => /^[a-z0-9][a-z0-9_-]{0,15}$/.test(entry)))]
+    .slice(0, 64);
+  const maxFileSizeMb = Number(source.maxFileSizeMb);
+  const cleanupIntervalMinutes = Number(source.cleanupIntervalMinutes);
+  return {
+    extensions: extensions.length ? extensions : [...defaultFilePreviewSettings.extensions],
+    maxFileSizeMb: Number.isFinite(maxFileSizeMb) && maxFileSizeMb >= 0.1 && maxFileSizeMb <= 1024
+      ? Math.round(maxFileSizeMb * 10) / 10
+      : defaultFilePreviewSettings.maxFileSizeMb,
+    cleanupIntervalMinutes: Number.isInteger(cleanupIntervalMinutes) && cleanupIntervalMinutes >= 1 && cleanupIntervalMinutes <= 10080
+      ? cleanupIntervalMinutes
+      : defaultFilePreviewSettings.cleanupIntervalMinutes
+  };
+}
+
+async function clearPreviewCache() {
+  await fs.mkdir(previewDir, { recursive: true });
+  const entries = await fs.readdir(previewDir, { withFileTypes: true });
+  await Promise.all(entries.map(async (entry) => {
+    if (!entry.isFile()) return;
+    const entryPath = path.join(previewDir, entry.name);
+    try {
+      await fs.unlink(entryPath);
+    } catch {
+      // A concurrent request may already have removed it.
+    }
+  }));
+  lastPreviewCacheCleanup = Date.now();
+  return entries.filter((entry) => entry.isFile()).length;
+}
+
+async function cleanPreviewCacheIfDue(settings) {
+  const intervalMs = settings.cleanupIntervalMinutes * 60 * 1000;
+  if (Date.now() - lastPreviewCacheCleanup < intervalMs) return 0;
+  return clearPreviewCache();
+}
+
+async function copyToPreviewCache(realFilePath, stat, settings) {
+  await cleanPreviewCacheIfDue(settings);
+  await fs.mkdir(previewDir, { recursive: true });
+  const extension = path.extname(realFilePath).toLowerCase();
+  const cacheKey = createHash("sha256")
+    .update(realFilePath)
+    .update("\0")
+    .update(String(stat.size))
+    .update("\0")
+    .update(String(stat.mtimeMs))
+    .digest("hex")
+    .slice(0, 32);
+  const cachedPath = path.join(previewDir, `${cacheKey}${extension}`);
+  try {
+    const cachedStat = await fs.stat(cachedPath);
+    if (cachedStat.isFile()) return { cachedPath, cachedStat };
+  } catch {
+    // Copy the source below when this version is not cached yet.
+  }
+  await fs.copyFile(realFilePath, cachedPath);
+  return { cachedPath, cachedStat: await fs.stat(cachedPath) };
+}
+
+async function previewWorkspaceFile(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const requestedPath = String(url.searchParams.get("path") || "");
+  const requestedCwd = String(url.searchParams.get("cwd") || "");
+  if (!requestedPath) {
+    return sendError(res, 400, "File path is required.");
+  }
+
+  const basePath = requestedCwd ? path.resolve(requestedCwd) : process.cwd();
+  const filePath = path.resolve(basePath, requestedPath);
+
+  let stat;
+  let realFilePath;
+  try {
+    realFilePath = await fs.realpath(filePath);
+    stat = await fs.stat(realFilePath);
+  } catch {
+    return sendError(res, 404, "File was not found.");
+  }
+  const extension = path.extname(realFilePath).toLowerCase();
+  const webuiState = await loadState();
+  const settings = webuiState.filePreview;
+  if (!settings.extensions.includes(extension.slice(1))) {
+    return sendError(res, 415, "This file type cannot be previewed.");
+  }
+  const contentType = previewMimeTypes.get(extension) || mimeTypes.get(extension) || "application/octet-stream";
+  const maxBytes = Math.floor(settings.maxFileSizeMb * 1024 * 1024);
+  if (!stat.isFile() || stat.size > maxBytes) {
+    return sendError(res, 413, "File is too large to preview.");
+  }
+
+  const { cachedPath, cachedStat } = await copyToPreviewCache(realFilePath, stat, settings);
+  const filename = encodeURIComponent(path.basename(realFilePath));
+  res.writeHead(200, {
+    "content-type": contentType,
+    "content-length": cachedStat.size,
+    "content-disposition": `inline; filename*=UTF-8''${filename}`,
+    "cache-control": "private, no-store",
+    "x-content-type-options": "nosniff",
+    "content-security-policy": "default-src 'none'; sandbox"
+  });
+  createReadStream(cachedPath).pipe(res);
 }
 
 async function listModels(res) {
@@ -259,7 +546,48 @@ function normalizeWebuiState(state) {
     ? state.hostSettings["local-codex"]
     : undefined;
   state.hostSettings = storedSettings ? { "local-codex": storedSettings } : {};
+  state.filePreview = normalizeFilePreviewSettings(state.filePreview);
   return state;
+}
+
+async function getFilePreviewSettings(res) {
+  const state = await loadState();
+  sendJson(res, 200, { settings: state.filePreview });
+}
+
+async function updateFilePreviewSettings(req, res) {
+  const body = await readBody(req, 32 * 1024);
+  const requestedExtensions = asArray(body.extensions)
+    .flatMap((entry) => String(entry || "").split(/[\s,，;；]+/))
+    .map((entry) => entry.trim().toLowerCase().replace(/^\.+/, ""))
+    .filter(Boolean);
+  if (!requestedExtensions.length || requestedExtensions.some((entry) => !/^[a-z0-9][a-z0-9_-]{0,15}$/.test(entry))) {
+    return sendError(res, 400, "Please provide 1-64 valid file extensions.");
+  }
+  if (new Set(requestedExtensions).size > 64) {
+    return sendError(res, 400, "At most 64 file extensions are allowed.");
+  }
+  const maxFileSizeMb = Number(body.maxFileSizeMb);
+  if (!Number.isFinite(maxFileSizeMb) || maxFileSizeMb < 0.1 || maxFileSizeMb > 1024) {
+    return sendError(res, 400, "Maximum file size must be between 0.1 and 1024 MB.");
+  }
+  const cleanupIntervalMinutes = Number(body.cleanupIntervalMinutes);
+  if (!Number.isInteger(cleanupIntervalMinutes) || cleanupIntervalMinutes < 1 || cleanupIntervalMinutes > 10080) {
+    return sendError(res, 400, "Cleanup interval must be between 1 and 10080 minutes.");
+  }
+  const state = await loadState();
+  state.filePreview = normalizeFilePreviewSettings({
+    extensions: requestedExtensions,
+    maxFileSizeMb,
+    cleanupIntervalMinutes
+  });
+  await saveState(state);
+  sendJson(res, 200, { ok: true, settings: state.filePreview });
+}
+
+async function clearFilePreviewCache(res) {
+  const removed = await clearPreviewCache();
+  sendJson(res, 200, { ok: true, removed });
 }
 
 function hostFromState(state, hostId) {
@@ -393,13 +721,112 @@ function isRepeatedMessageSegment(existingContent, nextContent) {
   return segments.at(-1) === next;
 }
 
+const injectedContextNames = new Set([
+  "environment_context",
+  "user_instructions",
+  "developer_instructions",
+  "skills_instructions",
+  "permissions instructions",
+  "apps_instructions",
+  "plugins_instructions",
+  "recommended_plugins",
+  "multi_agent_mode"
+]);
+
+function stripInjectedContext(text) {
+  return String(text || "")
+    .replace(/<([a-z][\w -]*)>[\s\S]*?<\/\1>/gi, (block, name) => (
+      injectedContextNames.has(String(name).toLowerCase()) ? "" : block
+    ))
+    .replace(/<(environment_context|recommended_plugins|user_instructions)[\s\S]*$/gi, "")
+    .trim();
+}
+
+function extractIdeRequest(text) {
+  const match = String(text || "").match(/##\s*My request for Codex:\s*([\s\S]+)/i);
+  return match ? match[1].trim() : "";
+}
+
+function extractActiveFileName(text) {
+  const match = String(text || "").match(/##\s*Active file:\s*([^\n]+)/i);
+  if (!match) {
+    return "";
+  }
+  const value = match[1].trim().split(/\s+/).at(0) || "";
+  return path.basename(value.replace(/[\\]/g, "/"));
+}
+
+function isIdeContextDump(text) {
+  return /context from my (ide|editor) setup/i.test(text)
+    || /##\s*Active file:/i.test(text)
+    || /##\s*Open tabs?:/i.test(text);
+}
+
+function cwdLabel(cwd) {
+  return String(cwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "";
+}
+
+function humanizeSessionTitle(text, cwd = "") {
+  let cleaned = stripInjectedContext(text);
+  const request = extractIdeRequest(cleaned);
+  if (request) {
+    cleaned = request;
+  } else if (isIdeContextDump(cleaned)) {
+    cleaned = extractActiveFileName(cleaned);
+  }
+  cleaned = cleaned.replace(/^#+\s+/gm, "").replace(/\s+/g, " ").trim();
+  if (cleaned.length >= 2) {
+    return cleaned.slice(0, 42);
+  }
+  return cwdLabel(cwd) || "未命名对话";
+}
+
+function isGeneratedFallbackTitle(text) {
+  return /^rollout-/i.test(text) || /^[0-9a-f-]{16,}$/i.test(text);
+}
+
+function deriveSessionTitle(messages, cwd, fallback = "", titleHints = []) {
+  const candidates = [
+    ...asArray(titleHints),
+    ...asArray(messages)
+      .filter((message) => message.role === "user")
+      .map((message) => message.content),
+    fallback
+  ];
+  for (const text of candidates) {
+    const title = humanizeSessionTitle(text, "");
+    if (title && title !== "未命名对话" && !isGeneratedFallbackTitle(title)) {
+      return title;
+    }
+  }
+  return cwdLabel(cwd) || "未命名对话";
+}
+
+function normalizeUserMessageContent(text) {
+  const request = extractIdeRequest(text);
+  if (request) {
+    return request;
+  }
+  const stripped = stripInjectedContext(text);
+  if (!stripped) {
+    return "";
+  }
+  if (isIdeContextDump(stripped) && !extractIdeRequest(stripped)) {
+    return "";
+  }
+  return stripped;
+}
+
 function appendCodexMessage(messages, role, content, timestamp) {
-  const text = extractTextFromContent(content).trim();
+  let text = extractTextFromContent(content).trim();
   if (!text) {
     return;
   }
-  if (role === "user" && text.startsWith("<environment_context>")) {
-    return;
+  if (role === "user") {
+    text = normalizeUserMessageContent(text);
+    if (!text) {
+      return;
+    }
   }
   const last = messages.at(-1);
   if (last?.role === role) {
@@ -442,6 +869,12 @@ function applyRolloutLine(summary, line) {
 
   if (entry.type === "response_item") {
     if (payload.type === "message" && ["user", "assistant", "system"].includes(payload.role)) {
+      if (payload.role === "user") {
+        const raw = extractTextFromContent(payload.content).trim();
+        if (raw) {
+          summary.titleHints.push(raw);
+        }
+      }
       appendCodexMessage(summary.messages, payload.role === "assistant" ? "assistant" : payload.role, payload.content, timestamp);
     }
     return;
@@ -449,6 +882,10 @@ function applyRolloutLine(summary, line) {
 
   if (entry.type === "event_msg") {
     if (payload.type === "user_message") {
+      const raw = extractTextFromContent(payload.message).trim();
+      if (raw) {
+        summary.titleHints.push(raw);
+      }
       appendCodexMessage(summary.messages, "user", payload.message, timestamp);
     }
     if (payload.type === "agent_message") {
@@ -471,7 +908,8 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
     modelProvider: "",
     path: filePath,
     messageCount: 0,
-    messages: []
+    messages: [],
+    titleHints: []
   };
 
   for (const line of raw.split(/\r?\n/)) {
@@ -480,12 +918,10 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
     }
   }
 
-  summary.messages = summary.messages.filter((message) => !(message.role === "user" && message.content.startsWith("<environment_context>")));
+  summary.messages = summary.messages.filter((message) => !(message.role === "user" && !normalizeUserMessageContent(message.content)));
   summary.messageCount = summary.messages.length;
-  const firstUser = summary.messages.find((message) => message.role === "user");
-  if (firstUser?.content) {
-    summary.title = firstUser.content.replace(/\s+/g, " ").slice(0, 80);
-  }
+  summary.title = deriveSessionTitle(summary.messages, summary.cwd, summary.title, summary.titleHints);
+  delete summary.titleHints;
   if (!summary.id) {
     const match = filePath.match(/rollout-[^/]*-([0-9a-f-]{36})\.jsonl$/i);
     summary.id = match?.[1] || path.basename(filePath, ".jsonl");
@@ -496,12 +932,47 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
   return summary;
 }
 
+async function parseCachedCodexSessionSummary(filePath) {
+  const stat = await fs.stat(filePath);
+  const fingerprint = `${stat.size}:${stat.mtimeMs}`;
+  const cached = codexSessionSummaryCache.get(filePath);
+  if (cached?.fingerprint === fingerprint) return cached.summary;
+  const summary = await parseCodexSessionFile(filePath, false);
+  codexSessionSummaryCache.set(filePath, { fingerprint, summary });
+  if (summary?.id) codexSessionPathCache.set(summary.id, filePath);
+  return summary;
+}
+
+async function mapWithConcurrency(items, limit, mapper) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length || 1) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function findCodexSessionFile(sessionId) {
   if (!isUuid(sessionId)) {
     return null;
   }
+  const cachedPath = codexSessionPathCache.get(sessionId);
+  if (cachedPath) {
+    try {
+      await fs.access(cachedPath);
+      return cachedPath;
+    } catch {
+      codexSessionPathCache.delete(sessionId);
+    }
+  }
   const files = await walkFiles(codexSessionsDir, 500);
-  return files.find((filePath) => filePath.includes(sessionId)) || null;
+  const filePath = files.find((candidate) => candidate.includes(sessionId)) || null;
+  if (filePath) codexSessionPathCache.set(sessionId, filePath);
+  return filePath;
 }
 
 function parseEnvLines(value) {
@@ -566,25 +1037,30 @@ function parseCommandLine(input) {
 async function getStatus(res) {
   const version = await runCodex(["--version"], { timeoutMs: 8000 });
   const doctor = await runCodex(["doctor", "--json"], { timeoutMs: 12000 });
+  const doctorPayload = parseJsonOutput(doctor, null);
+  const health = doctorPayload?.overallStatus || (doctor.ok ? "ok" : "unavailable");
   sendJson(res, 200, {
     available: version.ok,
     version: version.stdout.trim().split(/\r?\n/).at(-1) || null,
-    codexPath: existsSync(codexBin) ? codexBin : "PATH:codex",
-    doctor: parseJsonOutput(doctor, null),
-    warnings: [version.stderr, doctor.stderr].filter(Boolean).join("\n").trim()
+    health,
+    warnings: health === "warning" ? "Codex 可用，但有非阻塞诊断提醒。" : ""
   });
 }
 
 async function listCodexSessions(res) {
   const files = await walkFiles(codexSessionsDir, 300);
-  const sessions = [];
-  for (const filePath of files) {
-    try {
-      sessions.push(await parseCodexSessionFile(filePath, false));
-    } catch {
-      continue;
-    }
+  const currentFiles = new Set(files);
+  for (const cachedPath of codexSessionSummaryCache.keys()) {
+    if (!currentFiles.has(cachedPath)) codexSessionSummaryCache.delete(cachedPath);
   }
+  const parsed = await mapWithConcurrency(files, 8, async (filePath) => {
+    try {
+      return await parseCachedCodexSessionSummary(filePath);
+    } catch {
+      return null;
+    }
+  });
+  const sessions = parsed.filter(Boolean);
   sessions.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   sendJson(res, 200, { sessions });
 }
@@ -598,19 +1074,62 @@ async function getCodexSession(res, sessionId) {
   sendJson(res, 200, { session });
 }
 
+function archiveResultOk(result) {
+  const output = `${result.stdout}\n${result.stderr}`.trim();
+  return result.ok && !/(^|\n)\s*(error:|Error:)|failed to archive session/i.test(output);
+}
+
 async function archiveCodexSession(res, sessionId) {
   if (!isUuid(sessionId)) {
     return sendError(res, 400, "Invalid Codex session id.");
   }
   const result = await runCodex(["archive", sessionId], { timeoutMs: 20000 });
-  const output = `${result.stdout}\n${result.stderr}`.trim();
-  const ok = result.ok && !/(^|\n)\s*(error:|Error:)|failed to archive session/i.test(output);
+  const ok = archiveResultOk(result);
   sendJson(res, ok ? 200 : 502, {
     ok,
     stdout: result.stdout.trim(),
     stderr: result.stderr.trim(),
     code: result.code
   });
+}
+
+async function archiveAllCodexSessions(res) {
+  const files = await walkFiles(codexSessionsDir, 500);
+  const sessionIds = [];
+  for (const filePath of files) {
+    try {
+      const parsed = await parseCachedCodexSessionSummary(filePath);
+      if (isUuid(parsed.id)) {
+        sessionIds.push(parsed.id);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  const uniqueIds = [...new Set(sessionIds)];
+  const pending = uniqueIds.slice();
+  const summary = { archived: 0, failed: 0 };
+  const workers = Array.from({ length: Math.min(6, pending.length || 1) }, async () => {
+    while (pending.length) {
+      const sessionId = pending.shift();
+      if (!sessionId) {
+        return;
+      }
+      try {
+        const result = await runCodex(["archive", sessionId], { timeoutMs: 15000 });
+        if (archiveResultOk(result)) {
+          summary.archived += 1;
+        } else {
+          summary.failed += 1;
+        }
+      } catch {
+        summary.failed += 1;
+      }
+    }
+  });
+  await Promise.all(workers);
+  sendJson(res, 200, { ok: summary.failed === 0, ...summary, total: uniqueIds.length });
 }
 
 async function uploadAttachment(req, res) {
@@ -942,7 +1461,7 @@ async function removeHost(res, id) {
 
 async function runTerminalCommand(req, res) {
   if (!terminalEnabled) {
-    return sendError(res, 403, "Terminal is disabled. Start the server with ENABLE_TERMINAL=1 to enable it.");
+    return sendError(res, 403, "终端当前不可用。");
   }
   const body = await readBody(req, 64 * 1024);
   const command = String(body.command || "").trim();
@@ -1007,7 +1526,7 @@ async function runTerminalCommand(req, res) {
 
 async function handleTerminalSocket(ws, req) {
   if (!terminalEnabled) {
-    ws.send(JSON.stringify({ type: "error", message: "Terminal is disabled. Start with ENABLE_TERMINAL=1." }));
+    ws.send(JSON.stringify({ type: "error", message: "终端当前不可用。" }));
     ws.close();
     return;
   }
@@ -1074,8 +1593,18 @@ async function runCodexStream(req, res) {
 
   const cwd = sanitizeCwd(body.cwd);
   const sandbox = ["read-only", "workspace-write", "danger-full-access"].includes(body.sandbox) ? body.sandbox : "workspace-write";
-  const approval = ["never", "on-request", "untrusted"].includes(body.approval) ? body.approval : "on-request";
+  const approval = ["approve-for-me", "never", "on-request", "untrusted"].includes(body.approval)
+    ? body.approval
+    : "approve-for-me";
   const sessionId = isUuid(body.sessionId) ? body.sessionId : null;
+  const sessionKey = String(body.sessionKey || sessionId || randomUUID()).slice(0, 128);
+  const conflictingRun = [...codexRuns.values()].find((run) => (
+    activeRunStatuses.has(run.status)
+    && (run.sessionKey === sessionKey || (sessionId && run.threadId === sessionId))
+  ));
+  if (conflictingRun) {
+    return sendError(res, 409, "This session already has a running task.", { run: publicCodexRun(conflictingRun) });
+  }
   const cwdExists = await directoryExists(cwd);
 
   if (!cwdExists && !sessionId) {
@@ -1084,43 +1613,36 @@ async function runCodexStream(req, res) {
 
   const processCwd = cwdExists ? cwd : __dirname;
   const command = existsSync(codexBin) ? codexBin : "codex";
-  const args = ["exec"];
-
-  if (sessionId) {
-    args.push("resume", "--json", "--skip-git-repo-check");
-  } else {
-    args.push("--json", "--color", "never", "--skip-git-repo-check", "-C", cwd, "-s", sandbox);
-  }
-
-  if (body.model) {
-    args.push("-m", String(body.model));
-  }
-  if (["minimal", "low", "medium", "high", "xhigh"].includes(body.effort)) {
-    args.push("-c", `model_reasoning_effort="${body.effort}"`);
-  }
-  if (body.profile) {
-    args.push("-p", String(body.profile));
-  }
-
-  for (const attachment of asArray(body.attachments)) {
-    const uploadPath = safeUploadedPath(attachment?.path);
-    if (uploadPath && existsSync(uploadPath) && String(attachment?.mime || "").startsWith("image/")) {
-      args.push("-i", uploadPath);
-    }
-  }
-
-  if (sessionId) {
-    args.push(sessionId);
-  }
-  args.push("-");
 
   res.writeHead(200, {
     "content-type": "application/x-ndjson; charset=utf-8",
     "cache-control": "no-store",
+    "x-accel-buffering": "no",
     connection: "keep-alive"
   });
+  res.flushHeaders();
 
-  const child = spawn(command, args, {
+  const now = new Date().toISOString();
+  const run = {
+    id: randomUUID(),
+    sessionKey,
+    threadId: sessionId,
+    status: "starting",
+    approval,
+    cwd: processCwd,
+    startedAt: now,
+    updatedAt: now,
+    finishedAt: null,
+    sequence: 0,
+    events: [],
+    subscribers: new Set([res]),
+    stop: null,
+    emit: null
+  };
+  codexRuns.set(run.id, run);
+  res.on("close", () => run.subscribers.delete(res));
+
+  const child = spawn(command, ["app-server"], {
     cwd: processCwd,
     env: { ...process.env, NO_COLOR: "1" },
     shell: false,
@@ -1128,15 +1650,166 @@ async function runCodexStream(req, res) {
   });
 
   let finished = false;
+  let stderrLog = "";
+  let nextRequestId = 1;
+  const pendingRequests = new Map();
+  let turnCompletion = null;
+  let activeThreadId = sessionId;
+  let activeTurnId = null;
+  let rejectProcessExit = null;
+  let childExited = false;
+  let terminationRequested = false;
+  let terminationTimer = null;
   const writeEvent = (event) => {
-    if (!res.destroyed) {
-      res.write(`${JSON.stringify(event)}\n`);
+    const storedEvent = { ...event, sequence: ++run.sequence };
+    run.updatedAt = new Date().toISOString();
+    if (storedEvent.type === "webui.thread" && isUuid(storedEvent.threadId)) run.threadId = storedEvent.threadId;
+    if (storedEvent.type === "webui.started") run.status = "running";
+    run.events.push(storedEvent);
+    if (run.events.length > 4000) run.events.splice(0, run.events.length - 4000);
+    for (const subscriber of run.subscribers) {
+      if (!subscriber.destroyed) subscriber.write(`${JSON.stringify(storedEvent)}\n`);
+    }
+  };
+  run.emit = writeEvent;
+
+  const sendMessage = (message) => {
+    if (!child.stdin.destroyed) {
+      child.stdin.write(`${JSON.stringify(message)}\n`);
     }
   };
 
+  const requestAppServer = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = nextRequestId++;
+    pendingRequests.set(id, { resolve, reject, method });
+    sendMessage({ method, id, params });
+  });
+
+  const terminateChild = () => {
+    if (childExited || terminationRequested) return;
+    terminationRequested = true;
+    child.kill("SIGTERM");
+    terminationTimer = setTimeout(() => {
+      if (!childExited) child.kill("SIGKILL");
+    }, 2500);
+    terminationTimer.unref?.();
+  };
+  run.stop = () => {
+    if (!activeThreadId || !activeTurnId) {
+      terminateChild();
+      return;
+    }
+    requestAppServer("turn/interrupt", { threadId: activeThreadId, turnId: activeTurnId })
+      .catch(() => terminateChild());
+    const fallbackTimer = setTimeout(() => {
+      if (!finished) terminateChild();
+    }, 5000);
+    fallbackTimer.unref?.();
+  };
+
+  const handleServerRequest = (message) => {
+    const autoApprove = approval === "approve-for-me" || approval === "never";
+    const isPermissionRequest = message.method === "item/permissions/requestApproval";
+    const approvalMethods = new Set([
+      "item/commandExecution/requestApproval",
+      "item/fileChange/requestApproval",
+      "execCommandApproval",
+      "applyPatchApproval"
+    ]);
+    if (isPermissionRequest && autoApprove) {
+      sendMessage({
+        id: message.id,
+        result: { permissions: message.params?.permissions || {}, scope: "turn" }
+      });
+      return;
+    }
+    if (approvalMethods.has(message.method) && autoApprove) {
+      sendMessage({ id: message.id, result: { decision: "accept" } });
+      return;
+    }
+    if (isPermissionRequest || approvalMethods.has(message.method)) {
+      const approvalId = randomUUID();
+      const createdAt = new Date();
+      let settled = false;
+      const pending = {
+        id: approvalId,
+        runId: run.id,
+        sessionKey: run.sessionKey,
+        threadId: run.threadId,
+        method: message.method,
+        params: message.params || {},
+        createdAt: createdAt.toISOString(),
+        expiresAt: new Date(createdAt.getTime() + approvalTimeoutMs).toISOString(),
+        resolve(decision) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(pending.timer);
+          pendingCodexApprovals.delete(approvalId);
+          if (isPermissionRequest) {
+            sendMessage({
+              id: message.id,
+              result: {
+                permissions: decision === "decline" ? {} : (message.params?.permissions || {}),
+                scope: decision === "acceptForSession" ? "session" : "turn"
+              }
+            });
+          } else {
+            sendMessage({ id: message.id, result: { decision } });
+          }
+          writeEvent({ type: "webui.approvalResolved", approvalId, decision });
+        }
+      };
+      pending.timer = setTimeout(() => {
+        pending.resolve("decline");
+        writeEvent({ type: "webui.warning", message: "批准请求等待超时，已自动拒绝。" });
+      }, approvalTimeoutMs);
+      pending.timer.unref?.();
+      pendingCodexApprovals.set(approvalId, pending);
+      writeEvent({ type: "webui.approval", approval: publicCodexApproval(pending) });
+      return;
+    }
+    sendMessage({ id: message.id, error: { code: -32601, message: "Interactive request is not supported by this WebUI." } });
+  };
+
+  const handleAppServerMessage = (message) => {
+    if (Object.hasOwn(message, "id") && !message.method) {
+      const pending = pendingRequests.get(message.id);
+      if (!pending) return;
+      pendingRequests.delete(message.id);
+      if (message.error) {
+        pending.reject(new Error(message.error.message || `${pending.method} failed.`));
+      } else {
+        pending.resolve(message.result);
+      }
+      return;
+    }
+    if (Object.hasOwn(message, "id") && message.method) {
+      handleServerRequest(message);
+      return;
+    }
+    if (!message.method) return;
+    writeEvent({ type: "codex.event", data: message });
+    if (message.method === "turn/completed" && turnCompletion) {
+      const completion = turnCompletion;
+      turnCompletion = null;
+      completion.resolve(message.params?.turn || {});
+    }
+  };
+
+  const output = createInterface({ input: child.stdout });
+  output.on("line", (line) => {
+    if (!line.trim()) return;
+    try {
+      handleAppServerMessage(JSON.parse(line));
+    } catch {
+      writeEvent({ type: "codex.stdout", text: line });
+    }
+  });
+
+  writeEvent({ type: "webui.run", runId: run.id, sessionKey, status: run.status });
   writeEvent({ type: "webui.started", cwd: processCwd, requestedCwd: cwd, sandbox, approval, sessionId });
   if (!cwdExists && sessionId) {
-    writeEvent({ type: "webui.warning", message: `Original working directory no longer exists: ${cwd}. Running resume from ${processCwd}.` });
+    writeEvent({ type: "webui.warning", message: "原工作目录已不存在，已从 WebUI 目录恢复此会话。" });
   }
   const nonImageAttachments = asArray(body.attachments)
     .map((attachment) => ({ ...attachment, path: safeUploadedPath(attachment?.path) }))
@@ -1147,42 +1820,111 @@ async function runCodexStream(req, res) {
         .join("\n")}\n</attachments>`
     : prompt;
 
-  child.stdin.write(promptWithAttachments);
-  child.stdin.end();
-
-  child.stdout.on("data", (chunk) => {
-    const lines = chunk.toString("utf8").split(/\r?\n/).filter(Boolean);
-    for (const line of lines) {
-      try {
-        writeEvent({ type: "codex.event", data: JSON.parse(line) });
-      } catch {
-        writeEvent({ type: "codex.stdout", text: line });
-      }
-    }
-  });
-
   child.stderr.on("data", (chunk) => {
-    const text = chunk.toString("utf8");
-    for (const line of text.split(/\r?\n/).filter(Boolean)) {
-      writeEvent({ type: "codex.stderr", text: line });
-    }
+    if (stderrLog.length < 64 * 1024) stderrLog += chunk.toString("utf8");
   });
 
   child.on("error", (error) => {
-    writeEvent({ type: "webui.error", message: error.message });
+    console.error("Failed to start Codex process:", error);
+    writeEvent({ type: "webui.error", message: "Codex process could not be started." });
+    rejectProcessExit?.(error);
   });
 
   child.on("close", (code) => {
-    finished = true;
-    writeEvent({ type: "webui.finished", code });
-    res.end();
+    childExited = true;
+    if (terminationTimer) clearTimeout(terminationTimer);
+    const error = new Error(`Codex app-server exited with code ${code}.`);
+    for (const pending of pendingRequests.values()) pending.reject(error);
+    pendingRequests.clear();
+    if (!finished && code !== 0 && stderrLog.trim()) {
+      console.error(`Codex exited with code ${code}:\n${stderrLog.trim()}`);
+    }
+    if (!finished) rejectProcessExit?.(error);
   });
 
-  req.on("close", () => {
-    if (!finished) {
-      child.kill("SIGTERM");
-    }
+  const processExit = new Promise((_, reject) => {
+    rejectProcessExit = reject;
   });
+
+  try {
+    await Promise.race([
+      requestAppServer("initialize", {
+        clientInfo: { name: "codex_webui", title: "Codex WebUI", version: "1.1.0" }
+      }),
+      processExit
+    ]);
+    sendMessage({ method: "initialized", params: {} });
+
+    const approvalPolicy = approval === "approve-for-me" ? "on-request" : approval;
+    const threadParams = {
+      cwd: processCwd,
+      sandbox,
+      approvalPolicy,
+      approvalsReviewer: approval === "approve-for-me" ? "auto_review" : "user"
+    };
+    if (body.model) threadParams.model = String(body.model);
+    const threadResult = await Promise.race([
+      requestAppServer(sessionId ? "thread/resume" : "thread/start", sessionId ? { threadId: sessionId, ...threadParams } : threadParams),
+      processExit
+    ]);
+    const threadId = threadResult?.thread?.id || sessionId;
+    if (!threadId) throw new Error("Codex app-server did not return a thread id.");
+    activeThreadId = threadId;
+    writeEvent({ type: "webui.thread", threadId });
+
+    const input = [{ type: "text", text: promptWithAttachments }];
+    for (const attachment of asArray(body.attachments)) {
+      const uploadPath = safeUploadedPath(attachment?.path);
+      if (uploadPath && existsSync(uploadPath) && String(attachment?.mime || "").startsWith("image/")) {
+        input.push({ type: "localImage", path: uploadPath });
+      }
+    }
+    const turnParams = { threadId, input };
+    if (body.model) turnParams.model = String(body.model);
+    if (["minimal", "low", "medium", "high", "xhigh"].includes(body.effort)) {
+      turnParams.effort = body.effort;
+    }
+    const completed = new Promise((resolve, reject) => {
+      turnCompletion = { resolve, reject };
+    });
+    const startedTurn = await Promise.race([requestAppServer("turn/start", turnParams), processExit]);
+    activeTurnId = startedTurn?.turn?.id || null;
+    const turn = await Promise.race([completed, processExit]);
+    const ok = turn?.status === "completed";
+    const paused = run.status === "pausing";
+    finished = true;
+    run.status = paused ? "paused" : (ok ? "completed" : "failed");
+    run.finishedAt = new Date().toISOString();
+    if (!ok && !paused && turn?.error?.message) {
+      writeEvent({ type: "webui.error", message: turn.error.message });
+    }
+    writeEvent({ type: "webui.finished", code: ok || paused ? 0 : 1, status: run.status });
+  } catch (error) {
+    if (!finished) {
+      const paused = terminationRequested && run.status === "pausing";
+      if (!paused) console.error("Codex app-server run failed:", error, stderrLog.trim());
+      run.status = paused ? "paused" : "failed";
+      run.finishedAt = new Date().toISOString();
+      if (!paused) writeEvent({ type: "webui.error", message: error.message || "Codex app-server run failed." });
+      writeEvent({ type: "webui.finished", code: paused ? 0 : 1, status: run.status });
+    }
+  } finally {
+    finished = true;
+    for (const pending of pendingCodexApprovals.values()) {
+      if (pending.runId === run.id) pending.resolve("decline");
+    }
+    output.close();
+    terminateChild();
+    for (const subscriber of run.subscribers) {
+      if (!subscriber.destroyed) subscriber.end();
+    }
+    run.subscribers.clear();
+    run.emit = null;
+    run.stop = null;
+    const cleanupTimer = setTimeout(() => codexRuns.delete(run.id), runRetentionMs);
+    cleanupTimer.unref?.();
+  }
+
 }
 
 async function serveStatic(req, res) {
@@ -1222,14 +1964,35 @@ async function serveStatic(req, res) {
 }
 
 async function route(req, res) {
+  if (!requestIsAuthorized(req)) return sendUnauthorized(res);
+  if (!requestOriginIsAllowed(req)) return sendError(res, 403, "Forbidden origin.");
   const url = new URL(req.url, `http://${req.headers.host}`);
   const pathname = url.pathname;
 
   try {
     if (req.method === "GET" && pathname === "/api/status") return getStatus(res);
     if (req.method === "GET" && pathname === "/api/models") return listModels(res);
+    if (req.method === "GET" && pathname === "/api/cwd") return await checkWorkingDirectory(req, res);
     if (req.method === "GET" && pathname === "/api/directories") return await listDirectories(req, res);
+    if (req.method === "GET" && pathname === "/api/files/preview") return await previewWorkspaceFile(req, res);
+    if (req.method === "GET" && pathname === "/api/settings/file-preview") return await getFilePreviewSettings(res);
+    if (req.method === "PUT" && pathname === "/api/settings/file-preview") return await updateFilePreviewSettings(req, res);
+    if (req.method === "DELETE" && pathname === "/api/settings/file-preview/cache") return await clearFilePreviewCache(res);
     if (req.method === "GET" && pathname === "/api/codex/sessions") return listCodexSessions(res);
+    if (req.method === "GET" && pathname === "/api/codex/runs") return listCodexRuns(res);
+    if (req.method === "GET" && pathname === "/api/codex/approvals") return listCodexApprovals(res);
+    if (req.method === "POST" && pathname.startsWith("/api/codex/approvals/")) {
+      return await resolveCodexApproval(req, res, decodeURIComponent(pathname.slice("/api/codex/approvals/".length)));
+    }
+    if (req.method === "GET" && pathname.startsWith("/api/codex/runs/") && pathname.endsWith("/events")) {
+      const runId = decodeURIComponent(pathname.slice("/api/codex/runs/".length, -"/events".length));
+      return attachCodexRun(req, res, runId);
+    }
+    if (req.method === "POST" && pathname.startsWith("/api/codex/runs/") && pathname.endsWith("/pause")) {
+      const runId = decodeURIComponent(pathname.slice("/api/codex/runs/".length, -"/pause".length));
+      return pauseCodexRun(res, runId);
+    }
+    if (req.method === "DELETE" && pathname === "/api/codex/sessions") return archiveAllCodexSessions(res);
     if (req.method === "GET" && pathname.startsWith("/api/codex/sessions/")) {
       return getCodexSession(res, decodeURIComponent(pathname.slice("/api/codex/sessions/".length)));
     }
@@ -1258,7 +2021,12 @@ async function route(req, res) {
     if (error instanceof SyntaxError) {
       return sendError(res, 400, "Invalid JSON body.");
     }
-    return sendError(res, error.statusCode || 500, error.message || "Internal server error.");
+    const statusCode = error.statusCode || 500;
+    if (statusCode >= 500) {
+      console.error("Request failed:", error);
+      return sendError(res, statusCode, "服务暂时不可用，请稍后重试。");
+    }
+    return sendError(res, statusCode, error.message || "Request failed.");
   }
 }
 
@@ -1267,14 +2035,19 @@ const terminalWss = new WebSocketServer({ noServer: true });
 
 terminalWss.on("connection", (ws, req) => {
   handleTerminalSocket(ws, req).catch((error) => {
+    console.error("Terminal connection failed:", error);
     if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: "error", message: error.message }));
+      ws.send(JSON.stringify({ type: "error", message: "终端连接失败，请稍后重试。" }));
       ws.close();
     }
   });
 });
 
 server.on("upgrade", (req, socket, head) => {
+  if (!requestIsAuthorized(req) || !requestOriginIsAllowed(req)) {
+    socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+    return;
+  }
   const url = new URL(req.url, `http://${req.headers.host}`);
   if (url.pathname !== "/terminal") {
     socket.destroy();
@@ -1287,4 +2060,17 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(port, host, () => {
   console.log(`Codex WebUI listening on http://${host}:${port}`);
+  if (!["127.0.0.1", "::1", "localhost"].includes(host) && !accessPassword) {
+    console.warn("WARNING: Codex WebUI is reachable beyond localhost without a password. Set CODEX_WEBUI_PASSWORD.");
+  }
 });
+
+const previewCleanupTimer = setInterval(async () => {
+  try {
+    const state = await loadState();
+    await cleanPreviewCacheIfDue(state.filePreview);
+  } catch (error) {
+    console.error("Preview cache cleanup failed:", error);
+  }
+}, 60 * 1000);
+previewCleanupTimer.unref?.();

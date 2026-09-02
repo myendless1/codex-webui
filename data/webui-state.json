@@ -9,5 +9,10 @@
       "notes": "Uses the codex command available on this machine."
     }
   ],
-  "hostSettings": {}
+  "hostSettings": {},
+  "filePreview": {
+    "extensions": ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
+    "maxFileSizeMb": 20,
+    "cleanupIntervalMinutes": 30
+  }
 }

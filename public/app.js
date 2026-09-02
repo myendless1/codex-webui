@@ -12,9 +12,114 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
   }
 });
 
+const previewableImagePattern = /\.(?:svg|png|jpe?g|gif|webp|avif)$/i;
+const defaultFilePreviewSettings = {
+  extensions: ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
+  maxFileSizeMb: 20,
+  cleanupIntervalMinutes: 30
+};
+
+function previewableFilePattern() {
+  const extensions = state?.filePreviewSettings?.extensions || defaultFilePreviewSettings.extensions;
+  const alternation = extensions.map((entry) => String(entry).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  return new RegExp(`(?:/[^\\s<>"'\\x60]+)+\\.(?:${alternation})(?=$|[\\s\\]),.;!?，。；：！？、}])`, "gi");
+}
+
+function isAllowedPreviewPath(filePath) {
+  const extension = String(filePath || "").split(/[?#]/, 1)[0].match(/\.([a-z0-9_-]+)$/i)?.[1]?.toLowerCase();
+  const allowed = state?.filePreviewSettings?.extensions || defaultFilePreviewSettings.extensions;
+  return Boolean(extension && allowed.includes(extension));
+}
+
+function localPreviewPath(value) {
+  const raw = String(value || "");
+  if (!raw || raw.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(raw)) return "";
+  let decoded = raw;
+  try {
+    decoded = decodeURIComponent(raw);
+  } catch {
+    // Keep the original path when it contains a literal percent sign.
+  }
+  decoded = decoded.split(/[?#]/, 1)[0];
+  return isAllowedPreviewPath(decoded) ? decoded : "";
+}
+
+function filePreviewUrl(filePath) {
+  const cwd = activeSession()?.cwd || "";
+  return `/api/files/preview?${new URLSearchParams({ path: filePath, cwd })}`;
+}
+
+function decorateFilePreviews(html) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+
+  const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
+  const textNodes = [];
+  while (walker.nextNode()) textNodes.push(walker.currentNode);
+  for (const textNode of textNodes) {
+    if (textNode.parentElement?.closest("a, pre, code, script, style")) continue;
+    const value = textNode.nodeValue || "";
+    const filePattern = previewableFilePattern();
+    if (!filePattern.test(value)) continue;
+    filePattern.lastIndex = 0;
+    const fragment = document.createDocumentFragment();
+    let offset = 0;
+    for (const match of value.matchAll(filePattern)) {
+      fragment.append(value.slice(offset, match.index));
+      const anchor = document.createElement("a");
+      anchor.href = filePreviewUrl(match[0]);
+      anchor.target = "_blank";
+      anchor.rel = "noopener noreferrer";
+      anchor.className = "file-preview-link";
+      anchor.textContent = match[0];
+      fragment.append(anchor);
+      offset = match.index + match[0].length;
+    }
+    fragment.append(value.slice(offset));
+    textNode.replaceWith(fragment);
+  }
+
+  template.content.querySelectorAll("code").forEach((code) => {
+    const filePath = code.textContent?.trim() || "";
+    if (!localPreviewPath(filePath)) return;
+    const anchor = document.createElement("a");
+    anchor.href = filePreviewUrl(filePath);
+    anchor.target = "_blank";
+    anchor.rel = "noopener noreferrer";
+    anchor.className = "file-preview-link code-link";
+    anchor.append(code.cloneNode(true));
+    code.replaceWith(anchor);
+  });
+
+  template.content.querySelectorAll("a[href]").forEach((anchor) => {
+    const href = anchor.getAttribute("href") || "";
+    const filePath = localPreviewPath(href);
+    if (filePath) {
+      anchor.href = filePreviewUrl(filePath);
+      anchor.classList.add("file-preview-link");
+    }
+  });
+
+  template.content.querySelectorAll("img[src]").forEach((image) => {
+    const src = image.getAttribute("src") || "";
+    const filePath = localPreviewPath(src);
+    if (filePath && previewableImagePattern.test(filePath)) {
+      image.src = filePreviewUrl(filePath);
+      image.classList.add("file-preview-image");
+      image.tabIndex = 0;
+      image.setAttribute("role", "link");
+      image.dataset.previewUrl = image.src;
+      image.title = "点击打开原图";
+    }
+  });
+
+  return template.innerHTML;
+}
+
 function renderMarkdown(content) {
   const html = marked.parse(String(content || ""));
-  return DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  const sanitized = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+  return decorateFilePreviews(sanitized);
 }
 
 const views = [
@@ -24,12 +129,19 @@ const views = [
 const fallbackModels = ["gpt-5.6", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5", "gpt-5.1-codex", "gpt-5", "o3", "o4-mini"];
 
 function initialViewId() {
-  const hashView = window.location.hash.replace(/^#/, "");
+  const url = new URL(window.location.href);
+  const embeddedView = url.searchParams.get("session")?.split("#")[1] || "";
+  const hashView = url.hash.replace(/^#/, "") || embeddedView;
   if (views.some((view) => view.id === hashView)) {
     return hashView;
   }
   const storedView = localStorage.getItem("codex-webui:view");
   return views.some((view) => view.id === storedView) ? storedView : "console";
+}
+
+function sessionIdFromUrl() {
+  const value = new URL(window.location.href).searchParams.get("session") || "";
+  return value.split("#", 1)[0].trim() || null;
 }
 
 function createId() {
@@ -41,6 +153,10 @@ function createId() {
     // Non-local HTTP origins may not expose randomUUID.
   }
   return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function isUuid(value) {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ""));
 }
 
 function readJsonStorage(key, fallback) {
@@ -68,14 +184,16 @@ const state = {
   mcp: [],
   plugins: { installed: [], available: [] },
   localSkills: [],
+  filePreviewSettings: { ...defaultFilePreviewSettings, extensions: [...defaultFilePreviewSettings.extensions] },
   hosts: [],
   codexSessions: [],
-  attachments: [],
+  attachmentsBySession: {},
+  uploadingSessionKeys: new Set(),
   selectedHost: localStorage.getItem("codex-webui:host") || "local-codex",
   theme: localStorage.getItem("codex-webui:theme") === "dark" ? "dark" : "light",
   selectedModel: localStorage.getItem("codex-webui:model") || "",
   models: [],
-  selectedApproval: localStorage.getItem("codex-webui:approval") || "on-request",
+  selectedApproval: localStorage.getItem("codex-webui:approval") || "approve-for-me",
   selectedSandbox: localStorage.getItem("codex-webui:sandbox") || "workspace-write",
   selectedEffort: localStorage.getItem("codex-webui:effort") || "",
   composerMenu: null,
@@ -91,19 +209,33 @@ const state = {
   settingsSection: localStorage.getItem("codex-webui:settings-section") || "connections",
   hostFormOpen: false,
   collapsedHostSessions: readJsonStorage("codex-webui:collapsed-host-sessions", {}),
+  collapsedCwdGroups: readJsonStorage("codex-webui:collapsed-cwd-groups", {}),
   collapsedHostSettings: readJsonStorage("codex-webui:collapsed-host-settings", {}),
   sidebarCollapsed: localStorage.getItem("codex-webui:sidebar-collapsed") === "true",
-  terminalCollapsed: localStorage.getItem("codex-webui:terminal-collapsed") === "true",
+  sessionDrawerOpen: false,
+  newSessionSheetOpen: false,
+  terminalCollapsed: localStorage.getItem("codex-webui:terminal-collapsed") !== "false",
   terminal: null,
   terminalFit: null,
   terminalSocket: null,
   terminalConnected: false,
+  terminalShouldReconnect: false,
+  terminalReconnectTimer: null,
+  terminalReconnectAttempts: 0,
+  terminalSelectionMode: false,
+  terminalPointerGesture: null,
   busy: false,
+  sessionRuns: {},
+  approvals: [],
+  approvalBusy: false,
+  approvalFocusId: null,
+  promptDrafts: readJsonStorage("codex-webui:prompt-drafts", {}),
   events: [],
   sessions: loadSessions(),
-  activeSessionId: null,
+  sessionSettings: readJsonStorage("codex-webui:session-settings", {}),
+  activeSessionId: sessionIdFromUrl() || localStorage.getItem("codex-webui:active-session") || null,
   newSessionCwd: localStorage.getItem("codex-webui:cwd") || "",
-  directoryPicker: { open: false, path: "", parent: null, roots: [], directories: [] },
+  directoryPicker: { open: false, intent: null, path: "", parent: null, roots: [], directories: [] },
   localSkillPrefs: normalizeSkillPrefs(readJsonStorage("codex-webui:skill-prefs", {}))
 };
 
@@ -112,7 +244,7 @@ if (!["mcp", "skills"].includes(state.settingsTab)) {
   localStorage.setItem("codex-webui:settings-tab", state.settingsTab);
 }
 
-if (!["mcp", "skills"].includes(state.settingsSection)) {
+if (!["mcp", "skills", "file-preview"].includes(state.settingsSection)) {
   state.settingsSection = "mcp";
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
 }
@@ -131,12 +263,130 @@ function formValues(form) {
 }
 
 function loadSessions() {
-  return readJsonStorage("codex-webui:sessions", []);
+  const sessions = readJsonStorage("codex-webui:sessions", []);
+  return Array.isArray(sessions) ? sessions : [];
 }
 
 function saveSessions() {
-  localStorage.setItem("codex-webui:sessions", JSON.stringify(state.sessions.filter((session) => session.source !== "codex").slice(-12)));
+  localStorage.setItem("codex-webui:sessions", JSON.stringify(state.sessions.filter((session) => session.source !== "codex").slice(0, 12)));
   localStorage.removeItem("codex-webui:session");
+}
+
+function attachmentKeyForSession(session = activeSession()) {
+  return session?.id || "__new__";
+}
+
+function sessionAttachments(session = activeSession()) {
+  const key = attachmentKeyForSession(session);
+  if (!Array.isArray(state.attachmentsBySession[key])) state.attachmentsBySession[key] = [];
+  return state.attachmentsBySession[key];
+}
+
+function moveSessionAttachments(fromKey, toKey) {
+  if (!fromKey || !toKey || fromKey === toKey) return;
+  if (state.attachmentsBySession[fromKey]?.length) state.attachmentsBySession[toKey] = state.attachmentsBySession[fromKey];
+  delete state.attachmentsBySession[fromKey];
+}
+
+function renderAttachmentChips(sessionKey) {
+  return (state.attachmentsBySession[sessionKey] || []).map((attachment) => `
+    <span class="file-chip">
+      <span>${escapeHtml(attachment.name)}</span>
+      <button type="button" title="移除附件" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
+    </span>
+  `).join("");
+}
+
+function updateAttachmentTray(sessionKey) {
+  const form = $(`[data-session-key="${CSS.escape(sessionKey)}"]`);
+  const tray = form?.querySelector(".attachment-tray");
+  if (tray) tray.innerHTML = renderAttachmentChips(sessionKey);
+}
+
+function sessionRun(session = activeSession()) {
+  if (!session) return null;
+  return state.sessionRuns[session.id] || (session.codexThreadId ? state.sessionRuns[session.codexThreadId] : null) || null;
+}
+
+function runIsActive(run = sessionRun()) {
+  return ["starting", "running", "pausing", "reconnecting"].includes(run?.status);
+}
+
+function draftKeyForSession(session = activeSession()) {
+  return session?.id || "__new__";
+}
+
+let promptDraftSaveTimer = null;
+let promptDraftStorageWarningShown = false;
+
+function persistPromptDrafts() {
+  if (promptDraftSaveTimer) clearTimeout(promptDraftSaveTimer);
+  promptDraftSaveTimer = null;
+  try {
+    const entries = Object.entries(state.promptDrafts).slice(-32);
+    const snapshot = {};
+    let remainingCharacters = 200000;
+    for (const [key, value] of entries.reverse()) {
+      const text = String(value || "");
+      if (!text || text.length > remainingCharacters) continue;
+      snapshot[key] = text;
+      remainingCharacters -= text.length;
+    }
+    localStorage.setItem("codex-webui:prompt-drafts", JSON.stringify(snapshot));
+  } catch (error) {
+    console.warn("Unable to persist prompt drafts", error);
+    if (!promptDraftStorageWarningShown) {
+      promptDraftStorageWarningShown = true;
+      toast("草稿存储空间不足，本次输入仍会保留到页面关闭前。");
+    }
+  }
+}
+
+function savePromptDraft(key, value, immediate = false) {
+  if (!key) return;
+  if (value) {
+    delete state.promptDrafts[key];
+    state.promptDrafts[key] = value;
+  }
+  else delete state.promptDrafts[key];
+  if (immediate) persistPromptDrafts();
+  else {
+    if (promptDraftSaveTimer) clearTimeout(promptDraftSaveTimer);
+    promptDraftSaveTimer = setTimeout(persistPromptDrafts, 300);
+  }
+}
+
+function captureVisiblePromptDraft() {
+  const input = $("textarea[name='prompt']");
+  const form = input?.closest("[data-session-key]");
+  if (input && form) savePromptDraft(form.dataset.sessionKey, input.value);
+}
+
+function executionSettings() {
+  return {
+    approval: state.selectedApproval,
+    sandbox: state.selectedSandbox,
+    model: state.selectedModel,
+    effort: state.selectedEffort
+  };
+}
+
+function saveSessionSettings(sessionId = state.activeSessionId) {
+  if (!sessionId) return;
+  state.sessionSettings[sessionId] = executionSettings();
+  localStorage.setItem("codex-webui:session-settings", JSON.stringify(state.sessionSettings));
+}
+
+function applySessionSettings(sessionId) {
+  const settings = state.sessionSettings[sessionId];
+  if (!settings) {
+    saveSessionSettings(sessionId);
+    return;
+  }
+  if (["approve-for-me", "on-request", "untrusted", "never"].includes(settings.approval)) state.selectedApproval = settings.approval;
+  if (["read-only", "workspace-write", "danger-full-access"].includes(settings.sandbox)) state.selectedSandbox = settings.sandbox;
+  state.selectedModel = String(settings.model || "");
+  state.selectedEffort = String(settings.effort || "");
 }
 
 function saveSkillPrefs() {
@@ -145,6 +395,140 @@ function saveSkillPrefs() {
 
 function saveCollapsedHostSessions() {
   localStorage.setItem("codex-webui:collapsed-host-sessions", JSON.stringify(state.collapsedHostSessions));
+}
+
+function saveCollapsedCwdGroups() {
+  localStorage.setItem("codex-webui:collapsed-cwd-groups", JSON.stringify(state.collapsedCwdGroups));
+}
+
+function stripInjectedContext(text) {
+  return String(text || "")
+    .replace(/<([a-z][\w -]*)>[\s\S]*?<\/\1>/gi, (block, name) => (
+      [
+        "environment_context",
+        "user_instructions",
+        "developer_instructions",
+        "skills_instructions",
+        "permissions instructions",
+        "apps_instructions",
+        "plugins_instructions",
+        "recommended_plugins",
+        "multi_agent_mode"
+      ].includes(String(name).toLowerCase()) ? "" : block
+    ))
+    .replace(/<(environment_context|recommended_plugins|user_instructions)[\s\S]*$/gi, "")
+    .trim();
+}
+
+function extractIdeRequest(text) {
+  const match = String(text || "").match(/##\s*My request for Codex:\s*([\s\S]+)/i);
+  return match ? match[1].trim() : "";
+}
+
+function extractActiveFileName(text) {
+  const match = String(text || "").match(/##\s*Active file:\s*([^\n]+)/i);
+  if (!match) {
+    return "";
+  }
+  const value = match[1].trim().split(/\s+/).at(0) || "";
+  return value.split(/[\\/]/).filter(Boolean).at(-1) || value;
+}
+
+function isIdeContextDump(text) {
+  return /context from my (ide|editor) setup/i.test(text)
+    || /##\s*Active file:/i.test(text)
+    || /##\s*Open tabs?:/i.test(text);
+}
+
+function cwdLabel(cwd) {
+  return String(cwd || "").split(/[\\/]/).filter(Boolean).at(-1) || "";
+}
+
+function humanizeSessionTitle(text, cwd = "") {
+  let cleaned = stripInjectedContext(text);
+  const request = extractIdeRequest(cleaned);
+  if (request) {
+    cleaned = request;
+  } else if (isIdeContextDump(cleaned)) {
+    cleaned = extractActiveFileName(cleaned);
+  }
+  cleaned = cleaned.replace(/^#+\s+/gm, "").replace(/\s+/g, " ").trim();
+  if (cleaned.length >= 2) {
+    return cleaned.slice(0, 42);
+  }
+  return cwdLabel(cwd) || "未命名对话";
+}
+
+function isGeneratedFallbackTitle(text) {
+  return /^rollout-/i.test(text) || /^[0-9a-f-]{16,}$/i.test(text);
+}
+
+function displaySessionTitle(session) {
+  if (!session) {
+    return "新对话";
+  }
+  const candidates = [
+    ...(session.messages || [])
+      .filter((message) => message.role === "user")
+      .map((message) => message.content),
+    session.title
+  ];
+  for (const text of candidates) {
+    const title = humanizeSessionTitle(text, "");
+    if (title && title !== "未命名对话" && !isGeneratedFallbackTitle(title)) {
+      return title;
+    }
+  }
+  return cwdLabel(session.cwd) || "未命名对话";
+}
+
+function knownWorkingDirectories() {
+  const seen = new Set();
+  const directories = [];
+  for (const session of mergedSessions()) {
+    const cwd = String(session.cwd || "").trim();
+    if (!cwd || seen.has(cwd)) {
+      continue;
+    }
+    seen.add(cwd);
+    directories.push(cwd);
+  }
+  const current = String(state.newSessionCwd || "").trim();
+  if (current && !seen.has(current)) {
+    directories.unshift(current);
+  }
+  return directories;
+}
+
+function sessionsByCwd(sessions) {
+  const groups = new Map();
+  for (const session of sessions) {
+    const key = String(session.cwd || "").trim();
+    if (!groups.has(key)) {
+      groups.set(key, []);
+    }
+    groups.get(key).push(session);
+  }
+  return [...groups.entries()]
+    .map(([cwd, items]) => ({
+      cwd,
+      label: cwdLabel(cwd) || "未指定目录",
+      sessions: items.slice().sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+    }))
+    .sort((a, b) => {
+      const aTime = Math.max(...a.sessions.map((item) => new Date(item.updatedAt || 0).getTime()), 0);
+      const bTime = Math.max(...b.sessions.map((item) => new Date(item.updatedAt || 0).getTime()), 0);
+      return bTime - aTime;
+    });
+}
+
+function isCwdGroupCollapsed(cwd) {
+  const key = String(cwd || "");
+  if (Object.prototype.hasOwnProperty.call(state.collapsedCwdGroups, key)) {
+    return state.collapsedCwdGroups[key] === true;
+  }
+  const active = activeSession();
+  return !active || String(active.cwd || "") !== key;
 }
 
 function saveCollapsedHostSettings() {
@@ -163,6 +547,18 @@ function activeSession() {
   return session;
 }
 
+function syncSessionUrl(sessionId = state.activeSessionId) {
+  const url = new URL(window.location.href);
+  const rawSessionId = String(sessionId || "");
+  const [cleanSessionId, embeddedView] = rawSessionId.split("#");
+  if (cleanSessionId) url.searchParams.set("session", cleanSessionId);
+  else url.searchParams.delete("session");
+  if (!url.hash && views.some((view) => view.id === embeddedView)) url.hash = embeddedView;
+  const nextUrl = `${url.pathname}${url.search}${url.hash}`;
+  const currentUrl = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  if (nextUrl !== currentUrl) history.replaceState(history.state, "", nextUrl);
+}
+
 function mergedSessions() {
   const codex = state.codexSessions.map((session) => ({
     ...session,
@@ -170,12 +566,12 @@ function mergedSessions() {
     source: "codex",
     messages: session.messages || []
   }));
-  const existingIds = new Set(codex.map((session) => session.id));
+  const codexIds = new Set(codex.map((session) => session.id));
   return [
-    ...codex,
     ...state.sessions
-      .filter((session) => !existingIds.has(session.id))
-      .map((session) => ({ ...session, hostId: session.hostId || "local-codex" }))
+      .filter((session) => !codexIds.has(session.id))
+      .map((session) => ({ ...session, hostId: session.hostId || "local-codex" })),
+    ...codex
   ];
 }
 
@@ -213,6 +609,7 @@ async function changeHost(hostId) {
   const current = activeSession();
   if (current && sessionHostId(current) !== hostId) {
     state.activeSessionId = null;
+    localStorage.removeItem("codex-webui:active-session");
   }
   setBusy(true);
   try {
@@ -237,7 +634,7 @@ async function api(path, options = {}) {
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(payload.error || payload.stderr || `Request failed: ${response.status}`);
+    throw new Error(payload.error || `请求失败（${response.status}）`);
   }
   return payload;
 }
@@ -251,6 +648,12 @@ function toast(message) {
   setTimeout(() => node.remove(), 3200);
 }
 
+function recordEvent(text) {
+  if (state.events[0]?.text === text) return;
+  state.events.unshift({ time: nowTime(), text });
+  if (state.events.length > 100) state.events.length = 100;
+}
+
 function setBusy(value) {
   state.busy = value;
   applyBusyState();
@@ -261,7 +664,17 @@ function applyBusyState() {
     if (control.dataset.keepEnabled === "true") {
       return;
     }
-    control.disabled = state.busy && control.dataset.nav !== "true";
+    if (state.busy && control.dataset.nav !== "true") {
+      if (!control.disabled) {
+        control.dataset.busyDisabled = "true";
+      }
+      control.disabled = true;
+      return;
+    }
+    if (control.dataset.busyDisabled === "true") {
+      control.disabled = false;
+      delete control.dataset.busyDisabled;
+    }
   });
 }
 
@@ -350,9 +763,41 @@ function applySidebarState() {
 }
 
 async function refreshAll() {
-  await Promise.allSettled([refreshStatus(), refreshHosts(), refreshLocalSkills(), refreshCodexSessions(), refreshModels()]);
-  await Promise.allSettled([refreshMcp(), refreshPlugins()]);
-  renderAll();
+  const secondaryRefresh = Promise.allSettled([
+    refreshStatus(),
+    refreshLocalSkills(),
+    refreshRunStatuses(),
+    refreshApprovals(),
+    refreshModels(),
+    refreshFilePreviewSettings(),
+    refreshMcp(),
+    refreshPlugins()
+  ]);
+  await Promise.allSettled([refreshHosts(), restoreActiveSession()]);
+  const promptInput = $("textarea[name='prompt']");
+  const keepComposerMounted = document.activeElement?.matches("textarea[name='prompt']")
+    || (document.body.classList.contains("keyboard-open") && Boolean(promptInput?.value));
+  if (keepComposerMounted) {
+    renderTopbar();
+    renderSettings();
+    setView(state.activeView);
+    renderSidebarContent();
+    renderSessionDrawer();
+    updateActiveComposerState();
+  } else {
+    renderAll();
+  }
+  const session = activeSession();
+  if (session) attachSessionRun(session).catch(reportClientError);
+  // Avoid scanning the session archive at the same time as the priority
+  // request that reads the active session's rollout file.
+  await Promise.allSettled([secondaryRefresh, refreshCodexSessions()]);
+  renderTopbar();
+  renderSettings();
+  renderSidebarContent();
+  renderSessionDrawer();
+  renderApprovalDialog();
+  updateActiveComposerState();
 }
 
 async function refreshModels() {
@@ -365,6 +810,15 @@ async function refreshModels() {
     }
   } catch {
     state.models = [];
+  }
+}
+
+async function refreshFilePreviewSettings() {
+  try {
+    const payload = await api("/api/settings/file-preview");
+    if (payload.settings) state.filePreviewSettings = payload.settings;
+  } catch (error) {
+    console.warn("File preview settings unavailable", error);
   }
 }
 
@@ -381,7 +835,7 @@ async function refreshMcp() {
     const payload = await api(`/api/mcp?hostId=${encodeURIComponent(state.selectedHost)}`);
     state.mcp = payload.servers || [];
   } catch (error) {
-    state.events.unshift({ time: nowTime(), text: `MCP refresh failed: ${error.message}` });
+    recordEvent(`MCP refresh failed: ${error.message}`);
   }
 }
 
@@ -389,7 +843,7 @@ async function refreshPlugins() {
   try {
     state.plugins = await api(`/api/plugins?hostId=${encodeURIComponent(state.selectedHost)}`);
   } catch (error) {
-    state.events.unshift({ time: nowTime(), text: `Plugin refresh failed: ${error.message}` });
+    recordEvent(`Plugin refresh failed: ${error.message}`);
   }
 }
 
@@ -416,7 +870,155 @@ async function refreshCodexSessions() {
     const payload = await api("/api/codex/sessions");
     state.codexSessions = payload.sessions || [];
   } catch (error) {
-    state.events.unshift({ time: nowTime(), text: `Codex session refresh failed: ${error.message}` });
+    recordEvent(`Codex session refresh failed: ${error.message}`);
+  }
+}
+
+async function refreshRunStatuses() {
+  try {
+    const payload = await api("/api/codex/runs");
+    const serverRunIds = new Set((payload.runs || []).map((run) => run.id).filter(Boolean));
+    const claimedAliases = new Set();
+    const runs = (payload.runs || []).slice().sort((left, right) => (
+      String(right.updatedAt || "").localeCompare(String(left.updatedAt || ""))
+    ));
+    for (const serverRun of runs) {
+      const aliases = [serverRun.sessionKey, serverRun.threadId].filter(Boolean);
+      if (!aliases.some((alias) => !claimedAliases.has(alias))) continue;
+      const existingById = Object.values(state.sessionRuns).find((run) => run?.id === serverRun.id) || null;
+      const optimisticRun = aliases.map((alias) => state.sessionRuns[alias]).find((run) => run && !run.id) || null;
+      const existing = existingById || optimisticRun;
+      const { lastSequence: latestSequence, ...status } = serverRun;
+      const run = Object.assign(existing || {}, status, { latestSequence: Number(latestSequence) || 0 });
+      for (const alias of aliases) {
+        if (claimedAliases.has(alias)) continue;
+        state.sessionRuns[alias] = run;
+        claimedAliases.add(alias);
+      }
+    }
+    for (const run of new Set(Object.values(state.sessionRuns))) {
+      if (run?.id && runIsActive(run) && !serverRunIds.has(run.id) && !run.controller) {
+        run.status = "failed";
+        run.updatedAt = new Date().toISOString();
+      }
+    }
+  } catch (error) {
+    recordEvent(`Codex run refresh failed: ${error.message}`);
+  }
+}
+
+async function refreshApprovals() {
+  try {
+    const payload = await api("/api/codex/approvals");
+    const approvals = Array.isArray(payload.approvals) ? payload.approvals : [];
+    const changed = JSON.stringify(approvals) !== JSON.stringify(state.approvals);
+    state.approvals = approvals;
+    if (changed) {
+      renderApprovalDialog();
+      renderSidebarContent();
+      renderSessionDrawer();
+    }
+  } catch (error) {
+    recordEvent(`Approval refresh failed: ${error.message}`);
+  }
+}
+
+function approvalTitle(approval) {
+  if (approval.method === "item/permissions/requestApproval") return "需要额外权限";
+  if (["item/fileChange/requestApproval", "applyPatchApproval"].includes(approval.method)) return "批准文件修改";
+  return "批准命令执行";
+}
+
+function approvalDetails(approval) {
+  const params = approval.params || {};
+  const details = JSON.stringify(params, null, 2);
+  return details && details !== "{}" ? details : "Codex 请求继续执行此操作。";
+}
+
+function renderApprovalDialog() {
+  const layer = $("[data-approval-dialog]");
+  if (!layer) return;
+  const approval = state.approvals[0];
+  layer.hidden = !approval;
+  document.body.classList.toggle("approval-open", Boolean(approval));
+  if (!approval) {
+    layer.innerHTML = "";
+    state.approvalFocusId = null;
+    return;
+  }
+  const session = mergedSessions().find((item) => item.id === approval.sessionKey || item.id === approval.threadId);
+  layer.innerHTML = `
+    <section class="approval-dialog" role="dialog" aria-modal="true" aria-labelledby="approval-title">
+      <div class="approval-dialog-heading">
+        <div>
+          <p class="eyebrow">${state.approvals.length > 1 ? `${state.approvals.length} 项待处理` : "交互批准"}</p>
+          <h2 id="approval-title">${escapeHtml(approvalTitle(approval))}</h2>
+        </div>
+        <span class="approval-session">${escapeHtml(session ? displaySessionTitle(session) : "后台会话")}</span>
+      </div>
+      <p class="approval-help">请确认下面的操作是否可以执行。拒绝只会取消本次操作，不会删除会话。</p>
+      <pre class="approval-details">${escapeHtml(approvalDetails(approval))}</pre>
+      <div class="approval-actions">
+        <button class="button ghost" type="button" data-approval-decision="decline" data-approval-id="${escapeHtml(approval.id)}" data-keep-enabled="true" ${state.approvalBusy ? "disabled" : ""}>拒绝</button>
+        <button class="button ghost" type="button" data-approval-decision="acceptForSession" data-approval-id="${escapeHtml(approval.id)}" data-keep-enabled="true" ${state.approvalBusy ? "disabled" : ""}>本会话允许</button>
+        <button class="button primary" type="button" data-approval-decision="accept" data-approval-id="${escapeHtml(approval.id)}" data-keep-enabled="true" ${state.approvalBusy ? "disabled" : ""}>仅批准一次</button>
+      </div>
+    </section>`;
+  if (state.approvalFocusId !== approval.id) {
+    state.approvalFocusId = approval.id;
+    requestAnimationFrame(() => layer.querySelector('[data-approval-decision="decline"]')?.focus());
+  }
+}
+
+async function resolveApproval(approvalId, decision) {
+  if (state.approvalBusy) return;
+  state.approvalBusy = true;
+  renderApprovalDialog();
+  try {
+    await api(`/api/codex/approvals/${encodeURIComponent(approvalId)}`, {
+      method: "POST",
+      body: JSON.stringify({ decision })
+    });
+    state.approvals = state.approvals.filter((item) => item.id !== approvalId);
+  } catch (error) {
+    toast(error.message);
+    await refreshApprovals();
+  } finally {
+    state.approvalBusy = false;
+    renderApprovalDialog();
+    renderSidebarContent();
+    renderSessionDrawer();
+  }
+}
+
+async function restoreActiveSession() {
+  const sessionId = state.activeSessionId;
+  if (!sessionId) return;
+  let session = state.sessions.find((item) => item.id === sessionId);
+  if (!session) {
+    const summary = state.codexSessions.find((item) => item.id === sessionId);
+    if (summary) {
+      session = { ...summary, hostId: "local-codex", source: "codex", messages: [] };
+      state.sessions.unshift(session);
+    } else {
+      try {
+        const payload = await api(`/api/codex/sessions/${encodeURIComponent(sessionId)}`);
+        session = { ...payload.session, hostId: "local-codex", source: "codex" };
+        state.sessions.unshift(session);
+      } catch {
+        state.activeSessionId = null;
+        localStorage.removeItem("codex-webui:active-session");
+        return;
+      }
+    }
+  }
+  if (session.source === "codex" && !session.messages?.length) {
+    try {
+      const payload = await api(`/api/codex/sessions/${encodeURIComponent(session.id)}`);
+      Object.assign(session, payload.session, { hostId: "local-codex", source: "codex" });
+    } catch {
+      // Keep the session summary visible while its rollout is temporarily unavailable.
+    }
   }
 }
 
@@ -426,6 +1028,9 @@ function renderAll() {
   renderSettings();
   setView(state.activeView);
   renderSidebarContent();
+  renderSessionDrawer();
+  renderNewSessionSheet();
+  renderApprovalDialog();
   applyBusyState();
 }
 
@@ -434,8 +1039,30 @@ function renderTopbar() {
   $("[data-codex-health]").textContent = state.status?.available ? "ready" : "needs attention";
   const view = views.find((item) => item.id === state.activeView) || views[0];
   const session = state.activeView === "console" ? activeSession() : null;
-  $("[data-active-title]").textContent = session?.title || (state.activeView === "console" ? "新对话" : view.title);
-  $("[data-active-kicker]").textContent = session ? selectedHostName() : view.kicker;
+  $("[data-active-title]").textContent = session
+    ? displaySessionTitle(session)
+    : (state.activeView === "console" ? "新对话" : view.title);
+  $("[data-active-kicker]").textContent = session ? (cwdLabel(session.cwd) || selectedHostName()) : view.kicker;
+  const browserFullscreenToggle = $(".topbar-browser-fullscreen");
+  if (browserFullscreenToggle) {
+    const fullscreenSupported = Boolean(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
+    const browserFullscreen = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
+    const label = browserFullscreen ? "退出浏览器全屏" : "进入浏览器全屏";
+    browserFullscreenToggle.hidden = !fullscreenSupported;
+    browserFullscreenToggle.title = label;
+    browserFullscreenToggle.setAttribute("aria-label", label);
+    browserFullscreenToggle.setAttribute("aria-pressed", String(browserFullscreen));
+    browserFullscreenToggle.innerHTML = browserFullscreen ? iconBrowserFullscreenExit : iconBrowserFullscreenEnter;
+  }
+  const terminalToggle = $(".topbar-terminal-toggle");
+  if (terminalToggle) {
+    const showTerminalToggle = state.activeView === "console" && Boolean(session);
+    const label = state.terminalCollapsed ? "打开终端" : "返回对话";
+    terminalToggle.hidden = !showTerminalToggle;
+    terminalToggle.title = label;
+    terminalToggle.setAttribute("aria-label", label);
+    terminalToggle.innerHTML = state.terminalCollapsed ? iconTerminal : iconConversationLayout;
+  }
 }
 
 function renderSummary() {
@@ -452,85 +1079,94 @@ function renderSummary() {
 }
 
 function renderConsole() {
+  captureVisiblePromptDraft();
+  syncSessionUrl();
   renderSidebarContent();
   const session = activeSession();
   const container = $('[data-view="console"]');
   const canRun = hostCanRunCodex(state.selectedHost);
+  const currentRun = sessionRun(session);
+  const sessionRunning = runIsActive(currentRun);
   renderTopbar();
 
   if (!session) {
     disconnectTerminal();
     container.innerHTML = renderNewSessionSurface(canRun);
     applyBusyState();
+    renderSessionDrawer();
+    renderNewSessionSheet();
     return;
   }
 
   container.innerHTML = `
     <div class="console-grid ${state.terminalCollapsed ? "terminal-collapsed" : ""}">
-      <div class="mobile-session-panel">${renderSessionManager(session)}</div>
       <section class="workbench-surface">
         <div class="workbench-header">
           <p class="session-location" title="${escapeHtml(session.cwd || locationWorkspace())}">${escapeHtml(session.cwd || locationWorkspace())}</p>
         </div>
 
-        <div class="workbench-body ${state.terminalCollapsed ? "terminal-collapsed" : ""}">
+        <div class="workbench-body ${state.terminalCollapsed ? "terminal-collapsed" : "terminal-fullscreen"}">
           <div class="conversation-column">
             <div class="transcript" data-transcript>
               <div class="transcript-inner">${renderTranscript(session)}</div>
             </div>
 
-            <form class="composer" data-composer>
+            <form class="composer" data-composer data-session-key="${escapeHtml(session.id)}">
               <input type="hidden" name="cwd" value="${escapeHtml(session.cwd || locationWorkspace())}">
               <div class="attachment-tray">
-                ${state.attachments.map((attachment) => `
-                  <span class="file-chip">
-                    <span>${escapeHtml(attachment.name)}</span>
-                    <button type="button" title="移除附件" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
-                  </span>
-                `).join("")}
+                ${renderAttachmentChips(session.id)}
               </div>
               <div class="prompt-shell">
-                <textarea name="prompt" placeholder="${canRun ? "随心输入" : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "required" : "disabled"}></textarea>
-                <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="${session.source === "codex"}">
-                  ${renderComposerFooter({ canRun, lockPermissions: session.source === "codex" })}
+                <textarea name="prompt" placeholder="${canRun ? (sessionRunning ? "任务正在执行中" : "随心输入") : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "required" : "disabled"}>${escapeHtml(state.promptDrafts[session.id] || "")}</textarea>
+                <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="false">
+                  ${renderComposerFooter({ canRun, lockPermissions: false, run: currentRun })}
                 </div>
               </div>
             </form>
           </div>
-          ${state.terminalCollapsed ? `
-            <button class="terminal-restore" type="button" data-action="toggle-terminal">终端</button>
-          ` : `
+          ${state.terminalCollapsed ? "" : `
             <section class="terminal-dock" aria-label="终端">
               <div class="terminal-tabbar">
                 <div class="terminal-tab active" data-terminal-status="${state.terminalConnected ? "connected" : "disconnected"}">
                   <span class="terminal-tab-icon">${iconTerminal}</span>
                   <span class="terminal-tab-title" title="${escapeHtml(terminalCwd(session))}">${escapeHtml(terminalTabTitle(session))}</span>
-                  <button class="terminal-tab-close" type="button" data-action="toggle-terminal" title="关闭终端面板" aria-label="关闭终端面板">×</button>
                 </div>
+                <button class="terminal-tab-action" type="button" data-action="toggle-terminal" title="缩小终端" aria-label="缩小终端">${iconTerminalMinimize}</button>
                 <button class="terminal-tab-new" type="button" data-action="restart-terminal" title="新建终端（重新连接）" aria-label="新建终端">+</button>
                 <div class="terminal-tabbar-actions">
                   <button class="terminal-tab-action" type="button" data-action="restart-terminal" title="重新连接终端" aria-label="重新连接终端">↻</button>
-                  <button class="terminal-tab-action" type="button" data-action="toggle-terminal" title="隐藏终端面板" aria-label="隐藏终端面板">${iconPanelHide}</button>
                 </div>
               </div>
               <div class="terminal-body">
+                <div class="terminal-touchbar" aria-label="终端触控操作">
+                  <button type="button" data-action="paste-terminal" title="从剪贴板粘贴到终端">粘贴</button>
+                  <button type="button" data-action="toggle-terminal-selection" data-terminal-selection-mode="false" title="开启后可在终端内拖动框选文本">框选</button>
+                  <button type="button" data-action="copy-terminal-selection" title="复制终端中已框选的文本">复制</button>
+                  <span>向右滑：→</span>
+                </div>
                 <div class="terminal-xterm" data-terminal></div>
               </div>
             </section>
           `}
         </div>
       </section>
+      ${renderDirectoryPicker()}
     </div>
   `;
 
   scrollTranscript();
   applyBusyState();
   initTerminal();
+  renderSessionDrawer();
+  renderNewSessionSheet();
 }
 
 function renderTranscript(session) {
   if (session.messages.length) {
-    return session.messages.map(renderMessage).join("");
+    return session.messages.map((message, index) => renderMessage(
+      message,
+      runIsActive(sessionRun(session)) && index === session.messages.length - 1
+    )).join("");
   }
   if (session.source === "codex") {
     return `<article class="message system"><strong>WebUI</strong><pre>选择的 Codex 历史会话尚未加载详情。</pre></article>`;
@@ -541,30 +1177,29 @@ function renderTranscript(session) {
 function renderNewSessionSurface(canRun) {
   return `
     <div class="console-grid">
-      <div class="mobile-session-panel">${renderSessionManager(null)}</div>
-      <section class="new-session-surface">
-        <div class="new-session-shell">
-          <form class="composer new-session-form" data-new-session-form>
-            <input type="hidden" name="cwd" value="${escapeHtml(state.newSessionCwd)}">
-            <button class="project-select" type="button" data-action="open-directory-picker" ${canRun ? "" : "disabled"}>
-              <span class="project-select-icon">${iconFolder}</span>
-              <span class="project-select-path">${escapeHtml(state.newSessionCwd || "选择项目")}</span>
-            </button>
-            <div class="attachment-tray">
-              ${state.attachments.map((attachment) => `
-                <span class="file-chip">
-                  <span>${escapeHtml(attachment.name)}</span>
-                  <button type="button" title="移除附件" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
-                </span>
-              `).join("")}
+      <section class="workbench-surface new-session-surface">
+        <div class="workbench-body terminal-collapsed">
+          <div class="conversation-column">
+            <div class="transcript" data-transcript>
+              <div class="transcript-inner"><div class="transcript-empty"></div></div>
             </div>
-            <div class="prompt-shell">
-              <textarea name="prompt" placeholder="${canRun ? "随心输入" : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "" : "disabled"}></textarea>
-              <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="false">
-                ${renderComposerFooter({ canRun, lockPermissions: false })}
+            <form class="composer new-session-form" data-new-session-form data-session-key="__new__">
+              <input type="hidden" name="cwd" value="${escapeHtml(state.newSessionCwd)}">
+              <button class="project-select" type="button" data-action="open-directory-picker" ${canRun ? "" : "disabled"}>
+                <span class="project-select-icon">${iconFolder}</span>
+                <span class="project-select-path">${escapeHtml(state.newSessionCwd || "选择项目")}</span>
+              </button>
+              <div class="attachment-tray">
+                ${renderAttachmentChips("__new__")}
               </div>
-            </div>
-          </form>
+              <div class="prompt-shell">
+                <textarea name="prompt" placeholder="${canRun ? "随心输入" : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "" : "disabled"}>${escapeHtml(state.promptDrafts.__new__ || "")}</textarea>
+                <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="false">
+                  ${renderComposerFooter({ canRun, lockPermissions: false })}
+                </div>
+              </div>
+            </form>
+          </div>
         </div>
       </section>
       ${renderDirectoryPicker()}
@@ -611,7 +1246,23 @@ function renderSidebarSessions() {
   if (!container) {
     return;
   }
-  container.innerHTML = renderSessionManager(activeSession(), "sidebar");
+  replaceHtmlPreservingScroll(container, renderSessionManager(activeSession(), "sidebar"));
+}
+
+function replaceHtmlPreservingScroll(container, html, scrollSelector = "") {
+  const currentScroller = scrollSelector ? container.querySelector(scrollSelector) : container;
+  const scrollTop = currentScroller?.scrollTop || 0;
+  const maxScrollTop = currentScroller
+    ? Math.max(0, currentScroller.scrollHeight - currentScroller.clientHeight)
+    : 0;
+  const wasAtBottom = maxScrollTop > 0 && maxScrollTop - scrollTop <= 2;
+
+  container.innerHTML = html;
+
+  const nextScroller = scrollSelector ? container.querySelector(scrollSelector) : container;
+  if (!nextScroller) return;
+  const nextMaxScrollTop = Math.max(0, nextScroller.scrollHeight - nextScroller.clientHeight);
+  nextScroller.scrollTop = wasAtBottom ? nextMaxScrollTop : Math.min(scrollTop, nextMaxScrollTop);
 }
 
 function renderSidebarContent() {
@@ -620,10 +1271,10 @@ function renderSidebarContent() {
     return;
   }
   if (state.activeView === "settings") {
-    container.innerHTML = renderSettingsSidebar();
+    replaceHtmlPreservingScroll(container, renderSettingsSidebar());
     return;
   }
-  container.innerHTML = renderSessionManager(activeSession(), "sidebar");
+  replaceHtmlPreservingScroll(container, renderSessionManager(activeSession(), "sidebar"));
 }
 
 async function toggleHostSessions(hostId) {
@@ -640,41 +1291,43 @@ async function toggleHostSessions(hostId) {
 }
 
 function renderSessionManager(active, placement = "content") {
-  const groups = state.hosts.map((host) => ({
-    host,
-    sessions: sessionsForHost(host.id)
-  }));
-  const totalWeb = state.sessions.filter((item) => item.source !== "codex").length;
+  const groups = sessionsByCwd(mergedSessions());
+  const total = groups.reduce((count, group) => count + group.sessions.length, 0);
   return `
-    <section class="panel session-panel ${placement === "sidebar" ? "sidebar-session-panel" : ""}">
+    <section class="panel session-panel ${placement === "sidebar" ? "sidebar-session-panel" : ""} ${placement === "drawer" ? "drawer-session-panel" : ""}">
       <div class="panel-header">
         <div>
           <h3>会话</h3>
-          <p>${state.codexSessions.length} Codex · ${totalWeb} WebUI</p>
+          <p>按工作目录收纳 · ${total} 个对话</p>
         </div>
         <div class="toolbar-row">
-          <button class="button icon ghost" type="button" title="新会话" data-action="new-session">+</button>
+          <button class="button ghost slim" type="button" title="清空全部对话" data-action="clear-all-sessions">清空</button>
+          <button class="button icon ghost" type="button" title="新建对话" data-action="open-new-session-sheet">+</button>
         </div>
       </div>
       <div class="panel-body session-groups">
-        ${groups.map(({ host, sessions }) => {
-          const collapsed = state.collapsedHostSessions[host.id] === true;
+        ${groups.length ? groups.map((group) => {
+          const collapsed = isCwdGroupCollapsed(group.cwd);
+          const isActiveGroup = String(active?.cwd || "") === group.cwd;
           return `
           <section class="session-group ${collapsed ? "collapsed" : ""}">
-            <button class="session-group-header ${host.id === state.selectedHost ? "active" : ""}" type="button" data-toggle-host-sessions="${escapeHtml(host.id)}" aria-expanded="${collapsed ? "false" : "true"}">
-              <span class="host-fold" aria-hidden="true">${collapsed ? ">" : "v"}</span>
-              <span>
-                <strong>${escapeHtml(host.name)}</strong>
-                <small>${escapeHtml(host.kind)} · ${sessions.length} sessions</small>
-              </span>
-              <span class="badge ${host.status === "ready" ? "ok" : "warn"}">${escapeHtml(host.status || "ready")}</span>
-            </button>
+            <div class="session-group-heading">
+              <button class="session-group-header ${isActiveGroup ? "active" : ""}" type="button" data-toggle-cwd-group="${escapeHtml(group.cwd)}" aria-expanded="${collapsed ? "false" : "true"}">
+                <span class="host-fold" aria-hidden="true">${collapsed ? ">" : "v"}</span>
+                <span>
+                  <strong title="${escapeHtml(group.cwd || "未指定目录")}">${escapeHtml(group.label)}</strong>
+                  <small>${group.sessions.length} 个对话</small>
+                </span>
+                <span class="badge">${group.sessions.length}</span>
+              </button>
+              <button class="session-group-clear" type="button" data-clear-cwd="${escapeHtml(group.cwd)}" title="清空 ${escapeHtml(group.label)} 的对话" aria-label="清空 ${escapeHtml(group.label)} 的对话">${iconTrash}</button>
+            </div>
             <div class="session-list ${collapsed ? "hidden" : ""}">
-              ${sessions.length ? sessions.map((item) => renderSessionItem(item, active)).join("") : `<div class="empty-state compact">没有会话</div>`}
+              ${group.sessions.map((item) => renderSessionItem(item, active)).join("")}
             </div>
           </section>
         `;
-        }).join("")}
+        }).join("") : `<div class="empty-state compact">还没有对话</div>`}
       </div>
     </section>
   `;
@@ -683,16 +1336,127 @@ function renderSessionManager(active, placement = "content") {
 function renderSessionItem(item, active) {
   const isCodex = item.source === "codex";
   const actionLabel = isCodex ? "归档聊天" : "删除聊天";
+  const title = displaySessionTitle(item);
+  const run = sessionRun(item);
+  const waitingApproval = state.approvals.some((approval) => approval.sessionKey === item.id || approval.threadId === item.id || approval.runId === run?.id);
+  const runStatus = waitingApproval
+    ? "等待批准"
+    : runIsActive(run)
+    ? (run.status === "pausing" ? "暂停中" : "运行中")
+    : (run?.status === "paused" ? "已暂停" : run?.status === "failed" ? "未完成" : "已完成");
+  const runClass = waitingApproval ? "waiting" : (runIsActive(run) ? "running" : (run?.status || "completed"));
   return `
-    <div class="session-item ${item.id === active?.id ? "active" : ""}">
-      <button class="session-item-select" type="button" data-session-id="${item.id}" title="${escapeHtml(item.title)}">
-        <span class="session-title">${escapeHtml(item.title)}</span>
+    <div class="session-item ${item.id === active?.id ? "active" : ""}" data-run-status="${runClass}">
+      <button class="session-item-select" type="button" data-session-id="${item.id}" title="${escapeHtml(title)}">
+        <span class="session-title">${escapeHtml(title)}</span>
+        <span class="session-run-status ${runClass}">${runStatus}</span>
       </button>
       <button class="session-item-action" type="button" data-delete-session="${escapeHtml(item.id)}" title="${actionLabel}" aria-label="${actionLabel}">
         ${isCodex ? iconArchive : iconTrash}
       </button>
     </div>
   `;
+}
+
+function renderSessionDrawer() {
+  const drawer = $("[data-session-drawer]");
+  const backdrop = $("[data-session-drawer-backdrop]");
+  if (!drawer || !backdrop) {
+    return;
+  }
+  replaceHtmlPreservingScroll(drawer, `
+    <div class="session-drawer-header">
+      <strong>对话</strong>
+      <button class="button icon ghost" type="button" data-action="close-session-drawer" aria-label="关闭会话列表">×</button>
+    </div>
+    <div class="session-drawer-body">${renderSessionManager(activeSession(), "drawer")}</div>
+    <div class="session-drawer-footer">
+      <button class="button ghost" type="button" data-nav="true" data-nav-target="settings">设置</button>
+    </div>
+  `, ".session-drawer-body");
+  drawer.classList.toggle("open", state.sessionDrawerOpen);
+  drawer.setAttribute("aria-hidden", state.sessionDrawerOpen ? "false" : "true");
+  backdrop.hidden = !state.sessionDrawerOpen;
+  backdrop.classList.toggle("open", state.sessionDrawerOpen);
+  document.body.classList.toggle("session-drawer-open", state.sessionDrawerOpen);
+}
+
+function renderNewSessionSheet() {
+  const sheet = $("[data-new-session-sheet]");
+  if (!sheet) {
+    return;
+  }
+  if (!state.newSessionSheetOpen) {
+    sheet.hidden = true;
+    sheet.innerHTML = "";
+    return;
+  }
+  const directories = knownWorkingDirectories();
+  sheet.hidden = false;
+  sheet.innerHTML = `
+    <section class="sheet new-session-sheet" role="dialog" aria-modal="true" aria-label="新建对话">
+      <div class="sheet-header">
+        <div>
+          <p class="eyebrow">New conversation</p>
+          <h3>新建对话</h3>
+        </div>
+        <button class="button icon ghost" type="button" data-action="close-new-session-sheet" aria-label="关闭">×</button>
+      </div>
+      <p class="sheet-copy">先选择工作目录，再创建新对话。终端可以随时缩小。</p>
+      <button class="sheet-choice" type="button" data-keep-enabled="true" data-action="pick-new-directory">
+        <strong>选择新目录</strong>
+        <span>浏览本机文件夹并创建对话</span>
+      </button>
+      <div class="sheet-existing">
+        <p>已有工作目录</p>
+        ${directories.length
+          ? directories.map((cwd) => `
+            <button class="sheet-choice compact" type="button" data-keep-enabled="true" data-start-session-cwd="${escapeHtml(cwd)}">
+              <strong>${escapeHtml(cwdLabel(cwd) || cwd)}</strong>
+              <span>${escapeHtml(cwd)}</span>
+            </button>
+          `).join("")
+          : `<p class="empty-state compact">还没有用过的工作目录</p>`}
+      </div>
+    </section>
+  `;
+}
+
+function isMobileViewport() {
+  return window.matchMedia("(max-width: 900px)").matches;
+}
+
+function setSessionDrawerOpen(open) {
+  state.sessionDrawerOpen = Boolean(open);
+  renderSessionDrawer();
+}
+
+function toggleSessionDrawer() {
+  if (!isMobileViewport()) {
+    toggleSidebar();
+    return;
+  }
+  setSessionDrawerOpen(!state.sessionDrawerOpen);
+}
+
+function openNewSessionSheet() {
+  state.newSessionSheetOpen = true;
+  state.sessionDrawerOpen = false;
+  renderSessionDrawer();
+  renderNewSessionSheet();
+}
+
+function closeNewSessionSheet() {
+  state.newSessionSheetOpen = false;
+  renderNewSessionSheet();
+}
+
+function toggleCwdGroup(cwd) {
+  const key = String(cwd || "");
+  state.collapsedCwdGroups[key] = !isCwdGroupCollapsed(key);
+  saveCollapsedCwdGroups();
+  renderSidebarContent();
+  renderSessionDrawer();
 }
 
 function renderSettingsSidebar() {
@@ -706,6 +1470,11 @@ function renderSettingsSidebar() {
         <span class="settings-ready-dot" aria-hidden="true"></span>
       </div>
       <div class="settings-sidebar-list">
+        <p class="settings-nav-label">通用</p>
+        <button class="settings-connection-button ${state.settingsSection === "file-preview" ? "active" : ""}" type="button" data-settings-section="file-preview">
+          <span class="nav-icon">F</span>
+          <span><strong>文件预览</strong></span>
+        </button>
         <p class="settings-nav-label">集成</p>
         <button class="settings-connection-button ${state.settingsSection === "mcp" ? "active" : ""}" type="button" data-settings-section="mcp">
           <span class="nav-icon">M</span>
@@ -751,13 +1520,13 @@ async function toggleSettingsHost(hostId) {
 }
 
 async function selectSettingsSection(section, hostId = state.selectedHost) {
-  const nextSection = ["mcp", "skills"].includes(section) ? section : "mcp";
+  const nextSection = ["mcp", "skills", "file-preview"].includes(section) ? section : "mcp";
   state.settingsSection = nextSection;
   state.mcpView = "list";
   state.mcpEditName = null;
   state.mcpForm = null;
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
-  if (nextSection !== "connections" && state.hosts.some((host) => host.id === hostId) && hostId !== state.selectedHost) {
+  if (nextSection !== "file-preview" && state.hosts.some((host) => host.id === hostId) && hostId !== state.selectedHost) {
     state.selectedHost = hostId;
     localStorage.setItem("codex-webui:host", state.selectedHost);
     await Promise.allSettled([refreshMcp(), refreshPlugins()]);
@@ -765,8 +1534,8 @@ async function selectSettingsSection(section, hostId = state.selectedHost) {
   renderAll();
 }
 
-function renderMessage(message) {
-  const content = message.content || (message.role === "assistant" && state.busy ? "..." : "");
+function renderMessage(message, isRunning = false) {
+  const content = message.content || (message.role === "assistant" && isRunning ? "..." : "");
   const body = message.role === "assistant"
     ? `<div class="markdown-body">${renderMarkdown(content)}</div>`
     : `<pre>${escapeHtml(content)}</pre>`;
@@ -798,14 +1567,18 @@ const iconArchive = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none"
 const iconGear = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 12a7.2 7.2 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7.3 7.3 0 0 0-2.1-1.2L14.3 3h-4l-.4 2.7a7.3 7.3 0 0 0-2.1 1.2l-2.3-1-2 3.4 2 1.5a7.2 7.2 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1a7.3 7.3 0 0 0 2.1 1.2l.4 2.7h4l.4-2.7a7.3 7.3 0 0 0 2.1-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>`;
 const iconSearch = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.8-3.8"/></svg>`;
 const iconTerminal = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="m7.5 9.5 3 2.5-3 2.5M12.5 15h4"/></svg>`;
-const iconPanelHide = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="15" rx="2.5"/><path d="M14.5 4.5v15"/></svg>`;
+const iconTerminalMinimize = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3M21 8h-5V3M16 21v-5h5M8 21v-5H3"/></svg>`;
+const iconConversationLayout = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 14h18M7 9h7"/></svg>`;
+const iconBrowserFullscreenEnter = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5"/></svg>`;
+const iconBrowserFullscreenExit = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v5H3M16 3v5h5M21 16h-5v5M3 16h5v5"/></svg>`;
 const iconBackArrow = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5m6-7-7 7 7 7"/></svg>`;
 const iconTrash = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6.5h15M9.5 6.5v-1a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v1M6.5 6.5l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9l.8-12M10 10.5v6M14 10.5v6"/></svg>`;
 
 function approvalOptions() {
   return [
+    { value: "approve-for-me", label: "自动审批", description: "由 Codex 自动审查风险请求，适合远程使用", icon: iconAuto },
     { value: "on-request", label: "请求批准", description: "编辑外部文件和使用互联网时始终询问", icon: iconHand },
-    { value: "untrusted", label: "帮我批准", description: "仅对检测到的风险操作请求批准", icon: iconAuto },
+    { value: "untrusted", label: "谨慎模式", description: "只有已知安全操作无需询问", icon: iconHand },
     { value: "never", label: "从不询问", description: "不再询问，自动执行所有操作", icon: iconNever }
   ];
 }
@@ -932,6 +1705,8 @@ function renderModelMenu(lockPermissions) {
 function renderComposerFooter(flags = {}) {
   const canRun = flags.canRun !== false;
   const lockPermissions = flags.lockPermissions === true;
+  const run = flags.run || null;
+  const composerLocked = !canRun || runIsActive(run);
   const meta = approvalMeta();
   return `
     <input type="hidden" name="model" value="${escapeHtml(state.selectedModel)}">
@@ -942,16 +1717,18 @@ function renderComposerFooter(flags = {}) {
       <div class="composer-toolbar-side">
         <label class="round-action file-button" title="上传文件" aria-label="上传文件">
           +
-          <input type="file" data-file-input multiple ${canRun ? "" : "disabled"}>
+          <input type="file" data-file-input multiple ${composerLocked ? "disabled" : ""}>
         </label>
-        <button class="approval-pill ${state.composerMenu === "approval" ? "open" : ""}" type="button" data-action="toggle-approval-menu" title="${lockPermissions ? "Codex 原生会话沿用创建时的批准策略" : "批准策略"}" ${canRun ? "" : "disabled"}>
+        <button class="approval-pill ${state.composerMenu === "approval" ? "open" : ""}" type="button" data-action="toggle-approval-menu" title="${lockPermissions ? "Codex 原生会话沿用创建时的批准策略" : "批准策略"}" ${composerLocked ? "disabled" : ""}>
           <span class="approval-pill-icon">${meta.icon}</span>
           <span>${escapeHtml(meta.label)}</span>
         </button>
       </div>
       <div class="composer-toolbar-side">
-        <button class="model-trigger ${state.composerMenu === "model" ? "open" : ""}" type="button" data-action="toggle-model-menu" title="${escapeHtml(state.selectedModel || "模型")}" ${canRun ? "" : "disabled"}>${escapeHtml(composerTriggerLabel())}</button>
-        <button class="round-action send-action" type="submit" title="发送" aria-label="发送" ${canRun ? "" : "disabled"}>↑</button>
+        <button class="model-trigger ${state.composerMenu === "model" ? "open" : ""}" type="button" data-action="toggle-model-menu" title="${escapeHtml(state.selectedModel || "模型")}" ${composerLocked ? "disabled" : ""}>${escapeHtml(composerTriggerLabel())}</button>
+        ${runIsActive(run)
+          ? `<button class="round-action stop-action" type="button" data-action="stop-run" data-keep-enabled="true" title="${run.status === "pausing" ? "正在暂停" : "暂停任务"}" aria-label="${run.status === "pausing" ? "正在暂停" : "暂停任务"}" ${run.status === "pausing" ? "disabled" : ""}>■</button>`
+          : `<button class="round-action send-action" type="submit" title="发送" aria-label="发送" ${canRun ? "" : "disabled"}>↑</button>`}
       </div>
     </div>
     ${state.composerMenu === "approval" ? renderApprovalMenu(lockPermissions) : ""}
@@ -960,13 +1737,28 @@ function renderComposerFooter(flags = {}) {
 }
 
 function updateComposerFooters() {
+  const currentRun = sessionRun();
   $$("[data-composer-footer]").forEach((footer) => {
     footer.innerHTML = renderComposerFooter({
       canRun: footer.dataset.canRun !== "false",
-      lockPermissions: footer.dataset.lockPermissions === "true"
+      lockPermissions: footer.dataset.lockPermissions === "true",
+      run: currentRun
     });
   });
   applyBusyState();
+}
+
+function updateActiveComposerState() {
+  const run = sessionRun();
+  const textarea = $("[data-composer] textarea[name='prompt']");
+  if (textarea) {
+    const canRun = hostCanRunCodex(state.selectedHost);
+    textarea.disabled = !canRun;
+    textarea.placeholder = canRun
+      ? (runIsActive(run) ? "任务正在执行中" : "随心输入")
+      : "该主机的执行适配器尚未接入。";
+  }
+  updateComposerFooters();
 }
 
 function closeComposerMenu() {
@@ -985,6 +1777,7 @@ function formatDate(value) {
 }
 
 async function selectSession(sessionId) {
+  captureVisiblePromptDraft();
   let session = state.sessions.find((item) => item.id === sessionId);
   if (!session) {
     const summary = state.codexSessions.find((item) => item.id === sessionId);
@@ -999,22 +1792,33 @@ async function selectSession(sessionId) {
   state.selectedHost = sessionHostId(session);
   localStorage.setItem("codex-webui:host", state.selectedHost);
   state.activeSessionId = session.id;
+  localStorage.setItem("codex-webui:active-session", session.id);
+  applySessionSettings(session.id);
   if (session.source === "codex" && !session.messages.length) {
     setBusy(true);
     try {
-      const payload = await api(`/api/codex/sessions/${encodeURIComponent(session.id)}`);
+      const [payload] = await Promise.all([
+        api(`/api/codex/sessions/${encodeURIComponent(session.id)}`),
+        refreshRunStatuses()
+      ]);
       Object.assign(session, payload.session, { hostId: "local-codex", source: "codex" });
     } catch (error) {
       toast(error.message);
     } finally {
       setBusy(false);
     }
-  }
+  } else await refreshRunStatuses();
   if (previousHost !== state.selectedHost) {
     await Promise.allSettled([refreshMcp(), refreshPlugins()]);
   }
   saveSessions();
+  state.sessionDrawerOpen = false;
+  state.newSessionSheetOpen = false;
+  if (state.activeView !== "console") {
+    setView("console");
+  }
   renderConsole();
+  attachSessionRun(session).catch(reportClientError);
   if (!state.terminalCollapsed && state.terminalSocket) {
     restartTerminal();
   }
@@ -1035,10 +1839,42 @@ function createLocalSession(title, hostId = state.selectedHost, options = {}) {
 
 function newSession() {
   state.activeSessionId = null;
-  state.attachments = [];
+  localStorage.removeItem("codex-webui:active-session");
   state.directoryPicker.open = false;
+  state.sessionDrawerOpen = false;
   saveSessions();
   renderConsole();
+}
+
+async function startSessionWithCwd(cwd) {
+  const directory = String(cwd || "").trim();
+  state.newSessionSheetOpen = false;
+  state.sessionDrawerOpen = false;
+  state.directoryPicker.open = false;
+  state.directoryPicker.intent = null;
+  renderNewSessionSheet();
+  renderSessionDrawer();
+  if (!directory) {
+    toast("创建会话前需要选择工作目录。");
+    return;
+  }
+  try {
+    await api(`/api/cwd?path=${encodeURIComponent(directory)}`);
+  } catch {
+    toast("选择的工作目录已不存在，请重新选择。");
+    return;
+  }
+  state.newSessionCwd = directory;
+  localStorage.setItem("codex-webui:cwd", directory);
+  const session = createLocalSession("新对话", state.selectedHost, { cwd: directory });
+  moveSessionAttachments("__new__", session.id);
+  state.sessions.unshift(session);
+  state.activeSessionId = session.id;
+  localStorage.setItem("codex-webui:active-session", session.id);
+  savePromptDraft("__new__", "");
+  saveSessionSettings(session.id);
+  saveSessions();
+  renderAll();
 }
 
 async function openDirectoryPicker(directoryPath = state.newSessionCwd) {
@@ -1047,6 +1883,7 @@ async function openDirectoryPicker(directoryPath = state.newSessionCwd) {
     const payload = await api(`/api/directories${query}`);
     state.directoryPicker = {
       open: true,
+      intent: state.directoryPicker.intent || null,
       path: payload.path,
       parent: payload.parent,
       roots: payload.roots || [],
@@ -1067,8 +1904,15 @@ function closeDirectoryPicker() {
 }
 
 function selectDirectory() {
-  state.newSessionCwd = state.directoryPicker.path;
+  const cwd = state.directoryPicker.path;
+  const intent = state.directoryPicker.intent;
+  state.newSessionCwd = cwd;
   state.directoryPicker.open = false;
+  state.directoryPicker.intent = null;
+  if (intent === "new-session") {
+    startSessionWithCwd(cwd).catch(reportClientError);
+    return;
+  }
   renderConsole();
 }
 
@@ -1078,6 +1922,10 @@ async function submitNewSession(event, form = event.target) {
     toast("该主机的执行适配器尚未接入。");
     return;
   }
+  if (state.uploadingSessionKeys.has("__new__")) {
+    toast("附件仍在上传，请稍候再创建会话。");
+    return;
+  }
   const values = formValues(form);
   const cwd = String(values.cwd || "").trim();
   if (!cwd) {
@@ -1085,20 +1933,25 @@ async function submitNewSession(event, form = event.target) {
     return;
   }
   try {
-    await api(`/api/directories?path=${encodeURIComponent(cwd)}`);
+    await api(`/api/cwd?path=${encodeURIComponent(cwd)}`);
   } catch {
     toast("选择的工作目录已不存在，请重新选择。");
-    await openDirectoryPicker("");
     return;
   }
   const preferences = persistPreferences(values, cwd);
   const prompt = String(values.prompt || "").trim();
   const name = cwd.split("/").filter(Boolean).pop() || `Session ${state.sessions.length + 1}`;
   const session = createLocalSession(name, state.selectedHost, { cwd });
+  moveSessionAttachments("__new__", session.id);
   state.sessions.unshift(session);
   state.activeSessionId = session.id;
+  localStorage.setItem("codex-webui:active-session", session.id);
+  savePromptDraft("__new__", "");
+  saveSessionSettings(session.id);
   state.composerMenu = null;
   saveSessions();
+  const newPromptInput = form.querySelector("textarea[name='prompt']");
+  if (newPromptInput) newPromptInput.value = "";
   renderAll();
   if (prompt) {
     await sendPrompt({ prompt, cwd, ...preferences });
@@ -1118,6 +1971,7 @@ function persistPreferences(values, cwd) {
   localStorage.setItem("codex-webui:approval", approval);
   localStorage.setItem("codex-webui:model", model);
   localStorage.setItem("codex-webui:effort", effort);
+  saveSessionSettings();
   if (cwd) {
     localStorage.setItem("codex-webui:cwd", cwd);
   }
@@ -1127,6 +1981,10 @@ function persistPreferences(values, cwd) {
 async function deleteSession(sessionId) {
   const session = state.sessions.find((item) => item.id === sessionId) || state.codexSessions.find((item) => item.id === sessionId);
   if (!session) {
+    return;
+  }
+  if (runIsActive(sessionRun(session))) {
+    toast("请先暂停该会话正在进行的任务。");
     return;
   }
   const isCodex = session.source === "codex" || state.codexSessions.some((item) => item.id === sessionId);
@@ -1142,14 +2000,114 @@ async function deleteSession(sessionId) {
       state.codexSessions = state.codexSessions.filter((item) => item.id !== sessionId);
     }
     state.sessions = state.sessions.filter((item) => item.id !== sessionId);
+    delete state.sessionRuns[sessionId];
+    delete state.sessionSettings[sessionId];
+    delete state.attachmentsBySession[sessionId];
+    delete state.promptDrafts[sessionId];
+    persistPromptDrafts();
+    localStorage.setItem("codex-webui:session-settings", JSON.stringify(state.sessionSettings));
     if (state.activeSessionId === sessionId) {
       state.activeSessionId = null;
+      localStorage.removeItem("codex-webui:active-session");
     }
     saveSessions();
     await refreshCodexSessions();
     toast(isCodex ? "Codex 会话已归档" : "本地会话已删除");
     renderAll();
   } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearAllSessions() {
+  if (Object.values(state.sessionRuns).some(runIsActive)) {
+    toast("请先暂停所有正在运行的会话。");
+    return;
+  }
+  const total = mergedSessions().length;
+  if (!total) {
+    toast("没有可清空的对话");
+    return;
+  }
+  const ok = window.confirm(`清空全部 ${total} 个对话？Codex 原生会话会被归档，本地会话会被删除。`);
+  if (!ok) {
+    return;
+  }
+  setBusy(true);
+  try {
+    if (state.codexSessions.length) {
+      await api("/api/codex/sessions", { method: "DELETE" });
+    }
+    state.sessions = [];
+    state.codexSessions = [];
+    state.sessionSettings = {};
+    state.attachmentsBySession = {};
+    state.promptDrafts = {};
+    persistPromptDrafts();
+    localStorage.removeItem("codex-webui:session-settings");
+    state.activeSessionId = null;
+    localStorage.removeItem("codex-webui:active-session");
+    state.sessionDrawerOpen = false;
+    saveSessions();
+    await refreshCodexSessions();
+    toast("已清空全部对话");
+    renderAll();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
+  }
+}
+
+async function clearCwdSessions(cwd) {
+  const key = String(cwd || "");
+  const sessions = mergedSessions().filter((session) => String(session.cwd || "").trim() === key);
+  if (!sessions.length) {
+    toast("该工作目录没有可清空的对话");
+    return;
+  }
+  if (sessions.some((session) => runIsActive(sessionRun(session)))) {
+    toast("请先暂停该工作目录中正在运行的任务。");
+    return;
+  }
+  const label = cwdLabel(key) || "未指定目录";
+  const ok = window.confirm(`清空“${label}”下的 ${sessions.length} 个对话？Codex 原生会话会被归档，本地会话会被删除。`);
+  if (!ok) {
+    return;
+  }
+
+  const sessionIds = new Set(sessions.map((session) => session.id));
+  const codexSessionIds = sessions.filter((session) => session.source === "codex").map((session) => session.id);
+  setBusy(true);
+  try {
+    for (const sessionId of codexSessionIds) {
+      await api(`/api/codex/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+    }
+    state.sessions = state.sessions.filter((session) => !sessionIds.has(session.id));
+    state.codexSessions = state.codexSessions.filter((session) => !sessionIds.has(session.id));
+    for (const sessionId of sessionIds) {
+      delete state.sessionRuns[sessionId];
+      delete state.sessionSettings[sessionId];
+      delete state.attachmentsBySession[sessionId];
+      delete state.promptDrafts[sessionId];
+    }
+    delete state.collapsedCwdGroups[key];
+    saveCollapsedCwdGroups();
+    persistPromptDrafts();
+    localStorage.setItem("codex-webui:session-settings", JSON.stringify(state.sessionSettings));
+    if (sessionIds.has(state.activeSessionId)) {
+      state.activeSessionId = null;
+      localStorage.removeItem("codex-webui:active-session");
+    }
+    saveSessions();
+    await refreshCodexSessions();
+    toast(`已清空“${label}”下的对话`);
+    renderAll();
+  } catch (error) {
+    await refreshCodexSessions();
+    renderAll();
     toast(error.message);
   } finally {
     setBusy(false);
@@ -1177,6 +2135,7 @@ function initTerminal() {
   if (!container || state.terminalCollapsed || !activeSession()) {
     return;
   }
+  state.terminalShouldReconnect = true;
   if (!state.terminal) {
     const terminal = new Terminal({
       cursorBlink: true,
@@ -1201,12 +2160,144 @@ function initTerminal() {
     });
     state.terminal = terminal;
     state.terminalFit = fit;
+    installTerminalTouchControls(terminal);
   } else if (state.terminal.element?.parentElement !== container) {
     container.append(state.terminal.element);
   }
+  updateTerminalSelectionUi();
   fitTerminal();
   if (!state.terminalSocket || state.terminalSocket.readyState === WebSocket.CLOSED) {
     connectTerminal();
+  }
+}
+
+function sendTerminalInput(data) {
+  if (state.terminalSocket?.readyState !== WebSocket.OPEN) {
+    toast("终端尚未连接");
+    return false;
+  }
+  state.terminalSocket.send(JSON.stringify({ type: "input", data }));
+  return true;
+}
+
+function terminalCellAtPointer(terminal, event) {
+  const screen = terminal.element?.querySelector(".xterm-screen");
+  if (!screen) return null;
+  const bounds = screen.getBoundingClientRect();
+  if (!bounds.width || !bounds.height) return null;
+  const column = Math.max(0, Math.min(terminal.cols - 1, Math.floor((event.clientX - bounds.left) / bounds.width * terminal.cols)));
+  const viewportRow = Math.max(0, Math.min(terminal.rows - 1, Math.floor((event.clientY - bounds.top) / bounds.height * terminal.rows)));
+  return { column, row: terminal.buffer.active.viewportY + viewportRow };
+}
+
+function selectTerminalRange(terminal, start, end) {
+  const startIndex = start.row * terminal.cols + start.column;
+  const endIndex = end.row * terminal.cols + end.column;
+  const first = startIndex <= endIndex ? start : end;
+  terminal.select(first.column, first.row, Math.abs(endIndex - startIndex) + 1);
+}
+
+function installTerminalTouchControls(terminal) {
+  const element = terminal.element;
+  if (!element || element.dataset.touchControlsInstalled === "true") return;
+  element.dataset.touchControlsInstalled = "true";
+
+  element.addEventListener("pointerdown", (event) => {
+    if (event.pointerType !== "touch" && !state.terminalSelectionMode) return;
+    if (event.pointerType === "touch" && !state.terminalSelectionMode) {
+      // iOS only opens its software keyboard when focus happens directly
+      // inside the user's touch gesture.
+      terminal.focus();
+    }
+    const cell = terminalCellAtPointer(terminal, event);
+    state.terminalPointerGesture = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startY: event.clientY,
+      startedAt: Date.now(),
+      selectionStart: state.terminalSelectionMode ? cell : null
+    };
+    if (state.terminalSelectionMode && cell) {
+      event.preventDefault();
+      event.stopPropagation();
+      element.setPointerCapture?.(event.pointerId);
+      terminal.select(cell.column, cell.row, 1);
+    }
+  }, true);
+
+  element.addEventListener("pointermove", (event) => {
+    const gesture = state.terminalPointerGesture;
+    if (!gesture || gesture.pointerId !== event.pointerId || !gesture.selectionStart || !state.terminalSelectionMode) return;
+    const cell = terminalCellAtPointer(terminal, event);
+    if (!cell) return;
+    event.preventDefault();
+    event.stopPropagation();
+    selectTerminalRange(terminal, gesture.selectionStart, cell);
+  }, true);
+
+  const finishPointerGesture = (event) => {
+    const gesture = state.terminalPointerGesture;
+    if (!gesture || gesture.pointerId !== event.pointerId) return;
+    state.terminalPointerGesture = null;
+    if (gesture.selectionStart && state.terminalSelectionMode) {
+      event.preventDefault();
+      event.stopPropagation();
+      return;
+    }
+    if (event.pointerType !== "touch") return;
+    const deltaX = event.clientX - gesture.startX;
+    const deltaY = event.clientY - gesture.startY;
+    if (Date.now() - gesture.startedAt <= 900 && deltaX >= 48 && Math.abs(deltaX) > Math.abs(deltaY) * 1.35) {
+      event.preventDefault();
+      event.stopPropagation();
+      sendTerminalInput("\u001b[C");
+    }
+  };
+  element.addEventListener("pointerup", finishPointerGesture, true);
+  element.addEventListener("pointercancel", () => {
+    state.terminalPointerGesture = null;
+  }, true);
+}
+
+function updateTerminalSelectionUi() {
+  state.terminal?.element?.classList.toggle("touch-selection-mode", state.terminalSelectionMode);
+  const button = $('[data-action="toggle-terminal-selection"]');
+  if (!button) return;
+  button.dataset.terminalSelectionMode = String(state.terminalSelectionMode);
+  button.textContent = state.terminalSelectionMode ? "完成" : "框选";
+  button.setAttribute("aria-pressed", String(state.terminalSelectionMode));
+}
+
+function toggleTerminalSelection() {
+  state.terminalSelectionMode = !state.terminalSelectionMode;
+  if (!state.terminalSelectionMode) state.terminalPointerGesture = null;
+  updateTerminalSelectionUi();
+  if (state.terminalSelectionMode) toast("拖动手指框选终端文本");
+}
+
+async function pasteTerminal() {
+  focusTerminal();
+  let value = "";
+  try {
+    value = await navigator.clipboard.readText();
+  } catch {
+    value = window.prompt("浏览器无法直接读取剪贴板，请在这里粘贴：", "") || "";
+  }
+  if (!value) return;
+  state.terminal?.paste(value);
+}
+
+async function copyTerminalSelection() {
+  const value = state.terminal?.getSelection() || "";
+  if (!value) {
+    toast("请先框选终端文本");
+    return;
+  }
+  try {
+    await navigator.clipboard.writeText(value);
+    toast("已复制终端选区");
+  } catch {
+    window.prompt("复制下面的终端文本：", value);
   }
 }
 
@@ -1224,19 +2315,41 @@ function fitTerminal() {
   }
 }
 
+function scheduleTerminalReconnect() {
+  if (!state.terminalShouldReconnect || !activeSession() || state.terminalReconnectTimer) return;
+  const delay = Math.min(15000, 1000 * (2 ** state.terminalReconnectAttempts));
+  state.terminalReconnectAttempts += 1;
+  state.terminalReconnectTimer = setTimeout(() => {
+    state.terminalReconnectTimer = null;
+    connectTerminal();
+  }, document.hidden ? Math.max(delay, 5000) : delay);
+}
+
 function connectTerminal() {
+  if (!state.terminalShouldReconnect || !activeSession()) return;
+  if ([WebSocket.OPEN, WebSocket.CONNECTING].includes(state.terminalSocket?.readyState)) return;
+  if (state.terminalReconnectTimer) clearTimeout(state.terminalReconnectTimer);
+  state.terminalReconnectTimer = null;
   const cwd = String(terminalCwd()).trim();
   const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
   const socket = new WebSocket(`${protocol}//${window.location.host}/terminal?cwd=${encodeURIComponent(cwd)}&cols=${state.terminal?.cols || 100}&rows=${state.terminal?.rows || 32}`);
   state.terminalSocket = socket;
 
   socket.addEventListener("open", () => {
+    if (state.terminalSocket !== socket) return;
     state.terminalConnected = true;
+    state.terminalReconnectAttempts = 0;
     updateTerminalStatus();
     fitTerminal();
   });
   socket.addEventListener("message", (event) => {
-    const message = JSON.parse(event.data);
+    if (state.terminalSocket !== socket) return;
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch {
+      return;
+    }
     if (message.type === "ready") {
       state.terminal?.focus();
     }
@@ -1252,8 +2365,11 @@ function connectTerminal() {
     }
   });
   socket.addEventListener("close", () => {
+    if (state.terminalSocket !== socket) return;
+    state.terminalSocket = null;
     state.terminalConnected = false;
     updateTerminalStatus();
+    scheduleTerminalReconnect();
   });
   socket.addEventListener("error", () => {
     setTimeout(() => {
@@ -1268,19 +2384,26 @@ function restartTerminal() {
   if (!activeSession()) {
     return;
   }
-  if (state.terminalSocket && state.terminalSocket.readyState !== WebSocket.CLOSED) {
-    state.terminalSocket.close();
-  }
+  state.terminalShouldReconnect = true;
+  if (state.terminalReconnectTimer) clearTimeout(state.terminalReconnectTimer);
+  state.terminalReconnectTimer = null;
+  const previousSocket = state.terminalSocket;
+  state.terminalSocket = null;
+  if (previousSocket && previousSocket.readyState !== WebSocket.CLOSED) previousSocket.close();
   state.terminal?.clear();
   connectTerminal();
 }
 
 function disconnectTerminal() {
-  if (state.terminalSocket && state.terminalSocket.readyState !== WebSocket.CLOSED) {
-    state.terminalSocket.close();
-  }
+  state.terminalShouldReconnect = false;
+  if (state.terminalReconnectTimer) clearTimeout(state.terminalReconnectTimer);
+  state.terminalReconnectTimer = null;
+  const previousSocket = state.terminalSocket;
   state.terminalSocket = null;
+  if (previousSocket && previousSocket.readyState !== WebSocket.CLOSED) previousSocket.close();
   state.terminalConnected = false;
+  state.terminalReconnectAttempts = 0;
+  updateTerminalStatus();
 }
 
 function focusTerminal() {
@@ -1298,11 +2421,12 @@ function toggleTerminal() {
   localStorage.setItem("codex-webui:terminal-collapsed", String(state.terminalCollapsed));
   renderConsole();
   if (!state.terminalCollapsed) {
-    setTimeout(() => {
-      initTerminal();
-      fitTerminal();
-      focusTerminal();
-    }, 0);
+    // Keep focus in the trusted click event so iOS is allowed to show the
+    // software keyboard when the terminal is opened from the toolbar.
+    initTerminal();
+    fitTerminal();
+    focusTerminal();
+    requestAnimationFrame(fitTerminal);
   }
 }
 
@@ -1310,6 +2434,14 @@ async function submitPrompt(event, form = event.target) {
   event.preventDefault();
   if (!hostCanRunCodex(state.selectedHost)) {
     toast("该主机的执行适配器尚未接入。");
+    return;
+  }
+  if (runIsActive(sessionRun())) {
+    toast("请先暂停当前会话的任务。");
+    return;
+  }
+  if (state.uploadingSessionKeys.has(form.dataset.sessionKey)) {
+    toast("附件仍在上传，请稍候再发送。");
     return;
   }
   const values = formValues(form);
@@ -1327,15 +2459,38 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
     toast("请先从左侧选择会话。");
     return;
   }
+  if (runIsActive(sessionRun(session))) {
+    toast("请先暂停当前会话的任务。");
+    return;
+  }
   session.cwd = cwd;
   session.messages.push({ role: "user", content: prompt });
   const assistant = { role: "assistant", content: "" };
   session.messages.push(assistant);
-  session.title = prompt.slice(0, 42);
+  session.title = humanizeSessionTitle(prompt, session.cwd);
   session.updatedAt = new Date().toISOString();
   saveSessions();
+  const sessionKey = session.id;
+  const run = { id: null, sessionKey, threadId: session.codexThreadId || null, status: "starting", controller: new AbortController() };
+  state.sessionRuns[sessionKey] = run;
+  const attachmentKey = attachmentKeyForSession(session);
+  const runAttachments = sessionAttachments(session).slice();
+  delete state.attachmentsBySession[attachmentKey];
+  const visiblePrompt = $(`[data-session-key="${CSS.escape(sessionKey)}"] textarea[name='prompt']`);
+  if (visiblePrompt) visiblePrompt.value = "";
+  savePromptDraft(sessionKey, "");
   renderConsole();
-  setBusy(true);
+
+  const streamedItemIds = new Set();
+  let activeDeltaItemId = null;
+  let renderTimer = null;
+  const queueAssistantRender = () => {
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      updateLastAssistantMessage(assistant.content, session);
+    }, 100);
+  };
 
   try {
     await streamCodex({
@@ -1346,76 +2501,353 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
       model,
       effort,
       hostId: state.selectedHost,
-      sessionId: session.source === "codex" ? session.id : null,
-      attachments: state.attachments,
+      sessionId: session.source === "codex" ? session.id : (session.codexThreadId || null),
+      attachments: runAttachments,
+      sessionKey,
+      signal: run.controller.signal,
       onEvent(eventPayload) {
-        const text = eventText(eventPayload);
-        if (text) {
-          assistant.content = appendOutput(assistant.content, text);
-          session.updatedAt = new Date().toISOString();
-          saveSessions();
-          renderConsole();
+        if (eventPayload.sequence) run.lastSequence = eventPayload.sequence;
+        if (handleApprovalEvent(eventPayload)) return;
+        if (eventPayload.type === "webui.run") {
+          run.id = eventPayload.runId;
+          run.status = eventPayload.status || "starting";
+          renderSidebarContent();
+          renderSessionDrawer();
+          return;
         }
+        if (eventPayload.type === "webui.started") {
+          run.status = "running";
+          updateActiveComposerState();
+          return;
+        }
+        if (eventPayload.type === "webui.status") {
+          run.status = eventPayload.status || run.status;
+          updateActiveComposerState();
+          return;
+        }
+        if (eventPayload.type === "webui.finished") {
+          run.status = eventPayload.status || (Number(eventPayload.code) === 0 ? "completed" : "failed");
+          return;
+        }
+        if (eventPayload.type === "webui.thread" && isUuid(eventPayload.threadId)) {
+          adoptCodexThread(session, eventPayload.threadId);
+          return;
+        }
+        if (eventPayload.type === "webui.warning") {
+          toast(eventPayload.message || "Codex 返回了一条提醒。");
+          return;
+        }
+        const output = eventOutput(eventPayload);
+        if (!output.text) return;
+        if (output.mode === "delta") {
+          if (activeDeltaItemId && output.itemId && activeDeltaItemId !== output.itemId && assistant.content) {
+            assistant.content += "\n\n";
+          }
+          activeDeltaItemId = output.itemId || activeDeltaItemId;
+          if (output.itemId) streamedItemIds.add(output.itemId);
+          assistant.content += output.text;
+        } else if (output.mode === "final") {
+          if (!output.itemId || !streamedItemIds.has(output.itemId)) {
+            assistant.content = `${assistant.content}${assistant.content ? "\n\n" : ""}${output.text}`;
+          }
+        } else {
+          assistant.content = appendOutput(assistant.content, output.text);
+        }
+        session.updatedAt = new Date().toISOString();
+        queueAssistantRender();
       }
     });
   } catch (error) {
-    assistant.content = appendOutput(assistant.content, `Error: ${error.message}`);
-    toast(error.message);
+    if (run.status === "pausing") {
+      run.status = "paused";
+      assistant.content = appendOutput(assistant.content, "已暂停任务。");
+    } else if (run.id) {
+      run.status = "reconnecting";
+    } else {
+      run.status = "failed";
+      assistant.content = appendOutput(assistant.content, `运行未完成：${error.message}`);
+    }
   } finally {
-    state.attachments = [];
+    if (renderTimer) clearTimeout(renderTimer);
+    renderTimer = null;
+    updateLastAssistantMessage(assistant.content, session);
+    run.controller = null;
+    await refreshRunStatuses();
     saveSessions();
-    setBusy(false);
-    renderConsole();
+    if (activeSession() === session) {
+      renderConsole();
+    } else {
+      renderSidebarContent();
+      renderSessionDrawer();
+    }
+    await refreshCodexSessions();
+    renderSidebarContent();
+    if (activeSession() === session && runIsActive(run)) attachSessionRun(session).catch(reportClientError);
   }
 }
 
-async function streamCodex({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, attachments, onEvent }) {
+async function stopActiveRun() {
+  const run = sessionRun();
+  if (!run || !runIsActive(run) || run.status === "pausing") {
+    return;
+  }
+  run.status = "pausing";
+  updateActiveComposerState();
+  renderSidebarContent();
+  renderSessionDrawer();
+  try {
+    if (run.id) {
+      await api(`/api/codex/runs/${encodeURIComponent(run.id)}/pause`, { method: "POST" });
+    } else {
+      run.controller.abort();
+    }
+  } catch (error) {
+    run.status = "running";
+    updateActiveComposerState();
+    toast(error.message);
+  }
+}
+
+function adoptCodexThread(session, threadId) {
+  session.codexThreadId = threadId;
+  if (session.id === threadId) return;
+  const previousId = session.id;
+  const wasActive = state.activeSessionId === previousId;
+  const run = state.sessionRuns[previousId];
+  session.id = threadId;
+  session.source = "codex";
+  if (wasActive) state.activeSessionId = threadId;
+  if (wasActive) localStorage.setItem("codex-webui:active-session", threadId);
+  if (wasActive) syncSessionUrl(threadId);
+  if (run) {
+    run.threadId = threadId;
+    state.sessionRuns[threadId] = run;
+    delete state.sessionRuns[previousId];
+  }
+  moveSessionAttachments(previousId, threadId);
+  if (Object.prototype.hasOwnProperty.call(state.promptDrafts, previousId)) {
+    state.promptDrafts[threadId] = state.promptDrafts[previousId];
+    delete state.promptDrafts[previousId];
+    persistPromptDrafts();
+  }
+  if (state.sessionSettings[previousId]) {
+    state.sessionSettings[threadId] = state.sessionSettings[previousId];
+    delete state.sessionSettings[previousId];
+    localStorage.setItem("codex-webui:session-settings", JSON.stringify(state.sessionSettings));
+  }
+}
+
+function updateLastAssistantMessage(content, session) {
+  if (activeSession() !== session) return;
+  const messages = $$("[data-transcript] .message.assistant");
+  const body = messages.at(-1)?.querySelector(".markdown-body");
+  if (!body) return;
+  body.innerHTML = renderMarkdown(content || "...");
+  scrollTranscript();
+}
+
+async function streamCodex({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, sessionKey, attachments, signal, onEvent }) {
   const response = await fetch("/api/codex/run", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, attachments })
+    body: JSON.stringify({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, sessionKey, attachments }),
+    signal
   });
   if (!response.ok || !response.body) {
     const payload = await response.json().catch(() => ({}));
     throw new Error(payload.error || `Codex run failed: ${response.status}`);
   }
 
+  return consumeCodexEventResponse(response, onEvent);
+}
+
+async function consumeCodexEventResponse(response, onEvent) {
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";
+  let exitCode = 0;
+  const diagnostics = [];
   while (true) {
     const { value, done } = await reader.read();
-    if (done) break;
+    if (done) {
+      buffer += decoder.decode();
+      break;
+    }
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split(/\r?\n/);
     buffer = lines.pop() || "";
     for (const line of lines) {
       if (!line.trim()) continue;
-      onEvent(JSON.parse(line));
+      let eventPayload;
+      try {
+        eventPayload = JSON.parse(line);
+      } catch {
+        diagnostics.push(line);
+        continue;
+      }
+      if (eventPayload.type === "codex.stderr" || eventPayload.type === "webui.error") {
+        diagnostics.push(eventPayload.text || eventPayload.message || "");
+        continue;
+      }
+      if (eventPayload.type === "webui.finished") {
+        exitCode = Number(eventPayload.code) || 0;
+        onEvent(eventPayload);
+        reader.cancel().catch(() => {});
+        if (exitCode !== 0) {
+          console.error("Codex execution failed", { exitCode, diagnostics });
+          throw new Error("Codex 运行未完成，请重试或查看服务端日志。");
+        }
+        return;
+      }
+      onEvent(eventPayload);
+    }
+  }
+  if (buffer.trim()) diagnostics.push(buffer.trim());
+  if (exitCode !== 0) {
+    console.error("Codex execution failed", { exitCode, diagnostics });
+    throw new Error("Codex 运行未完成，请重试或查看服务端日志。");
+  }
+}
+
+async function attachSessionRun(session) {
+  const run = sessionRun(session);
+  if (!runIsActive(run) || run.controller || run.attaching || !run.id) return;
+  run.attaching = true;
+  let assistant = session.messages.at(-1);
+  if (assistant?.role !== "assistant") {
+    assistant = { role: "assistant", content: "" };
+    session.messages.push(assistant);
+  }
+  const replayingFromStart = !Number(run.lastSequence);
+  let recoveredContent = replayingFromStart ? "" : assistant.content;
+  let activeDeltaItemId = null;
+  const streamedItemIds = new Set();
+  let renderTimer = null;
+  const queueRecoveredRender = () => {
+    if (renderTimer) return;
+    renderTimer = setTimeout(() => {
+      renderTimer = null;
+      updateLastAssistantMessage(assistant.content, session);
+    }, 100);
+  };
+  try {
+    const response = await fetch(`/api/codex/runs/${encodeURIComponent(run.id)}/events?after=${Number(run.lastSequence) || 0}`);
+    if (!response.ok || !response.body) throw new Error("无法重新连接后台任务。");
+    await consumeCodexEventResponse(response, (eventPayload) => {
+      if (eventPayload.sequence) run.lastSequence = eventPayload.sequence;
+      if (handleApprovalEvent(eventPayload)) return;
+      if (eventPayload.type === "webui.run") run.id = eventPayload.runId || run.id;
+      if (eventPayload.type === "webui.started") run.status = "running";
+      if (eventPayload.type === "webui.status") run.status = eventPayload.status || run.status;
+      if (eventPayload.type === "webui.finished") {
+        run.status = eventPayload.status || (Number(eventPayload.code) === 0 ? "completed" : "failed");
+        return;
+      }
+      if (eventPayload.type === "webui.thread" && isUuid(eventPayload.threadId)) {
+        adoptCodexThread(session, eventPayload.threadId);
+        return;
+      }
+      if (eventPayload.type === "webui.warning") {
+        if (activeSession() === session) toast(eventPayload.message || "Codex 返回了一条提醒。");
+        return;
+      }
+      const output = eventOutput(eventPayload);
+      if (!output.text) return;
+      if (output.mode === "delta") {
+        if (activeDeltaItemId && output.itemId && activeDeltaItemId !== output.itemId && recoveredContent) {
+          recoveredContent += "\n\n";
+        }
+        activeDeltaItemId = output.itemId || activeDeltaItemId;
+        if (output.itemId) streamedItemIds.add(output.itemId);
+        recoveredContent += output.text;
+      } else if (output.mode === "final") {
+        if (!output.itemId || !streamedItemIds.has(output.itemId)) {
+          recoveredContent = `${recoveredContent}${recoveredContent ? "\n\n" : ""}${output.text}`;
+        }
+      } else {
+        recoveredContent = appendOutput(recoveredContent, output.text);
+      }
+      assistant.content = recoveredContent;
+      session.updatedAt = new Date().toISOString();
+      queueRecoveredRender();
+    });
+  } catch (error) {
+    if (runIsActive(run)) run.status = "reconnecting";
+    throw error;
+  } finally {
+    if (renderTimer) clearTimeout(renderTimer);
+    renderTimer = null;
+    updateLastAssistantMessage(assistant.content, session);
+    run.attaching = false;
+    if (runIsActive(run)) await refreshRunStatuses();
+    if (!runIsActive(run)) {
+      try {
+        const payload = await api(`/api/codex/sessions/${encodeURIComponent(session.id)}`);
+        Object.assign(session, payload.session, { hostId: "local-codex", source: "codex" });
+      } catch {
+        // The session file may take a moment to flush; keep the streamed copy.
+      }
+      if (activeSession() === session) renderConsole();
+      renderSidebarContent();
+      renderSessionDrawer();
+    } else {
+      updateActiveComposerState();
+      renderSidebarContent();
+      renderSessionDrawer();
+      setTimeout(() => attachSessionRun(session).catch((error) => console.warn("Codex run reconnect failed", error)), 1000);
     }
   }
 }
 
-function eventText(eventPayload) {
+function handleApprovalEvent(eventPayload) {
+  if (eventPayload.type === "webui.approval" && eventPayload.approval) {
+    const approval = eventPayload.approval;
+    state.approvals = [
+      ...state.approvals.filter((item) => item.id !== approval.id),
+      approval
+    ].sort((left, right) => String(left.createdAt).localeCompare(String(right.createdAt)));
+    renderApprovalDialog();
+    renderSidebarContent();
+    renderSessionDrawer();
+    return true;
+  }
+  if (eventPayload.type === "webui.approvalResolved") {
+    state.approvals = state.approvals.filter((item) => item.id !== eventPayload.approvalId);
+    renderApprovalDialog();
+    renderSidebarContent();
+    renderSessionDrawer();
+    return true;
+  }
+  return false;
+}
+
+function eventOutput(eventPayload) {
   if (eventPayload.type === "webui.started") {
-    return "";
+    return { mode: "none", text: "" };
   }
   if (eventPayload.type === "webui.finished") {
-    return "";
+    return { mode: "none", text: "" };
   }
-  if (eventPayload.type === "codex.stderr") {
-    return eventPayload.text;
-  }
+  if (eventPayload.type === "codex.stderr") return { mode: "none", text: "" };
   if (eventPayload.type === "codex.stdout") {
-    return eventPayload.text;
+    return { mode: "block", text: eventPayload.text || "" };
   }
   if (eventPayload.type === "codex.event") {
-    return extractCodexText(eventPayload.data);
+    const data = eventPayload.data;
+    if (data?.method === "item/agentMessage/delta") {
+      return { mode: "delta", text: String(data.params?.delta || ""), itemId: data.params?.itemId || null };
+    }
+    if (data?.method === "item/completed") {
+      const item = data.params?.item;
+      const isAgentMessage = ["agentMessage", "agent_message"].includes(item?.type);
+      return { mode: "final", text: isAgentMessage ? extractCodexText(item) : "", itemId: item?.id || null };
+    }
+    if (data?.method) {
+      return { mode: "none", text: "" };
+    }
+    return { mode: "block", text: extractCodexText(data) };
   }
-  if (eventPayload.message) {
-    return eventPayload.message;
-  }
-  return "";
+  return { mode: "block", text: eventPayload.message || "" };
 }
 
 function extractCodexText(data) {
@@ -1463,12 +2895,21 @@ function fileToDataUrl(file) {
   });
 }
 
-async function uploadFiles(fileList) {
+async function uploadFiles(fileList, sessionKey = attachmentKeyForSession()) {
   const files = Array.from(fileList || []);
   if (!files.length) {
     return;
   }
-  setBusy(true);
+  const oversized = files.find((file) => file.size > 16 * 1024 * 1024);
+  if (oversized) {
+    toast(`${oversized.name} 超过 16 MB，未上传。`);
+    return;
+  }
+  if (state.uploadingSessionKeys.has(sessionKey)) {
+    toast("这个会话已有附件正在上传。");
+    return;
+  }
+  state.uploadingSessionKeys.add(sessionKey);
   try {
     for (const file of files) {
       const data = await fileToDataUrl(file);
@@ -1476,14 +2917,15 @@ async function uploadFiles(fileList) {
         method: "POST",
         body: JSON.stringify({ name: file.name, size: file.size, mime: file.type, data })
       });
-      state.attachments.push(payload.attachment);
+      if (!Array.isArray(state.attachmentsBySession[sessionKey])) state.attachmentsBySession[sessionKey] = [];
+      state.attachmentsBySession[sessionKey].push(payload.attachment);
     }
     toast(`${files.length} 个附件已上传`);
-    renderConsole();
+    updateAttachmentTray(sessionKey);
   } catch (error) {
     toast(error.message);
   } finally {
-    setBusy(false);
+    state.uploadingSessionKeys.delete(sessionKey);
   }
 }
 
@@ -1493,8 +2935,9 @@ function renderSettings() {
     return;
   }
   const host = hostById();
-  const sectionTitle = state.settingsSection === "skills" ? "Skill" : "MCP";
-  const sectionSubtitle = `${host.name} · ${host.endpoint || ""}`;
+  const isFilePreview = state.settingsSection === "file-preview";
+  const sectionTitle = isFilePreview ? "文件预览" : (state.settingsSection === "skills" ? "Skill" : "MCP");
+  const sectionSubtitle = isFilePreview ? "临时可浏览目录与复制规则" : `${host.name} · ${host.endpoint || ""}`;
   container.innerHTML = `
     <div class="mobile-settings-panel">${renderSettingsSidebar()}</div>
     <section class="settings-stage">
@@ -1556,10 +2999,46 @@ function settingsTabLabel(tab) {
 }
 
 function renderSettingsContent() {
+  if (state.settingsSection === "file-preview") {
+    return renderFilePreviewSettingsContent();
+  }
   if (state.settingsSection === "skills") {
     return renderSkillSettingsContent();
   }
   return renderMcpSettingsContent();
+}
+
+function renderFilePreviewSettingsContent() {
+  const settings = state.filePreviewSettings || defaultFilePreviewSettings;
+  return `
+    <section class="panel settings-section-block file-preview-settings-block">
+      <div class="panel-header">
+        <div>
+          <h3>可复制文件规则</h3>
+          <p>符合后缀和大小规则的本机文件可复制到临时可浏览目录，不限制文件所在位置。</p>
+        </div>
+      </div>
+      <div class="panel-body">
+        <form class="form-grid file-preview-settings-form" data-file-preview-settings-form>
+          <label class="full-width">允许的文件后缀
+            <textarea name="extensions" rows="4" placeholder="json, svg, png, jpg, mp4, webm">${escapeHtml(settings.extensions.join(", "))}</textarea>
+            <small>用逗号、分号、空格或换行分隔，不需要填写点号；最多 64 种。</small>
+          </label>
+          <label>单文件大小上限（MB）
+            <input name="maxFileSizeMb" type="number" min="0.1" max="1024" step="0.1" value="${escapeHtml(settings.maxFileSizeMb)}" required>
+          </label>
+          <label>自动清空间隔（分钟）
+            <input name="cleanupIntervalMinutes" type="number" min="1" max="10080" step="1" value="${escapeHtml(settings.cleanupIntervalMinutes)}" required>
+            <small>默认每 30 分钟清空一次临时可浏览目录。</small>
+          </label>
+          <div class="toolbar-row full-width">
+            <button class="button primary slim" type="submit">保存设置</button>
+            <button class="button ghost slim" type="button" data-action="clear-preview-cache">立即清空临时目录</button>
+          </div>
+        </form>
+      </div>
+    </section>
+  `;
 }
 
 function renderConnectionSettingsContent() {
@@ -1871,6 +3350,30 @@ async function submitMcp(event) {
     await refreshMcp();
     setBusy(false);
     renderAll();
+  }
+}
+
+async function submitFilePreviewSettings(event, form) {
+  event.preventDefault();
+  const values = formValues(form);
+  const extensions = String(values.extensions || "").split(/[\s,，;；]+/).map((entry) => entry.trim()).filter(Boolean);
+  setBusy(true);
+  try {
+    const payload = await api("/api/settings/file-preview", {
+      method: "PUT",
+      body: JSON.stringify({
+        extensions,
+        maxFileSizeMb: Number(values.maxFileSizeMb),
+        cleanupIntervalMinutes: Number(values.cleanupIntervalMinutes)
+      })
+    });
+    state.filePreviewSettings = payload.settings;
+    toast("文件预览设置已保存");
+    renderSettings();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    setBusy(false);
   }
 }
 
@@ -2202,9 +3705,26 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  const previewImage = target.closest("[data-preview-url]");
+  if (previewImage) {
+    window.open(previewImage.dataset.previewUrl, "_blank", "noopener,noreferrer");
+    return;
+  }
+
+  if (target.closest("[data-session-drawer-backdrop]")) {
+    setSessionDrawerOpen(false);
+    return;
+  }
+
+  if (target.closest("[data-new-session-sheet]") && !target.closest(".sheet")) {
+    closeNewSessionSheet();
+    return;
+  }
+
   const navButton = target.closest("[data-nav-target]");
   if (navButton) {
     event.preventDefault();
+    setSessionDrawerOpen(false);
     setView(navButton.dataset.navTarget);
     return;
   }
@@ -2223,9 +3743,19 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  if (button.dataset.approvalDecision && button.dataset.approvalId) {
+    await resolveApproval(button.dataset.approvalId, button.dataset.approvalDecision);
+    return;
+  }
+
   if (button.dataset.approvalOption) {
     state.selectedApproval = button.dataset.approvalOption;
+    if (state.selectedApproval === "approve-for-me" && state.selectedSandbox === "danger-full-access") {
+      state.selectedSandbox = "workspace-write";
+      localStorage.setItem("codex-webui:sandbox", state.selectedSandbox);
+    }
     localStorage.setItem("codex-webui:approval", state.selectedApproval);
+    saveSessionSettings();
     state.composerMenu = null;
     updateComposerFooters();
     return;
@@ -2234,6 +3764,7 @@ async function handleDocumentClick(event) {
   if (button.dataset.modelOption) {
     state.selectedModel = button.dataset.modelOption;
     localStorage.setItem("codex-webui:model", state.selectedModel);
+    saveSessionSettings();
     state.modelMenuPanel = "root";
     updateComposerFooters();
     return;
@@ -2242,6 +3773,7 @@ async function handleDocumentClick(event) {
   if (button.dataset.effortOption !== undefined) {
     state.selectedEffort = button.dataset.effortOption;
     localStorage.setItem("codex-webui:effort", state.selectedEffort);
+    saveSessionSettings();
     state.modelMenuPanel = "root";
     updateComposerFooters();
     return;
@@ -2250,6 +3782,7 @@ async function handleDocumentClick(event) {
   if (button.dataset.sandboxOption) {
     state.selectedSandbox = button.dataset.sandboxOption;
     localStorage.setItem("codex-webui:sandbox", state.selectedSandbox);
+    saveSessionSettings();
     updateComposerFooters();
     return;
   }
@@ -2261,6 +3794,18 @@ async function handleDocumentClick(event) {
 
   if (button.dataset.toggleHostSessions) {
     await toggleHostSessions(button.dataset.toggleHostSessions);
+    return;
+  }
+
+  if (button.dataset.toggleCwdGroup !== undefined) {
+    toggleCwdGroup(button.dataset.toggleCwdGroup);
+    return;
+  }
+
+  if (button.dataset.startSessionCwd) {
+    event.preventDefault();
+    event.stopPropagation();
+    await startSessionWithCwd(button.dataset.startSessionCwd);
     return;
   }
 
@@ -2326,13 +3871,19 @@ async function handleDocumentClick(event) {
   }
 
   if (button.dataset.removeAttachment) {
-    state.attachments = state.attachments.filter((attachment) => attachment.id !== button.dataset.removeAttachment);
-    renderConsole();
+    const key = button.closest("[data-session-key]")?.dataset.sessionKey || attachmentKeyForSession();
+    state.attachmentsBySession[key] = (state.attachmentsBySession[key] || []).filter((attachment) => attachment.id !== button.dataset.removeAttachment);
+    updateAttachmentTray(key);
     return;
   }
 
   if (button.dataset.deleteSession) {
     await deleteSession(button.dataset.deleteSession);
+    return;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(button.dataset, "clearCwd")) {
+    await clearCwdSessions(button.dataset.clearCwd);
     return;
   }
 
@@ -2355,6 +3906,9 @@ async function handleDocumentClick(event) {
   }
 
   switch (button.dataset.action) {
+    case "stop-run":
+      await stopActiveRun();
+      break;
     case "toggle-approval-menu":
       state.composerMenu = state.composerMenu === "approval" ? null : "approval";
       updateComposerFooters();
@@ -2385,7 +3939,28 @@ async function handleDocumentClick(event) {
       toast("已刷新");
       break;
     case "new-session":
-      newSession();
+      openNewSessionSheet();
+      break;
+    case "open-new-session-sheet":
+      openNewSessionSheet();
+      break;
+    case "close-new-session-sheet":
+      closeNewSessionSheet();
+      break;
+    case "toggle-session-drawer":
+      toggleSessionDrawer();
+      break;
+    case "close-session-drawer":
+      setSessionDrawerOpen(false);
+      break;
+    case "clear-all-sessions":
+      await clearAllSessions();
+      break;
+    case "pick-new-directory":
+      state.newSessionSheetOpen = false;
+      state.directoryPicker.intent = "new-session";
+      renderNewSessionSheet();
+      await openDirectoryPicker();
       break;
     case "open-directory-picker":
       await openDirectoryPicker();
@@ -2398,6 +3973,15 @@ async function handleDocumentClick(event) {
       break;
     case "restart-terminal":
       restartTerminal();
+      break;
+    case "paste-terminal":
+      await pasteTerminal();
+      break;
+    case "toggle-terminal-selection":
+      toggleTerminalSelection();
+      break;
+    case "copy-terminal-selection":
+      await copyTerminalSelection();
       break;
     case "toggle-terminal":
       toggleTerminal();
@@ -2467,6 +4051,11 @@ async function handleDocumentClick(event) {
       state.skillQuery = "";
       renderSettings();
       break;
+    case "clear-preview-cache": {
+      const payload = await api("/api/settings/file-preview/cache", { method: "DELETE" });
+      toast(`临时目录已清空（${payload.removed || 0} 个文件）`);
+      break;
+    }
     default:
       break;
   }
@@ -2489,6 +4078,10 @@ async function handleDocumentSubmit(event) {
     await submitMcp(event, form);
     return;
   }
+  if (form.matches("[data-file-preview-settings-form]")) {
+    await submitFilePreviewSettings(event, form);
+    return;
+  }
   if (form.matches("[data-host-form]")) {
     await submitHost(event, form);
   }
@@ -2496,13 +4089,19 @@ async function handleDocumentSubmit(event) {
 
 function handleDocumentInput(event) {
   const target = event.target;
+  if (target instanceof HTMLTextAreaElement && target.name === "prompt") {
+    const form = target.closest("[data-session-key]");
+    if (form) savePromptDraft(form.dataset.sessionKey, target.value);
+    return;
+  }
   if (target.matches("[data-theme-toggle]")) {
     setTheme(target.checked ? "dark" : "light");
     return;
   }
 
   if (target.matches("[data-file-input]")) {
-    uploadFiles(target.files).catch(reportClientError);
+    const sessionKey = target.closest("[data-session-key]")?.dataset.sessionKey || attachmentKeyForSession();
+    uploadFiles(target.files, sessionKey).catch(reportClientError);
     target.value = "";
     return;
   }
@@ -2556,9 +4155,17 @@ function handleDocumentInput(event) {
 }
 
 function reportClientError(error) {
-  const message = error?.message || String(error);
   console.error(error);
-  toast(`前端错误: ${message}`);
+  toast("页面操作未完成，请重试。");
+}
+
+function syncMobileViewport() {
+  const viewport = window.visualViewport;
+  const height = viewport?.height || window.innerHeight || document.documentElement.clientHeight;
+  const offsetTop = viewport?.offsetTop || 0;
+  document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+  document.documentElement.style.setProperty("--app-offset-top", `${Math.round(offsetTop)}px`);
+  document.body.classList.toggle("keyboard-open", Boolean(viewport && window.innerHeight - viewport.height > 120));
 }
 
 document.addEventListener("click", (event) => {
@@ -2570,6 +4177,11 @@ document.addEventListener("submit", (event) => {
 document.addEventListener("input", handleDocumentInput);
 document.addEventListener("keydown", (event) => {
   const target = event.target instanceof Element ? event.target : null;
+  if (target?.matches("[data-preview-url]") && (event.key === "Enter" || event.key === " ")) {
+    event.preventDefault();
+    window.open(target.dataset.previewUrl, "_blank", "noopener,noreferrer");
+    return;
+  }
   const composer = target?.closest("[data-composer], [data-new-session-form]");
   if (
     target instanceof HTMLTextAreaElement
@@ -2583,7 +4195,7 @@ document.addEventListener("keydown", (event) => {
     && !event.isComposing
   ) {
     event.preventDefault();
-    if (!target.disabled && !state.busy) {
+    if (!target.disabled && !state.busy && !runIsActive(sessionRun())) {
       composer.requestSubmit();
     }
     return;
@@ -2594,11 +4206,50 @@ document.addEventListener("keydown", (event) => {
     toggleSidebar();
   }
 });
-window.addEventListener("resize", () => fitTerminal());
+window.addEventListener("resize", () => {
+  syncMobileViewport();
+  fitTerminal();
+});
+window.visualViewport?.addEventListener("resize", syncMobileViewport);
+window.visualViewport?.addEventListener("scroll", syncMobileViewport);
+let backgroundPollTimer = null;
+let backgroundPollRunning = false;
+
+async function pollBackgroundState() {
+  if (backgroundPollRunning) return;
+  backgroundPollRunning = true;
+  const before = JSON.stringify(Object.values(state.sessionRuns).map((run) => [run.id, run.status, run.updatedAt]));
+  try {
+    await Promise.all([refreshRunStatuses(), refreshApprovals()]);
+    const after = JSON.stringify(Object.values(state.sessionRuns).map((run) => [run.id, run.status, run.updatedAt]));
+    if (before !== after) {
+      renderSidebarContent();
+      renderSessionDrawer();
+      updateActiveComposerState();
+      const session = activeSession();
+      if (session) attachSessionRun(session).catch((error) => console.warn("Codex run reconnect failed", error));
+    }
+  } finally {
+    backgroundPollRunning = false;
+    const hasActiveRun = Object.values(state.sessionRuns).some(runIsActive) || state.approvals.length > 0;
+    const delay = document.hidden ? 30000 : (hasActiveRun ? 2000 : 10000);
+    backgroundPollTimer = setTimeout(pollBackgroundState, delay);
+  }
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) return;
+  if (backgroundPollTimer) clearTimeout(backgroundPollTimer);
+  backgroundPollTimer = setTimeout(pollBackgroundState, 0);
+  if (state.terminalShouldReconnect && !state.terminalConnected) scheduleTerminalReconnect();
+});
+window.addEventListener("pagehide", persistPromptDrafts);
 window.addEventListener("error", (event) => reportClientError(event.error || event.message));
 window.addEventListener("unhandledrejection", (event) => reportClientError(event.reason));
 
 renderShell();
 renderAll();
+syncMobileViewport();
 startSignalCanvas();
 refreshAll().catch(reportClientError);
+backgroundPollTimer = setTimeout(pollBackgroundState, 2000);

@@ -1,5 +1,5 @@
 {
-  "name": "@zxm-bupt/codex-webui",
+  "name": "@myendless1/codex-webui",
   "version": "1.1.0",
   "description": "Browser-based local console for Codex CLI, MCP, skills, and terminal sessions.",
   "type": "module",
@@ -12,12 +12,12 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zxm-bupt/codex-webui.git"
+    "url": "git+ssh://git@github.com/myendless1/codex-webui.git"
   },
   "bugs": {
-    "url": "https://github.com/zxm-bupt/codex-webui/issues"
+    "url": "https://github.com/myendless1/codex-webui/issues"
   },
-  "homepage": "https://github.com/zxm-bupt/codex-webui#readme",
+  "homepage": "https://github.com/myendless1/codex-webui#readme",
   "publishConfig": {
     "access": "public"
   },
