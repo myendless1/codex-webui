@@ -28,29 +28,18 @@ Requirements:
 - Codex CLI installed and authenticated;
 - the `codex` command available in `PATH`.
 
-### Install
+### Install from source
 
-Install globally:
-
-```bash
-npm install -g @myendless1/codex-webui
-codex-webui
-```
-
-Or run without a global installation:
+> `@myendless1/codex-webui` is not currently published to the public npm registry. Do not use `npm install -g @myendless1/codex-webui` or `npx @myendless1/codex-webui` yet. Deploy from the GitHub source repository instead.
 
 ```bash
-npx @myendless1/codex-webui
+git clone https://github.com/myendless1/codex-webui.git
+cd codex-webui
+npm ci
+npm start
 ```
 
-The CLI defaults to `http://127.0.0.1:8787`.
-
-### Run from source
-
-```bash
-npm install
-npm run dev
-```
+The server defaults to `http://127.0.0.1:8787`.
 
 To listen on the LAN, set a strong login password at the same time:
 
@@ -67,7 +56,7 @@ HOST=127.0.0.1 PORT=8787 \
 CODEX_BIN=/path/to/codex \
 CODEX_WEBUI_DATA_DIR=/path/to/state \
 CODEX_WEBUI_MAX_UPLOAD_MB=64 \
-codex-webui
+npm start
 ```
 
 Runtime state and uploads default to `~/.codex-webui/`. Local and embedded images are archived under `sessions/<session-id>/images/`, and uploads under `sessions/<session-id>/attachments/`. UI actions and upload results are recorded as JSON Lines in `action-events.jsonl` with client and server timestamps.
@@ -75,7 +64,15 @@ Runtime state and uploads default to `~/.codex-webui/`. Local and embedded image
 New-session working directories are selected through the server-side directory picker and validated before use. By default, it can browse the current user's home directory and the directory where the server was started. Restrict the available roots with the platform path separator:
 
 ```bash
-CODEX_WEBUI_DIRECTORY_ROOTS=/home/euler/workspace:/mnt/projects codex-webui
+CODEX_WEBUI_DIRECTORY_ROOTS=/home/euler/workspace:/mnt/projects npm start
+```
+
+To update a source deployment:
+
+```bash
+git pull --ff-only
+npm ci
+npm start
 ```
 
 ## Usage
@@ -153,7 +150,9 @@ For development, `./restart-webui.sh` safely stops this project's old process an
 
 ## Automated npm releases
 
-The workflow at `.github/workflows/publish.yml` publishes only when a `v*` tag is pushed and runs `npm test` first. Configure npm Trusted Publishing for the repository, then create and push a release tag without publishing locally:
+The package is not currently available from the public npm registry, so this README does not present global installation or `npx` as working installation methods.
+
+The workflow at `.github/workflows/publish.yml` is a preconfigured release path. It attempts to publish only when a `v*` tag matching the version in `package.json` is pushed, and it runs `npm test` first. Before the first public release, npm Trusted Publishing must also be configured for this repository. Then create and push a release tag without publishing locally:
 
 ```bash
 np patch --no-publish

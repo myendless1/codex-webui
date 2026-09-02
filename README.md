@@ -28,28 +28,15 @@
 - 已安装并完成登录的 Codex CLI；
 - `codex` 命令可从 `PATH` 调用。
 
-### 安装
+### 从源码安装
 
-全局安装：
-
-```bash
-npm install -g @myendless1/codex-webui
-codex-webui
-```
-
-或者不全局安装，直接运行：
+> 当前 `@myendless1/codex-webui` 尚未发布到公共 npm registry，请勿使用 `npm install -g @myendless1/codex-webui` 或 `npx @myendless1/codex-webui`。目前请从 GitHub 源码部署。
 
 ```bash
-npx @myendless1/codex-webui
-```
-
-默认访问地址为 `http://127.0.0.1:8787`。
-
-### 源码运行
-
-```bash
-npm install
-npm run dev
+git clone https://github.com/myendless1/codex-webui.git
+cd codex-webui
+npm ci
+npm start
 ```
 
 默认监听：
@@ -79,10 +66,10 @@ HOST=127.0.0.1 PORT=8787 npm run dev
 登录用户名默认为 `codex`，可通过 `CODEX_WEBUI_USER` 修改。iPhone Safari 首次访问会显示系统登录框，之后终端 WebSocket 会复用同一登录信息。
 
 ```bash
-CODEX_BIN=/path/to/codex CODEX_WEBUI_DATA_DIR=/path/to/state CODEX_WEBUI_MAX_UPLOAD_MB=64 codex-webui
+CODEX_BIN=/path/to/codex CODEX_WEBUI_DATA_DIR=/path/to/state CODEX_WEBUI_MAX_UPLOAD_MB=64 npm start
 ```
 
-运行时状态和上传文件默认保存在 `~/.codex-webui/`，避免全局安装时写入 npm 的安装目录。
+运行时状态和上传文件默认保存在 `~/.codex-webui/`，不会写入源码目录。
 对话中的本地图片和内嵌 base64 图片会自动归档到 `~/.codex-webui/sessions/<session-id>/images/`；上传附件位于同一会话目录的 `attachments/`。归档图片会在消息中显示为缩略图，点击可打开原图。
 附件使用原始二进制流上传，默认单文件上限为 64 MB，可通过 `CODEX_WEBUI_MAX_UPLOAD_MB` 调整。
 
@@ -93,7 +80,15 @@ CODEX_BIN=/path/to/codex CODEX_WEBUI_DATA_DIR=/path/to/state CODEX_WEBUI_MAX_UPL
 新会话的工作目录通过服务端目录选择器选取，并在创建前校验其存在。默认可浏览用户主目录和启动命令所在目录；可用 `CODEX_WEBUI_DIRECTORY_ROOTS` 限制范围，多个根目录使用系统路径分隔符：
 
 ```bash
-CODEX_WEBUI_DIRECTORY_ROOTS=/home/euler/workspace:/mnt/projects codex-webui
+CODEX_WEBUI_DIRECTORY_ROOTS=/home/euler/workspace:/mnt/projects npm start
+```
+
+更新源码部署：
+
+```bash
+git pull --ff-only
+npm ci
+npm start
 ```
 
 ## 使用说明
@@ -187,7 +182,9 @@ sudo ./install-webui-service.sh uninstall
 
 ## 自动发布 npm 包
 
-仓库中的 `.github/workflows/publish.yml` 只在推送 `v*` 标签时发布，并会在发布前运行 `npm test`。
+目前该包尚未发布到公共 npm registry，README 中不把全局安装或 `npx` 作为可用安装方式。
+
+仓库中的 `.github/workflows/publish.yml` 是预配置的发布流程：只在推送与 `package.json` 版本一致的 `v*` 标签时尝试发布，并会在发布前运行 `npm test`。首次正式发布前还必须在 npm 包设置中完成 Trusted Publishing 配置。
 
 首次自动发布前，在 npm 包设置中配置 Trusted Publishing：
 
