@@ -17,7 +17,8 @@ const nodeModulesDir = path.join(__dirname, "node_modules");
 const dataDir = process.env.CODEX_WEBUI_DATA_DIR || path.join(os.homedir(), ".codex-webui");
 const stateFile = path.join(dataDir, "webui-state.json");
 const uploadDir = path.join(dataDir, "uploads");
-const previewDir = path.join(dataDir, "previews");
+const sessionFilesDir = path.join(dataDir, "sessions");
+const actionLogFile = path.join(dataDir, "action-events.jsonl");
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const codexSessionsDir = path.join(codexHome, "sessions");
 const codexBin = process.env.CODEX_BIN || "codex";
@@ -34,6 +35,12 @@ const codexSessionPathCache = new Map();
 const activeRunStatuses = new Set(["starting", "running", "pausing"]);
 const runRetentionMs = 6 * 60 * 60 * 1000;
 const approvalTimeoutMs = 10 * 60 * 1000;
+const configuredMaxUploadMb = Number(process.env.CODEX_WEBUI_MAX_UPLOAD_MB || 64);
+const maxUploadBytes = Math.round(
+  (Number.isFinite(configuredMaxUploadMb) && configuredMaxUploadMb > 0 ? configuredMaxUploadMb : 64) * 1024 * 1024
+);
+let actionLogWrite = Promise.resolve();
+const recentActionEventIds = new Set();
 
 const mimeTypes = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -41,7 +48,9 @@ const mimeTypes = new Map([
   [".js", "text/javascript; charset=utf-8"],
   [".mjs", "text/javascript; charset=utf-8"],
   [".json", "application/json; charset=utf-8"],
+  [".webmanifest", "application/manifest+json; charset=utf-8"],
   [".svg", "image/svg+xml"],
+  [".png", "image/png"],
   [".ico", "image/x-icon"]
 ]);
 
@@ -67,10 +76,8 @@ const previewMimeTypes = new Map([
 
 const defaultFilePreviewSettings = {
   extensions: ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
-  maxFileSizeMb: 20,
-  cleanupIntervalMinutes: 30
+  maxFileSizeMb: 20
 };
-let lastPreviewCacheCleanup = Date.now();
 
 const defaultState = {
   hosts: [
@@ -100,6 +107,58 @@ function sendError(res, status, message, details = undefined) {
   sendJson(res, status, { error: message, details });
 }
 
+function sanitizeActionLogValue(value, depth = 0) {
+  if (value === null || typeof value === "boolean" || typeof value === "number") return value;
+  if (typeof value === "string") return value.slice(0, 500);
+  if (depth >= 3) return String(value).slice(0, 500);
+  if (Array.isArray(value)) {
+    return value.slice(0, 32).map((entry) => sanitizeActionLogValue(entry, depth + 1));
+  }
+  if (!value || typeof value !== "object") return String(value).slice(0, 500);
+  return Object.fromEntries(Object.entries(value).slice(0, 48).map(([key, entry]) => [
+    String(key).slice(0, 80),
+    sanitizeActionLogValue(entry, depth + 1)
+  ]));
+}
+
+function appendActionEvents(entries, req = null) {
+  const receivedAt = new Date().toISOString();
+  const remoteAddress = String(req?.socket?.remoteAddress || "").slice(0, 120);
+  const userAgent = String(req?.headers?.["user-agent"] || "").slice(0, 300);
+  const lines = asArray(entries).slice(0, 100).flatMap((entry) => {
+    const eventId = typeof entry?.eventId === "string" ? entry.eventId.slice(0, 120) : null;
+    if (eventId && recentActionEventIds.has(eventId)) return [];
+    if (eventId) {
+      recentActionEventIds.add(eventId);
+      if (recentActionEventIds.size > 5000) recentActionEventIds.delete(recentActionEventIds.values().next().value);
+    }
+    return [JSON.stringify({
+      serverTime: receivedAt,
+      clientTime: typeof entry?.clientTime === "string" ? entry.clientTime.slice(0, 80) : null,
+      eventId,
+      behavior: String(entry?.behavior || "unknown").slice(0, 160),
+      details: sanitizeActionLogValue(entry?.details || {}),
+      remoteAddress,
+      userAgent
+    })];
+  });
+  if (!lines.length) return Promise.resolve();
+
+  const write = async () => {
+    await fs.mkdir(dataDir, { recursive: true });
+    await fs.appendFile(actionLogFile, `${lines.join("\n")}\n`, "utf8");
+  };
+  actionLogWrite = actionLogWrite.then(write, write);
+  return actionLogWrite;
+}
+
+async function recordClientActions(req, res) {
+  const body = await readBody(req, 256 * 1024);
+  const entries = Array.isArray(body.events) ? body.events : [body];
+  await appendActionEvents(entries, req);
+  sendJson(res, 202, { ok: true, recorded: Math.min(entries.length, 100) });
+}
+
 function publicCodexRun(run) {
   return {
     id: run.id,
@@ -122,6 +181,50 @@ function listCodexRuns(res) {
   sendJson(res, 200, { runs });
 }
 
+function approvalChangeKind(change = {}) {
+  const value = change.kind?.type || change.kind || change.type || "update";
+  return ["add", "delete", "update"].includes(value) ? value : "update";
+}
+
+function approvalChangeSummaries(params = {}, item = null) {
+  const changes = Array.isArray(params.changes)
+    ? params.changes
+    : (Array.isArray(item?.changes) ? item.changes : []);
+  if (changes.length) {
+    return changes
+      .filter((change) => change?.path)
+      .map((change) => ({
+        path: String(change.path),
+        kind: approvalChangeKind(change),
+        movePath: change.kind?.move_path || change.move_path || null
+      }));
+  }
+  if (params.fileChanges && typeof params.fileChanges === "object") {
+    return Object.entries(params.fileChanges).map(([filePath, change]) => ({
+      path: filePath,
+      kind: approvalChangeKind(change),
+      movePath: change?.move_path || null
+    }));
+  }
+  return [];
+}
+
+function approvalDisplayDetails(method, params = {}, item = null) {
+  const command = params.command ?? params.cmd ?? item?.command ?? "";
+  const normalizedCommand = Array.isArray(command)
+    ? command.map((part) => String(part)).join(" ").trim()
+    : String(command || "").trim();
+  return {
+    command: normalizedCommand,
+    cwd: String(params.cwd || item?.cwd || ""),
+    grantRoot: String(params.grantRoot || ""),
+    changes: approvalChangeSummaries(params, item),
+    isFileChange: ["item/fileChange/requestApproval", "applyPatchApproval"].includes(method),
+    isCommand: ["item/commandExecution/requestApproval", "execCommandApproval"].includes(method),
+    isPermission: method === "item/permissions/requestApproval"
+  };
+}
+
 function publicCodexApproval(approval) {
   return {
     id: approval.id,
@@ -130,6 +233,7 @@ function publicCodexApproval(approval) {
     threadId: approval.threadId,
     method: approval.method,
     params: approval.params,
+    display: approval.display,
     createdAt: approval.createdAt,
     expiresAt: approval.expiresAt
   };
@@ -331,43 +435,17 @@ function normalizeFilePreviewSettings(value) {
     .filter((entry) => /^[a-z0-9][a-z0-9_-]{0,15}$/.test(entry)))]
     .slice(0, 64);
   const maxFileSizeMb = Number(source.maxFileSizeMb);
-  const cleanupIntervalMinutes = Number(source.cleanupIntervalMinutes);
   return {
     extensions: extensions.length ? extensions : [...defaultFilePreviewSettings.extensions],
     maxFileSizeMb: Number.isFinite(maxFileSizeMb) && maxFileSizeMb >= 0.1 && maxFileSizeMb <= 1024
       ? Math.round(maxFileSizeMb * 10) / 10
-      : defaultFilePreviewSettings.maxFileSizeMb,
-    cleanupIntervalMinutes: Number.isInteger(cleanupIntervalMinutes) && cleanupIntervalMinutes >= 1 && cleanupIntervalMinutes <= 10080
-      ? cleanupIntervalMinutes
-      : defaultFilePreviewSettings.cleanupIntervalMinutes
+      : defaultFilePreviewSettings.maxFileSizeMb
   };
 }
 
-async function clearPreviewCache() {
-  await fs.mkdir(previewDir, { recursive: true });
-  const entries = await fs.readdir(previewDir, { withFileTypes: true });
-  await Promise.all(entries.map(async (entry) => {
-    if (!entry.isFile()) return;
-    const entryPath = path.join(previewDir, entry.name);
-    try {
-      await fs.unlink(entryPath);
-    } catch {
-      // A concurrent request may already have removed it.
-    }
-  }));
-  lastPreviewCacheCleanup = Date.now();
-  return entries.filter((entry) => entry.isFile()).length;
-}
-
-async function cleanPreviewCacheIfDue(settings) {
-  const intervalMs = settings.cleanupIntervalMinutes * 60 * 1000;
-  if (Date.now() - lastPreviewCacheCleanup < intervalMs) return 0;
-  return clearPreviewCache();
-}
-
-async function copyToPreviewCache(realFilePath, stat, settings) {
-  await cleanPreviewCacheIfDue(settings);
-  await fs.mkdir(previewDir, { recursive: true });
+async function copyToPreviewCache(realFilePath, stat, sessionId) {
+  const targetDir = path.join(sessionFilesDir, sessionId, "previews");
+  await fs.mkdir(targetDir, { recursive: true });
   const extension = path.extname(realFilePath).toLowerCase();
   const cacheKey = createHash("sha256")
     .update(realFilePath)
@@ -377,7 +455,7 @@ async function copyToPreviewCache(realFilePath, stat, settings) {
     .update(String(stat.mtimeMs))
     .digest("hex")
     .slice(0, 32);
-  const cachedPath = path.join(previewDir, `${cacheKey}${extension}`);
+  const cachedPath = path.join(targetDir, `${cacheKey}${extension}`);
   try {
     const cachedStat = await fs.stat(cachedPath);
     if (cachedStat.isFile()) return { cachedPath, cachedStat };
@@ -388,12 +466,37 @@ async function copyToPreviewCache(realFilePath, stat, settings) {
   return { cachedPath, cachedStat: await fs.stat(cachedPath) };
 }
 
+function parseByteRange(header, size) {
+  if (!header) return null;
+  const match = String(header).match(/^bytes=(\d*)-(\d*)$/i);
+  if (!match || (!match[1] && !match[2])) return undefined;
+  let start;
+  let end;
+  if (!match[1]) {
+    const suffixLength = Number(match[2]);
+    if (!Number.isSafeInteger(suffixLength) || suffixLength <= 0) return undefined;
+    start = Math.max(0, size - suffixLength);
+    end = size - 1;
+  } else {
+    start = Number(match[1]);
+    end = match[2] ? Number(match[2]) : size - 1;
+    if (!Number.isSafeInteger(start) || !Number.isSafeInteger(end) || start < 0 || end < start) return undefined;
+    end = Math.min(end, size - 1);
+  }
+  if (start >= size) return undefined;
+  return { start, end };
+}
+
 async function previewWorkspaceFile(req, res) {
   const url = new URL(req.url, `http://${req.headers.host}`);
   const requestedPath = String(url.searchParams.get("path") || "");
   const requestedCwd = String(url.searchParams.get("cwd") || "");
+  const sessionId = normalizeSessionStorageId(url.searchParams.get("sessionId"));
   if (!requestedPath) {
     return sendError(res, 400, "File path is required.");
+  }
+  if (!sessionId) {
+    return sendError(res, 400, "A valid session id is required for file previews.");
   }
 
   const basePath = requestedCwd ? path.resolve(requestedCwd) : process.cwd();
@@ -419,17 +522,34 @@ async function previewWorkspaceFile(req, res) {
     return sendError(res, 413, "File is too large to preview.");
   }
 
-  const { cachedPath, cachedStat } = await copyToPreviewCache(realFilePath, stat, settings);
+  const { cachedPath, cachedStat } = await copyToPreviewCache(realFilePath, stat, sessionId);
   const filename = encodeURIComponent(path.basename(realFilePath));
-  res.writeHead(200, {
+  const range = parseByteRange(req.headers.range, cachedStat.size);
+  if (req.headers.range && !range) {
+    res.writeHead(416, {
+      "content-range": `bytes */${cachedStat.size}`,
+      "accept-ranges": "bytes",
+      "cache-control": "private, no-store"
+    });
+    return res.end();
+  }
+  const start = range?.start ?? 0;
+  const end = range?.end ?? cachedStat.size - 1;
+  const headers = {
     "content-type": contentType,
-    "content-length": cachedStat.size,
+    "content-length": end - start + 1,
     "content-disposition": `inline; filename*=UTF-8''${filename}`,
     "cache-control": "private, no-store",
     "x-content-type-options": "nosniff",
-    "content-security-policy": "default-src 'none'; sandbox"
-  });
-  createReadStream(cachedPath).pipe(res);
+    "accept-ranges": "bytes"
+  };
+  if (range) headers["content-range"] = `bytes ${start}-${end}/${cachedStat.size}`;
+  if (extension === ".svg" || extension === ".html" || extension === ".htm") {
+    headers["content-security-policy"] = "default-src 'none'; sandbox";
+  }
+  res.writeHead(range ? 206 : 200, headers);
+  if (req.method === "HEAD") return res.end();
+  createReadStream(cachedPath, { start, end }).pipe(res);
 }
 
 async function listModels(res) {
@@ -461,17 +581,246 @@ function isUuid(value) {
   return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }
 
+function normalizeSessionStorageId(value) {
+  const id = String(value || "").trim();
+  return /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(id) ? id : null;
+}
+
+function sessionFilesPath(sessionId) {
+  const normalized = normalizeSessionStorageId(sessionId);
+  return normalized ? path.join(sessionFilesDir, normalized) : null;
+}
+
+async function deleteSessionFiles(sessionId) {
+  const directoryPath = sessionFilesPath(sessionId);
+  if (!directoryPath) return false;
+  await fs.rm(directoryPath, { recursive: true, force: true });
+  return true;
+}
+
+async function moveSessionFiles(fromSessionId, toSessionId) {
+  const source = sessionFilesPath(fromSessionId);
+  const target = sessionFilesPath(toSessionId);
+  if (!source || !target || source === target || !existsSync(source)) return;
+  await fs.mkdir(path.dirname(target), { recursive: true });
+  if (!existsSync(target)) {
+    try {
+      await fs.rename(source, target);
+      return;
+    } catch {
+      // Cross-device moves and concurrent directory creation fall back to copy/remove.
+    }
+  }
+  await fs.cp(source, target, { recursive: true, force: false, errorOnExist: false });
+  await fs.rm(source, { recursive: true, force: true });
+}
+
 function safeUploadedPath(value) {
   if (typeof value !== "string" || !value.trim()) {
     return null;
   }
   const resolved = path.resolve(value);
-  return resolved.startsWith(`${uploadDir}${path.sep}`) ? resolved : null;
+  return resolved.startsWith(`${uploadDir}${path.sep}`) || resolved.startsWith(`${sessionFilesDir}${path.sep}`) ? resolved : null;
 }
 
 function sanitizeUploadName(value) {
   const base = path.basename(String(value || "upload.bin"));
   return base.replace(/[^a-zA-Z0-9_.@-]/g, "_").slice(0, 120) || "upload.bin";
+}
+
+const imageExtensionsByMime = new Map([
+  ["image/svg+xml", ".svg"],
+  ["image/png", ".png"],
+  ["image/jpeg", ".jpg"],
+  ["image/gif", ".gif"],
+  ["image/webp", ".webp"],
+  ["image/avif", ".avif"]
+]);
+
+function validImageDimensions(width, height) {
+  const normalizedWidth = Math.round(Number(width));
+  const normalizedHeight = Math.round(Number(height));
+  if (!Number.isFinite(normalizedWidth) || !Number.isFinite(normalizedHeight)) return null;
+  if (normalizedWidth < 1 || normalizedHeight < 1 || normalizedWidth > 100000 || normalizedHeight > 100000) return null;
+  return { width: normalizedWidth, height: normalizedHeight };
+}
+
+function jpegExifOrientation(buffer, markerOffset, segmentLength) {
+  const dataOffset = markerOffset + 4;
+  const segmentEnd = Math.min(buffer.length, markerOffset + 2 + segmentLength);
+  if (dataOffset + 14 > segmentEnd || buffer.subarray(dataOffset, dataOffset + 6).toString("binary") !== "Exif\0\0") return 1;
+  const tiffOffset = dataOffset + 6;
+  const byteOrder = buffer.subarray(tiffOffset, tiffOffset + 2).toString("ascii");
+  const littleEndian = byteOrder === "II";
+  if (!littleEndian && byteOrder !== "MM") return 1;
+  const readUInt16 = (offset) => littleEndian ? buffer.readUInt16LE(offset) : buffer.readUInt16BE(offset);
+  const readUInt32 = (offset) => littleEndian ? buffer.readUInt32LE(offset) : buffer.readUInt32BE(offset);
+  if (readUInt16(tiffOffset + 2) !== 42) return 1;
+  const ifdOffset = tiffOffset + readUInt32(tiffOffset + 4);
+  if (ifdOffset + 2 > segmentEnd) return 1;
+  const entryCount = readUInt16(ifdOffset);
+  for (let index = 0; index < entryCount; index += 1) {
+    const entryOffset = ifdOffset + 2 + index * 12;
+    if (entryOffset + 12 > segmentEnd) break;
+    if (readUInt16(entryOffset) === 0x0112 && readUInt16(entryOffset + 2) === 3 && readUInt32(entryOffset + 4) >= 1) {
+      const orientation = readUInt16(entryOffset + 8);
+      return orientation >= 1 && orientation <= 8 ? orientation : 1;
+    }
+  }
+  return 1;
+}
+
+function imageDimensionsFromBuffer(buffer, mime = "") {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 10) return null;
+  if (mime === "image/png" && buffer.length >= 24 && buffer.subarray(1, 4).toString("ascii") === "PNG") {
+    return validImageDimensions(buffer.readUInt32BE(16), buffer.readUInt32BE(20));
+  }
+  if (mime === "image/gif" && buffer.length >= 10 && buffer.subarray(0, 3).toString("ascii") === "GIF") {
+    return validImageDimensions(buffer.readUInt16LE(6), buffer.readUInt16LE(8));
+  }
+  if (mime === "image/jpeg" && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    const frameMarkers = new Set([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf]);
+    let orientation = 1;
+    let offset = 2;
+    while (offset + 8 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      const marker = buffer[offset + 1];
+      if (frameMarkers.has(marker)) {
+        const height = buffer.readUInt16BE(offset + 5);
+        const width = buffer.readUInt16BE(offset + 7);
+        return orientation >= 5 ? validImageDimensions(height, width) : validImageDimensions(width, height);
+      }
+      if (marker === 0xd8 || marker === 0xd9 || (marker >= 0xd0 && marker <= 0xd7)) {
+        offset += 2;
+        continue;
+      }
+      if (offset + 4 > buffer.length) break;
+      const segmentLength = buffer.readUInt16BE(offset + 2);
+      if (segmentLength < 2) break;
+      if (marker === 0xe1) orientation = jpegExifOrientation(buffer, offset, segmentLength);
+      offset += segmentLength + 2;
+    }
+  }
+  if (mime === "image/webp" && buffer.length >= 30 && buffer.subarray(0, 4).toString("ascii") === "RIFF"
+      && buffer.subarray(8, 12).toString("ascii") === "WEBP") {
+    const format = buffer.subarray(12, 16).toString("ascii");
+    if (format === "VP8X") return validImageDimensions(buffer.readUIntLE(24, 3) + 1, buffer.readUIntLE(27, 3) + 1);
+    if (format === "VP8 " && buffer.length >= 30) {
+      return validImageDimensions(buffer.readUInt16LE(26) & 0x3fff, buffer.readUInt16LE(28) & 0x3fff);
+    }
+    if (format === "VP8L" && buffer.length >= 25) {
+      return validImageDimensions(
+        1 + buffer[21] + ((buffer[22] & 0x3f) << 8),
+        1 + (buffer[22] >> 6) + (buffer[23] << 2) + ((buffer[24] & 0x0f) << 10)
+      );
+    }
+  }
+  if (mime === "image/svg+xml") {
+    const source = buffer.toString("utf8");
+    const width = source.match(/<svg\b[^>]*\bwidth=["']([\d.]+)/i)?.[1];
+    const height = source.match(/<svg\b[^>]*\bheight=["']([\d.]+)/i)?.[1];
+    const explicit = validImageDimensions(width, height);
+    if (explicit) return explicit;
+    const viewBox = source.match(/<svg\b[^>]*\bviewBox=["']\s*[-\d.]+[ ,]+[-\d.]+[ ,]+([\d.]+)[ ,]+([\d.]+)/i);
+    return viewBox ? validImageDimensions(viewBox[1], viewBox[2]) : null;
+  }
+  return null;
+}
+
+async function readImageDimensions(filePath, mime, availableBuffer = null) {
+  if (availableBuffer) return imageDimensionsFromBuffer(availableBuffer, mime);
+  let handle;
+  try {
+    handle = await fs.open(filePath, "r");
+    const stat = await handle.stat();
+    const buffer = Buffer.alloc(Math.min(stat.size, 512 * 1024));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    return imageDimensionsFromBuffer(buffer.subarray(0, bytesRead), mime);
+  } catch {
+    return null;
+  } finally {
+    await handle?.close().catch(() => {});
+  }
+}
+
+function archivedImageUrl(sessionId, filename) {
+  return `/api/session-images/${encodeURIComponent(sessionId)}/${encodeURIComponent(filename)}`;
+}
+
+async function archiveConversationImage(attachment, sessionId, cwd = "") {
+  const normalizedSessionId = normalizeSessionStorageId(sessionId);
+  if (!normalizedSessionId) return null;
+  const imageDir = path.join(sessionFilesDir, normalizedSessionId, "images");
+  let extension = "";
+  let mime = String(attachment?.mime || "").toLowerCase();
+  let sourcePath = null;
+  let buffer = null;
+  let cacheKey = "";
+
+  if (attachment?.dataUrl) {
+    const match = String(attachment.dataUrl).match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=\s]+)$/i);
+    if (!match || !imageExtensionsByMime.has(match[1].toLowerCase())) return null;
+    mime = match[1].toLowerCase();
+    buffer = Buffer.from(match[2].replace(/\s/g, ""), "base64");
+    if (!buffer.length || buffer.length > maxUploadBytes) return null;
+    extension = imageExtensionsByMime.get(mime);
+    cacheKey = createHash("sha256").update(buffer).digest("hex").slice(0, 32);
+  } else if (attachment?.sourcePath) {
+    const rawPath = String(attachment.sourcePath);
+    const candidate = path.isAbsolute(rawPath) ? rawPath : path.resolve(cwd || process.cwd(), rawPath);
+    try {
+      sourcePath = await fs.realpath(candidate);
+      const stat = await fs.stat(sourcePath);
+      extension = path.extname(sourcePath).toLowerCase();
+      mime = previewMimeTypes.get(extension) || "";
+      if (!stat.isFile() || !String(mime).startsWith("image/")) return null;
+      cacheKey = createHash("sha256")
+        .update(sourcePath)
+        .update("\0")
+        .update(String(stat.size))
+        .update("\0")
+        .update(String(stat.mtimeMs))
+        .digest("hex")
+        .slice(0, 32);
+    } catch {
+      return null;
+    }
+  } else {
+    return null;
+  }
+
+  const filename = `${cacheKey}${extension}`;
+  const targetPath = path.join(imageDir, filename);
+  await fs.mkdir(imageDir, { recursive: true });
+  if (!existsSync(targetPath)) {
+    if (buffer) await fs.writeFile(targetPath, buffer);
+    else await fs.copyFile(sourcePath, targetPath);
+  }
+  const dimensions = await readImageDimensions(targetPath, mime, buffer);
+  return {
+    name: String(attachment.name || "").trim() || path.basename(sourcePath || `image${extension}`),
+    mime,
+    url: archivedImageUrl(normalizedSessionId, filename),
+    ...(dimensions || {})
+  };
+}
+
+async function archiveConversationImages(messages, sessionId, cwd = "") {
+  for (const message of messages) {
+    const archived = await Promise.all(asArray(message.attachments).map(async (attachment) => {
+      if (!attachment?.sourcePath && !attachment?.dataUrl) return attachment;
+      return await archiveConversationImage(attachment, sessionId, cwd) || null;
+    }));
+    const attachments = archived
+      .filter(Boolean)
+      .map(({ sourcePath, dataUrl, ...attachment }) => attachment)
+      .filter((attachment, index, items) => items.findIndex((item) => item.url === attachment.url) === index);
+    if (attachments.length) message.attachments = attachments;
+    else delete message.attachments;
+  }
 }
 
 async function walkFiles(root, limit = 120) {
@@ -571,23 +920,13 @@ async function updateFilePreviewSettings(req, res) {
   if (!Number.isFinite(maxFileSizeMb) || maxFileSizeMb < 0.1 || maxFileSizeMb > 1024) {
     return sendError(res, 400, "Maximum file size must be between 0.1 and 1024 MB.");
   }
-  const cleanupIntervalMinutes = Number(body.cleanupIntervalMinutes);
-  if (!Number.isInteger(cleanupIntervalMinutes) || cleanupIntervalMinutes < 1 || cleanupIntervalMinutes > 10080) {
-    return sendError(res, 400, "Cleanup interval must be between 1 and 10080 minutes.");
-  }
   const state = await loadState();
   state.filePreview = normalizeFilePreviewSettings({
     extensions: requestedExtensions,
-    maxFileSizeMb,
-    cleanupIntervalMinutes
+    maxFileSizeMb
   });
   await saveState(state);
   sendJson(res, 200, { ok: true, settings: state.filePreview });
-}
-
-async function clearFilePreviewCache(res) {
-  const removed = await clearPreviewCache();
-  sendJson(res, 200, { ok: true, removed });
 }
 
 function hostFromState(state, hostId) {
@@ -708,6 +1047,89 @@ function extractTextFromContent(content) {
     .join("\n");
 }
 
+function imageAttachmentFromPath(filePath, label = "") {
+  const sourcePath = String(filePath || "").trim().replace(/^<|>$/g, "");
+  if (/^[a-z][a-z0-9+.-]*:/i.test(sourcePath) || sourcePath.startsWith("//")) return null;
+  const extension = path.extname(sourcePath).toLowerCase();
+  const mime = previewMimeTypes.get(extension);
+  if (!sourcePath || !String(mime || "").startsWith("image/")) {
+    return null;
+  }
+  const displayLabel = String(label || "").replace(/^\[|\]$/g, "").trim();
+  return {
+    name: displayLabel || path.basename(sourcePath),
+    mime,
+    sourcePath,
+    url: `/api/files/preview?path=${encodeURIComponent(sourcePath)}`
+  };
+}
+
+function imageAttachmentFromDataUrl(dataUrl, label = "", index = 0) {
+  const match = String(dataUrl || "").match(/^data:(image\/[a-z0-9.+-]+);base64,/i);
+  const mime = match?.[1]?.toLowerCase();
+  const extension = imageExtensionsByMime.get(mime);
+  if (!extension) return null;
+  return {
+    name: String(label || "").trim() || `image-${index + 1}${extension}`,
+    mime,
+    dataUrl
+  };
+}
+
+function attachmentIdentity(attachment) {
+  return attachment?.url || attachment?.sourcePath || attachment?.dataUrl || "";
+}
+
+function extractMessageContent(content) {
+  let text = extractTextFromContent(content);
+  const attachments = [];
+  const addAttachment = (attachment) => {
+    if (!attachment) return;
+    const key = attachmentIdentity(attachment);
+    if (!attachments.some((item) => attachmentIdentity(item) === key)) attachments.push(attachment);
+  };
+
+  text = text.replace(/<image\b([^>]*)>\s*(?:<\/image>)?/gi, (markup, attributes) => {
+    const imagePath = attributes.match(/\bpath=(?:"([^"]+)"|'([^']+)')/i)?.slice(1).find(Boolean);
+    const imageName = attributes.match(/\bname=(?:"([^"]+)"|'([^']+)'|\[([^\]]+)\])/i)?.slice(1).find(Boolean);
+    addAttachment(imageAttachmentFromPath(imagePath, imageName));
+    return "";
+  });
+
+  text = text.replace(/!\[([^\]]*)\]\(<?([^)>\s]+)>?(?:\s+["'][^"']*["'])?\)/gi, (markup, label, source) => {
+    const attachment = String(source).startsWith("data:image/")
+      ? imageAttachmentFromDataUrl(source, label, attachments.length)
+      : imageAttachmentFromPath(source, label);
+    if (!attachment) return markup;
+    addAttachment(attachment);
+    return "";
+  });
+
+  text = text.replace(/<img\b([^>]*)>/gi, (markup, attributes) => {
+    const source = attributes.match(/\bsrc=(?:"([^"]+)"|'([^']+)')/i)?.slice(1).find(Boolean);
+    const label = attributes.match(/\balt=(?:"([^"]+)"|'([^']+)')/i)?.slice(1).find(Boolean);
+    const attachment = String(source || "").startsWith("data:image/")
+      ? imageAttachmentFromDataUrl(source, label, attachments.length)
+      : imageAttachmentFromPath(source, label);
+    if (!attachment) return markup;
+    addAttachment(attachment);
+    return "";
+  });
+
+  for (const item of asArray(content)) {
+    if (!item || typeof item !== "object") continue;
+    if (["local_image", "localImage"].includes(item.type) || item.path) {
+      addAttachment(imageAttachmentFromPath(item.path, item.name));
+    }
+    const imageUrl = item.image_url || item.imageUrl;
+    if (String(imageUrl || "").startsWith("data:image/")) {
+      addAttachment(imageAttachmentFromDataUrl(imageUrl, item.name, attachments.length));
+    }
+  }
+
+  return { text: text.trim(), attachments };
+}
+
 function isRepeatedMessageSegment(existingContent, nextContent) {
   const existing = String(existingContent || "").trim();
   const next = String(nextContent || "").trim();
@@ -803,6 +1225,9 @@ function deriveSessionTitle(messages, cwd, fallback = "", titleHints = []) {
 }
 
 function normalizeUserMessageContent(text) {
+  if (isInternalCodexAssessment(text)) {
+    return "";
+  }
   const request = extractIdeRequest(text);
   if (request) {
     return request;
@@ -817,28 +1242,38 @@ function normalizeUserMessageContent(text) {
   return stripped;
 }
 
+function isInternalCodexAssessment(text) {
+  const value = String(text || "").trimStart();
+  return value.startsWith("The following is the Codex agent history whose request action you are assessing.")
+    && value.includes(">>> TRANSCRIPT START")
+    && value.includes(">>> TRANSCRIPT END")
+    && value.includes(">>> APPROVAL REQUEST START");
+}
+
 function appendCodexMessage(messages, role, content, timestamp) {
-  let text = extractTextFromContent(content).trim();
-  if (!text) {
-    return;
-  }
+  const extracted = extractMessageContent(content);
+  let text = extracted.text;
   if (role === "user") {
     text = normalizeUserMessageContent(text);
-    if (!text) {
-      return;
-    }
+  }
+  if (!text && !extracted.attachments.length) {
+    return;
   }
   const last = messages.at(-1);
   if (last?.role === role) {
-    if (isRepeatedMessageSegment(last.content, text)) {
+    const mergedAttachments = [...asArray(last.attachments), ...extracted.attachments]
+      .filter((attachment, index, items) => items.findIndex((item) => attachmentIdentity(item) === attachmentIdentity(attachment)) === index);
+    if (!text || isRepeatedMessageSegment(last.content, text)) {
+      if (mergedAttachments.length) last.attachments = mergedAttachments;
       last.timestamp = timestamp || last.timestamp;
       return;
     }
-    last.content = `${last.content}\n\n${text}`;
+    last.content = last.content ? `${last.content}\n\n${text}` : text;
+    if (mergedAttachments.length) last.attachments = mergedAttachments;
     last.timestamp = timestamp || last.timestamp;
     return;
   }
-  messages.push({ role, content: text, timestamp });
+  messages.push({ role, content: text, timestamp, ...(extracted.attachments.length ? { attachments: extracted.attachments } : {}) });
 }
 
 function applyRolloutLine(summary, line) {
@@ -851,10 +1286,17 @@ function applyRolloutLine(summary, line) {
   const timestamp = entry.timestamp || null;
   const payload = entry.payload || {};
 
+  if (timestamp) {
+    const timestampMs = new Date(timestamp).getTime();
+    const updatedAtMs = new Date(summary.updatedAt || 0).getTime();
+    if (Number.isFinite(timestampMs) && (!Number.isFinite(updatedAtMs) || timestampMs > updatedAtMs)) {
+      summary.updatedAt = timestamp;
+    }
+  }
+
   if (entry.type === "session_meta") {
     summary.id = payload.id || summary.id;
     summary.createdAt = payload.timestamp || summary.createdAt || timestamp;
-    summary.updatedAt = timestamp || summary.updatedAt;
     summary.cwd = payload.cwd || summary.cwd;
     summary.source = payload.source || summary.source;
     summary.modelProvider = payload.model_provider || summary.modelProvider;
@@ -870,9 +1312,14 @@ function applyRolloutLine(summary, line) {
   if (entry.type === "response_item") {
     if (payload.type === "message" && ["user", "assistant", "system"].includes(payload.role)) {
       if (payload.role === "user") {
-        const raw = extractTextFromContent(payload.content).trim();
-        if (raw) {
-          summary.titleHints.push(raw);
+        const raw = extractMessageContent(payload.content).text;
+        if (isInternalCodexAssessment(raw)) {
+          summary.hiddenFromConversationList = true;
+          return;
+        }
+        const normalized = normalizeUserMessageContent(raw);
+        if (normalized) {
+          summary.titleHints.push(normalized);
         }
       }
       appendCodexMessage(summary.messages, payload.role === "assistant" ? "assistant" : payload.role, payload.content, timestamp);
@@ -882,9 +1329,14 @@ function applyRolloutLine(summary, line) {
 
   if (entry.type === "event_msg") {
     if (payload.type === "user_message") {
-      const raw = extractTextFromContent(payload.message).trim();
-      if (raw) {
-        summary.titleHints.push(raw);
+      const raw = extractMessageContent(payload.message).text;
+      if (isInternalCodexAssessment(raw)) {
+        summary.hiddenFromConversationList = true;
+        return;
+      }
+      const normalized = normalizeUserMessageContent(raw);
+      if (normalized) {
+        summary.titleHints.push(normalized);
       }
       appendCodexMessage(summary.messages, "user", payload.message, timestamp);
     }
@@ -901,7 +1353,7 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
     id: null,
     title: path.basename(filePath, ".jsonl"),
     createdAt: stat.birthtime.toISOString(),
-    updatedAt: stat.mtime.toISOString(),
+    updatedAt: "",
     cwd: "",
     source: "codex",
     model: "",
@@ -909,7 +1361,8 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
     path: filePath,
     messageCount: 0,
     messages: [],
-    titleHints: []
+    titleHints: [],
+    hiddenFromConversationList: false
   };
 
   for (const line of raw.split(/\r?\n/)) {
@@ -918,13 +1371,31 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
     }
   }
 
-  summary.messages = summary.messages.filter((message) => !(message.role === "user" && !normalizeUserMessageContent(message.content)));
+  summary.updatedAt = summary.updatedAt || stat.mtime.toISOString();
+
+  summary.messages = summary.messages.filter((message) => !(
+    message.role === "user"
+    && !normalizeUserMessageContent(message.content)
+    && !asArray(message.attachments).length
+  ));
   summary.messageCount = summary.messages.length;
   summary.title = deriveSessionTitle(summary.messages, summary.cwd, summary.title, summary.titleHints);
   delete summary.titleHints;
   if (!summary.id) {
     const match = filePath.match(/rollout-[^/]*-([0-9a-f-]{36})\.jsonl$/i);
     summary.id = match?.[1] || path.basename(filePath, ".jsonl");
+  }
+  if (includeMessages) {
+    await archiveConversationImages(summary.messages, summary.id, summary.cwd);
+  }
+  for (const message of summary.messages) {
+    for (const attachment of asArray(message.attachments)) {
+      if (String(attachment.url || "").startsWith("/api/files/preview?")) {
+        const previewUrl = new URL(attachment.url, "http://localhost");
+        previewUrl.searchParams.set("sessionId", summary.id);
+        attachment.url = `${previewUrl.pathname}${previewUrl.search}`;
+      }
+    }
   }
   if (!includeMessages) {
     delete summary.messages;
@@ -1043,7 +1514,8 @@ async function getStatus(res) {
     available: version.ok,
     version: version.stdout.trim().split(/\r?\n/).at(-1) || null,
     health,
-    warnings: health === "warning" ? "Codex 可用，但有非阻塞诊断提醒。" : ""
+    warnings: health === "warning" ? "Codex 可用，但有非阻塞诊断提醒。" : "",
+    maxUploadBytes
   });
 }
 
@@ -1060,7 +1532,7 @@ async function listCodexSessions(res) {
       return null;
     }
   });
-  const sessions = parsed.filter(Boolean);
+  const sessions = parsed.filter((session) => session && !session.hiddenFromConversationList);
   sessions.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   sendJson(res, 200, { sessions });
 }
@@ -1085,6 +1557,7 @@ async function archiveCodexSession(res, sessionId) {
   }
   const result = await runCodex(["archive", sessionId], { timeoutMs: 20000 });
   const ok = archiveResultOk(result);
+  if (ok) await deleteSessionFiles(sessionId);
   sendJson(res, ok ? 200 : 502, {
     ok,
     stdout: result.stdout.trim(),
@@ -1120,6 +1593,7 @@ async function archiveAllCodexSessions(res) {
         const result = await runCodex(["archive", sessionId], { timeoutMs: 15000 });
         if (archiveResultOk(result)) {
           summary.archived += 1;
+          await deleteSessionFiles(sessionId);
         } else {
           summary.failed += 1;
         }
@@ -1132,35 +1606,213 @@ async function archiveAllCodexSessions(res) {
   sendJson(res, 200, { ok: summary.failed === 0, ...summary, total: uniqueIds.length });
 }
 
-async function uploadAttachment(req, res) {
-  const body = await readBody(req, 20 * 1024 * 1024);
-  const name = sanitizeUploadName(body.name);
-  const data = String(body.data || "");
-  const match = data.match(/^data:([^;,]+)?(;base64)?,(.*)$/);
-  const encoded = match ? match[3] : data;
-  let buffer;
-  try {
-    buffer = Buffer.from(encoded, "base64");
-  } catch {
-    return sendError(res, 400, "Attachment payload must be base64 encoded.");
+async function deleteStoredSessionFiles(res, sessionId) {
+  if (!normalizeSessionStorageId(sessionId)) {
+    return sendError(res, 400, "Invalid session id.");
   }
-  if (!buffer.length || buffer.length > 16 * 1024 * 1024) {
-    return sendError(res, 400, "Attachment must be between 1 byte and 16 MB.");
+  await deleteSessionFiles(sessionId);
+  sendJson(res, 200, { ok: true });
+}
+
+async function deleteAllStoredSessionFiles(res) {
+  await fs.rm(sessionFilesDir, { recursive: true, force: true });
+  sendJson(res, 200, { ok: true });
+}
+
+async function writeUploadStream(req, filePath) {
+  const declaredLength = Number(req.headers["content-length"] || 0);
+  if (Number.isFinite(declaredLength) && declaredLength > maxUploadBytes) {
+    const error = new Error(`附件不能超过 ${Math.round(maxUploadBytes / 1024 / 1024)} MB。`);
+    error.statusCode = 413;
+    throw error;
   }
 
-  await fs.mkdir(uploadDir, { recursive: true });
-  const id = randomUUID();
-  const filePath = path.join(uploadDir, `${id}-${name}`);
-  await fs.writeFile(filePath, buffer);
-  sendJson(res, 201, {
-    attachment: {
+  let size = 0;
+  const handle = await fs.open(filePath, "wx");
+  try {
+    for await (const chunk of req) {
+      size += chunk.length;
+      if (size > maxUploadBytes) {
+        const error = new Error(`附件不能超过 ${Math.round(maxUploadBytes / 1024 / 1024)} MB。`);
+        error.statusCode = 413;
+        throw error;
+      }
+      await handle.writeFile(chunk);
+    }
+  } catch (error) {
+    await handle.close().catch(() => {});
+    await fs.unlink(filePath).catch(() => {});
+    throw error;
+  }
+  await handle.close();
+  if (!size) {
+    await fs.unlink(filePath).catch(() => {});
+    const error = new Error("附件不能为空。");
+    error.statusCode = 400;
+    throw error;
+  }
+  return size;
+}
+
+async function uploadAttachment(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const rawUpload = url.searchParams.has("sessionId");
+  let sessionId;
+  let name;
+  let mime;
+  let size;
+  let filePath;
+  let temporaryPath;
+  let reused = false;
+  const requestedUploadId = url.searchParams.get("uploadId");
+  const id = rawUpload && isUuid(requestedUploadId) ? requestedUploadId : randomUUID();
+  const attempt = Math.max(1, Math.min(10, Number(url.searchParams.get("attempt")) || 1));
+
+  try {
+    if (rawUpload) {
+      sessionId = normalizeSessionStorageId(url.searchParams.get("sessionId"));
+      name = sanitizeUploadName(url.searchParams.get("name"));
+      mime = String(req.headers["content-type"] || "application/octet-stream").split(";", 1)[0].slice(0, 160);
+      if (!sessionId) {
+        return sendError(res, 400, "A valid session id is required for attachments.");
+      }
+      const attachmentDir = path.join(sessionFilesDir, sessionId, "attachments");
+      await fs.mkdir(attachmentDir, { recursive: true });
+      filePath = path.join(attachmentDir, `${id}-${name}`);
+      temporaryPath = path.join(attachmentDir, `.upload-${randomUUID()}.part`);
+      size = await writeUploadStream(req, temporaryPath);
+      try {
+        await fs.link(temporaryPath, filePath);
+      } catch (error) {
+        if (error.code !== "EEXIST") throw error;
+        const existingStat = await fs.stat(filePath);
+        if (!existingStat.isFile() || existingStat.size !== size) {
+          const conflict = new Error("相同上传 ID 对应的附件内容不一致，请重新选择文件。");
+          conflict.statusCode = 409;
+          throw conflict;
+        }
+        reused = true;
+      } finally {
+        await fs.unlink(temporaryPath).catch(() => {});
+        temporaryPath = null;
+      }
+    } else {
+      // Backward compatibility for clients that still send base64 JSON.
+      const body = await readBody(req, Math.ceil(maxUploadBytes * 4 / 3) + 1024 * 1024);
+      sessionId = normalizeSessionStorageId(body.sessionId);
+      if (!sessionId) {
+        return sendError(res, 400, "A valid session id is required for attachments.");
+      }
+      name = sanitizeUploadName(body.name);
+      const data = String(body.data || "");
+      const match = data.match(/^data:([^;,]+)?(;base64)?,(.*)$/);
+      const buffer = Buffer.from(match ? match[3] : data, "base64");
+      if (!buffer.length || buffer.length > maxUploadBytes) {
+        return sendError(res, 413, `附件必须为非空文件且不能超过 ${Math.round(maxUploadBytes / 1024 / 1024)} MB。`);
+      }
+      const attachmentDir = path.join(sessionFilesDir, sessionId, "attachments");
+      await fs.mkdir(attachmentDir, { recursive: true });
+      filePath = path.join(attachmentDir, `${id}-${name}`);
+      await fs.writeFile(filePath, buffer);
+      size = buffer.length;
+      mime = body.mime || match?.[1] || "application/octet-stream";
+    }
+
+    const dimensions = String(mime || "").startsWith("image/") ? await readImageDimensions(filePath, mime) : null;
+    const attachment = {
       id,
       name,
-      size: buffer.length,
+      size,
       path: filePath,
-      mime: body.mime || match?.[1] || "application/octet-stream"
-    }
+      mime,
+      url: `/api/uploads/${encodeURIComponent(sessionId)}/${id}`,
+      ...(dimensions || {})
+    };
+    await appendActionEvents([{
+      behavior: "attachment.upload.succeeded",
+      details: { sessionId, attachmentId: id, name, size, mime, attempt, reused, transport: rawUpload ? "binary" : "base64-json" }
+    }], req);
+    sendJson(res, 201, { attachment });
+  } catch (error) {
+    if (temporaryPath) await fs.unlink(temporaryPath).catch(() => {});
+    if (!error.statusCode && (error.code === "ECONNRESET" || error.message === "aborted")) error.statusCode = 499;
+    await appendActionEvents([{
+      behavior: "attachment.upload.failed",
+      details: {
+        sessionId: sessionId || null,
+        attachmentId: id,
+        name: name || null,
+        declaredSize: Number(req.headers["content-length"] || 0) || null,
+        attempt,
+        transport: rawUpload ? "binary" : "base64-json",
+        statusCode: error.statusCode || 500,
+        error: error.message || String(error)
+      }
+    }], req).catch(() => {});
+    throw error;
+  }
+}
+
+async function findUploadedAttachment(sessionId, id) {
+  const preferredDir = sessionId ? path.join(sessionFilesDir, sessionId, "attachments") : uploadDir;
+  try {
+    const entry = (await fs.readdir(preferredDir, { withFileTypes: true }))
+      .find((candidate) => candidate.isFile() && candidate.name.startsWith(`${id}-`));
+    if (entry) return path.join(preferredDir, entry.name);
+  } catch {
+    // The session may have been assigned a new Codex thread id; scan session storage below.
+  }
+  const match = (await walkFiles(sessionFilesDir, 10000))
+    .find((filePath) => path.basename(filePath).startsWith(`${id}-`) && filePath.includes(`${path.sep}attachments${path.sep}`));
+  return match || null;
+}
+
+async function previewUploadedAttachment(req, res, sessionId, id) {
+  if (!/^[0-9a-f-]{36}$/i.test(id)) return sendError(res, 404, "Attachment was not found.");
+  const filePath = await findUploadedAttachment(normalizeSessionStorageId(sessionId), id);
+  if (!filePath) return sendError(res, 404, "Attachment was not found.");
+  const stat = await fs.stat(filePath);
+  const filename = path.basename(filePath);
+  const extension = path.extname(filename).toLowerCase();
+  const contentType = previewMimeTypes.get(extension) || mimeTypes.get(extension) || "application/octet-stream";
+  res.writeHead(200, {
+    "content-type": contentType,
+    "content-length": stat.size,
+    "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(filename.slice(id.length + 1))}`,
+    "cache-control": "private, max-age=3600",
+    "x-content-type-options": "nosniff"
   });
+  if (req.method === "HEAD") return res.end();
+  createReadStream(filePath).pipe(res);
+}
+
+async function previewArchivedImage(req, res, sessionId, filename) {
+  const normalizedSessionId = normalizeSessionStorageId(sessionId);
+  const normalizedFilename = path.basename(String(filename || ""));
+  if (!normalizedSessionId || !/^[0-9a-f]{32}\.(?:svg|png|jpe?g|gif|webp|avif)$/i.test(normalizedFilename)) {
+    return sendError(res, 404, "Image was not found.");
+  }
+  const filePath = path.join(sessionFilesDir, normalizedSessionId, "images", normalizedFilename);
+  let stat;
+  try {
+    stat = await fs.stat(filePath);
+  } catch {
+    return sendError(res, 404, "Image was not found.");
+  }
+  if (!stat.isFile()) return sendError(res, 404, "Image was not found.");
+  const extension = path.extname(normalizedFilename).toLowerCase();
+  const contentType = previewMimeTypes.get(extension) || "application/octet-stream";
+  const headers = {
+    "content-type": contentType,
+    "content-length": stat.size,
+    "content-disposition": `inline; filename*=UTF-8''${encodeURIComponent(normalizedFilename)}`,
+    "cache-control": "private, max-age=31536000, immutable",
+    "x-content-type-options": "nosniff"
+  };
+  if (extension === ".svg") headers["content-security-policy"] = "default-src 'none'; sandbox";
+  res.writeHead(200, headers);
+  if (req.method === "HEAD") return res.end();
+  createReadStream(filePath).pipe(res);
 }
 
 async function listMcp(req, res) {
@@ -1360,40 +2012,78 @@ async function mutatePlugin(req, res, action) {
 }
 
 async function listLocalSkills(res) {
-  const roots = [
-    process.env.CODEX_HOME ? path.join(process.env.CODEX_HOME, "skills") : null,
+  const skills = [];
+  const seenManifests = new Set();
+
+  async function scanSkillRoot(root, source, maxDepth) {
+    async function visit(directory, depth) {
+      let entries;
+      try {
+        entries = await fs.readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      const manifestPath = path.join(directory, "SKILL.md");
+      if (entries.some((entry) => entry.isFile() && entry.name === "SKILL.md")) {
+        let manifestKey = manifestPath;
+        try {
+          manifestKey = await fs.realpath(manifestPath);
+        } catch {
+          // Keep the unresolved path as a stable de-duplication fallback.
+        }
+        if (!seenManifests.has(manifestKey)) {
+          seenManifests.add(manifestKey);
+          try {
+            const raw = await fs.readFile(manifestPath, "utf8");
+            const metadata = parseSkillFrontmatter(raw);
+            const skillSource = directory.includes(`${path.sep}.system${path.sep}`) ? "system" : source;
+            skills.push({
+              id: `${skillSource}:${manifestKey}`,
+              name: metadata.name || path.basename(directory),
+              description: metadata.description || "",
+              path: directory,
+              source: skillSource,
+              sourceRoot: root
+            });
+          } catch {
+            // A single unreadable manifest should not hide the other skills.
+          }
+        }
+      }
+
+      if (depth >= maxDepth) return;
+      for (const entry of entries) {
+        if (entry.isDirectory()) await visit(path.join(directory, entry.name), depth + 1);
+      }
+    }
+
+    await visit(root, 0);
+  }
+
+  const localRoots = [...new Set([
+    path.join(codexHome, "skills"),
     path.join(os.homedir(), ".codex", "skills"),
     path.join(os.homedir(), ".cc-switch", "skills")
-  ].filter(Boolean);
-  const skills = [];
+  ])];
+  for (const root of localRoots) {
+    await scanSkillRoot(root, "local", 2);
+  }
 
-  for (const root of roots) {
-    try {
-      const entries = await fs.readdir(root, { withFileTypes: true });
-      for (const entry of entries) {
-        if (!entry.isDirectory()) {
-          continue;
-        }
-        const skillPath = path.join(root, entry.name);
-        const manifestPath = path.join(skillPath, "SKILL.md");
-        if (!existsSync(manifestPath)) {
-          continue;
-        }
-        const raw = await fs.readFile(manifestPath, "utf8");
-        const metadata = parseSkillFrontmatter(raw);
-        skills.push({
-          id: `${entry.name}:${skillPath}`,
-          name: metadata.name || entry.name,
-          description: metadata.description || "",
-          path: skillPath,
-          sourceRoot: root
-        });
-      }
-    } catch {
-      continue;
+  const pluginResult = await runCodex(["plugin", "list", "--json", "--available"], {
+    timeoutMs: 30000,
+    maxOutputBytes: 12 * 1024 * 1024
+  });
+  if (pluginResult.ok) {
+    const payload = parseJsonOutput(pluginResult, { installed: [] });
+    for (const plugin of asArray(payload.installed)) {
+      const pluginRoot = String(plugin?.source?.path || "");
+      if (!pluginRoot) continue;
+      await scanSkillRoot(path.join(pluginRoot, "skills"), `plugin:${plugin.name || plugin.pluginId || "installed"}`, 2);
     }
   }
 
+  skills.sort((left, right) => left.name.localeCompare(right.name));
   sendJson(res, 200, { skills });
 }
 
@@ -1660,6 +2350,8 @@ async function runCodexStream(req, res) {
   let childExited = false;
   let terminationRequested = false;
   let terminationTimer = null;
+  const pendingImageArchives = new Set();
+  const approvalItems = new Map();
   const writeEvent = (event) => {
     const storedEvent = { ...event, sequence: ++run.sequence };
     run.updatedAt = new Date().toISOString();
@@ -1730,6 +2422,8 @@ async function runCodexStream(req, res) {
     if (isPermissionRequest || approvalMethods.has(message.method)) {
       const approvalId = randomUUID();
       const createdAt = new Date();
+      const params = message.params || {};
+      const relatedItem = approvalItems.get(params.itemId || params.callId) || null;
       let settled = false;
       const pending = {
         id: approvalId,
@@ -1737,7 +2431,8 @@ async function runCodexStream(req, res) {
         sessionKey: run.sessionKey,
         threadId: run.threadId,
         method: message.method,
-        params: message.params || {},
+        params,
+        display: approvalDisplayDetails(message.method, params, relatedItem),
         createdAt: createdAt.toISOString(),
         expiresAt: new Date(createdAt.getTime() + approvalTimeoutMs).toISOString(),
         resolve(decision) {
@@ -1788,7 +2483,45 @@ async function runCodexStream(req, res) {
       return;
     }
     if (!message.method) return;
+    if (["item/started", "item/completed"].includes(message.method)) {
+      const item = message.params?.item;
+      if (item?.id && ["commandExecution", "fileChange"].includes(item.type)) {
+        const existing = approvalItems.get(item.id) || {};
+        approvalItems.set(item.id, {
+          ...existing,
+          ...item,
+          changes: item.changes?.length ? item.changes : (existing.changes || item.changes)
+        });
+      }
+    }
+    if (message.method === "item/fileChange/patchUpdated" && message.params?.itemId) {
+      const existing = approvalItems.get(message.params.itemId) || {};
+      approvalItems.set(message.params.itemId, {
+        ...existing,
+        id: message.params.itemId,
+        type: "fileChange",
+        changes: message.params.changes || existing.changes || []
+      });
+    }
     writeEvent({ type: "codex.event", data: message });
+    if (message.method === "item/completed") {
+      const item = message.params?.item;
+      const isUserItem = ["userMessage", "user_message"].includes(item?.type);
+      const imageContent = Array.isArray(item?.content) ? [...item.content, item] : [item];
+      const extracted = isUserItem ? { attachments: [] } : extractMessageContent(imageContent);
+      if (extracted.attachments.length) {
+        const archiveTask = Promise.all(extracted.attachments.map((attachment) => (
+          archiveConversationImage(attachment, activeThreadId || sessionKey, processCwd)
+        )))
+          .then((attachments) => attachments.filter(Boolean))
+          .then((attachments) => {
+            if (attachments.length) writeEvent({ type: "webui.images", attachments });
+          })
+          .catch((error) => console.warn("Failed to archive conversation image:", error))
+          .finally(() => pendingImageArchives.delete(archiveTask));
+        pendingImageArchives.add(archiveTask);
+      }
+    }
     if (message.method === "turn/completed" && turnCompletion) {
       const completion = turnCompletion;
       turnCompletion = null;
@@ -1811,14 +2544,18 @@ async function runCodexStream(req, res) {
   if (!cwdExists && sessionId) {
     writeEvent({ type: "webui.warning", message: "原工作目录已不存在，已从 WebUI 目录恢复此会话。" });
   }
-  const nonImageAttachments = asArray(body.attachments)
-    .map((attachment) => ({ ...attachment, path: safeUploadedPath(attachment?.path) }))
+  const resolvedAttachments = await Promise.all(asArray(body.attachments).map(async (attachment) => ({
+    ...attachment,
+    path: await findUploadedAttachment(sessionId || sessionKey, attachment?.id) || safeUploadedPath(attachment?.path)
+  })));
+  const nonImageAttachments = resolvedAttachments
     .filter((attachment) => attachment.path && existsSync(attachment.path) && !String(attachment.mime || "").startsWith("image/"));
-  const promptWithAttachments = nonImageAttachments.length
+  const buildPromptWithAttachments = () => nonImageAttachments.length
     ? `${prompt}\n\n<attachments>\n${nonImageAttachments
         .map((attachment) => `- ${attachment.name || path.basename(attachment.path)}: ${attachment.path}`)
         .join("\n")}\n</attachments>`
     : prompt;
+  let promptWithAttachments = buildPromptWithAttachments();
 
   child.stderr.on("data", (chunk) => {
     if (stderrLog.length < 64 * 1024) stderrLog += chunk.toString("utf8");
@@ -1870,10 +2607,16 @@ async function runCodexStream(req, res) {
     const threadId = threadResult?.thread?.id || sessionId;
     if (!threadId) throw new Error("Codex app-server did not return a thread id.");
     activeThreadId = threadId;
+    await moveSessionFiles(sessionKey, threadId);
+    for (const attachment of resolvedAttachments) {
+      const movedPath = await findUploadedAttachment(threadId, attachment?.id);
+      if (movedPath) attachment.path = movedPath;
+    }
+    promptWithAttachments = buildPromptWithAttachments();
     writeEvent({ type: "webui.thread", threadId });
 
     const input = [{ type: "text", text: promptWithAttachments }];
-    for (const attachment of asArray(body.attachments)) {
+    for (const attachment of resolvedAttachments) {
       const uploadPath = safeUploadedPath(attachment?.path);
       if (uploadPath && existsSync(uploadPath) && String(attachment?.mime || "").startsWith("image/")) {
         input.push({ type: "localImage", path: uploadPath });
@@ -1890,6 +2633,7 @@ async function runCodexStream(req, res) {
     const startedTurn = await Promise.race([requestAppServer("turn/start", turnParams), processExit]);
     activeTurnId = startedTurn?.turn?.id || null;
     const turn = await Promise.race([completed, processExit]);
+    if (pendingImageArchives.size) await Promise.allSettled([...pendingImageArchives]);
     const ok = turn?.status === "completed";
     const paused = run.status === "pausing";
     finished = true;
@@ -1970,15 +2714,15 @@ async function route(req, res) {
   const pathname = url.pathname;
 
   try {
-    if (req.method === "GET" && pathname === "/api/status") return getStatus(res);
-    if (req.method === "GET" && pathname === "/api/models") return listModels(res);
+    if (req.method === "GET" && pathname === "/api/status") return await getStatus(res);
+    if (req.method === "POST" && pathname === "/api/action-events") return await recordClientActions(req, res);
+    if (req.method === "GET" && pathname === "/api/models") return await listModels(res);
     if (req.method === "GET" && pathname === "/api/cwd") return await checkWorkingDirectory(req, res);
     if (req.method === "GET" && pathname === "/api/directories") return await listDirectories(req, res);
-    if (req.method === "GET" && pathname === "/api/files/preview") return await previewWorkspaceFile(req, res);
+    if (["GET", "HEAD"].includes(req.method) && pathname === "/api/files/preview") return await previewWorkspaceFile(req, res);
     if (req.method === "GET" && pathname === "/api/settings/file-preview") return await getFilePreviewSettings(res);
     if (req.method === "PUT" && pathname === "/api/settings/file-preview") return await updateFilePreviewSettings(req, res);
-    if (req.method === "DELETE" && pathname === "/api/settings/file-preview/cache") return await clearFilePreviewCache(res);
-    if (req.method === "GET" && pathname === "/api/codex/sessions") return listCodexSessions(res);
+    if (req.method === "GET" && pathname === "/api/codex/sessions") return await listCodexSessions(res);
     if (req.method === "GET" && pathname === "/api/codex/runs") return listCodexRuns(res);
     if (req.method === "GET" && pathname === "/api/codex/approvals") return listCodexApprovals(res);
     if (req.method === "POST" && pathname.startsWith("/api/codex/approvals/")) {
@@ -1992,32 +2736,58 @@ async function route(req, res) {
       const runId = decodeURIComponent(pathname.slice("/api/codex/runs/".length, -"/pause".length));
       return pauseCodexRun(res, runId);
     }
-    if (req.method === "DELETE" && pathname === "/api/codex/sessions") return archiveAllCodexSessions(res);
+    if (req.method === "DELETE" && pathname === "/api/codex/sessions") return await archiveAllCodexSessions(res);
     if (req.method === "GET" && pathname.startsWith("/api/codex/sessions/")) {
-      return getCodexSession(res, decodeURIComponent(pathname.slice("/api/codex/sessions/".length)));
+      return await getCodexSession(res, decodeURIComponent(pathname.slice("/api/codex/sessions/".length)));
     }
     if (req.method === "DELETE" && pathname.startsWith("/api/codex/sessions/")) {
-      return archiveCodexSession(res, decodeURIComponent(pathname.slice("/api/codex/sessions/".length)));
+      return await archiveCodexSession(res, decodeURIComponent(pathname.slice("/api/codex/sessions/".length)));
     }
-    if (req.method === "POST" && pathname === "/api/uploads") return uploadAttachment(req, res);
-    if (req.method === "GET" && pathname === "/api/mcp") return listMcp(req, res);
-    if (req.method === "POST" && pathname === "/api/mcp") return addMcp(req, res);
+    if (req.method === "DELETE" && pathname === "/api/session-files") return await deleteAllStoredSessionFiles(res);
+    if (req.method === "DELETE" && pathname.startsWith("/api/session-files/")) {
+      return await deleteStoredSessionFiles(res, decodeURIComponent(pathname.slice("/api/session-files/".length)));
+    }
+    if (req.method === "POST" && pathname === "/api/uploads") return await uploadAttachment(req, res);
+    const archivedImageMatch = pathname.match(/^\/api\/session-images\/([^/]+)\/([^/]+)$/);
+    if (["GET", "HEAD"].includes(req.method) && archivedImageMatch) {
+      return await previewArchivedImage(
+        req,
+        res,
+        decodeURIComponent(archivedImageMatch[1]),
+        decodeURIComponent(archivedImageMatch[2])
+      );
+    }
+    const uploadedAttachmentMatch = pathname.match(/^\/api\/uploads\/([^/]+)\/([0-9a-f-]{36})$/i);
+    if (["GET", "HEAD"].includes(req.method) && uploadedAttachmentMatch) {
+      return await previewUploadedAttachment(req, res, decodeURIComponent(uploadedAttachmentMatch[1]), uploadedAttachmentMatch[2]);
+    }
+    const legacyUploadedAttachmentMatch = pathname.match(/^\/api\/uploads\/([0-9a-f-]{36})$/i);
+    if (["GET", "HEAD"].includes(req.method) && legacyUploadedAttachmentMatch) {
+      return await previewUploadedAttachment(req, res, null, legacyUploadedAttachmentMatch[1]);
+    }
+    if (req.method === "GET" && pathname === "/api/mcp") return await listMcp(req, res);
+    if (req.method === "POST" && pathname === "/api/mcp") return await addMcp(req, res);
     if (req.method === "DELETE" && pathname.startsWith("/api/mcp/")) {
-      return removeMcp(req, res, decodeURIComponent(pathname.slice("/api/mcp/".length)));
+      return await removeMcp(req, res, decodeURIComponent(pathname.slice("/api/mcp/".length)));
     }
-    if (req.method === "GET" && pathname === "/api/plugins") return listPlugins(req, res);
-    if (req.method === "POST" && pathname === "/api/plugins/install") return mutatePlugin(req, res, "add");
-    if (req.method === "POST" && pathname === "/api/plugins/remove") return mutatePlugin(req, res, "remove");
-    if (req.method === "GET" && pathname === "/api/skills/local") return listLocalSkills(res);
-    if (req.method === "GET" && pathname === "/api/hosts") return listHosts(res);
+    if (req.method === "GET" && pathname === "/api/plugins") return await listPlugins(req, res);
+    if (req.method === "POST" && pathname === "/api/plugins/install") return await mutatePlugin(req, res, "add");
+    if (req.method === "POST" && pathname === "/api/plugins/remove") return await mutatePlugin(req, res, "remove");
+    if (req.method === "GET" && pathname === "/api/skills/local") return await listLocalSkills(res);
+    if (req.method === "GET" && pathname === "/api/hosts") return await listHosts(res);
     if ((req.method === "POST" && pathname === "/api/hosts") || (req.method === "DELETE" && pathname.startsWith("/api/hosts/"))) {
       return sendError(res, 410, "Remote host adapters are temporarily disabled.");
     }
-    if (req.method === "POST" && pathname === "/api/terminal/run") return runTerminalCommand(req, res);
-    if (req.method === "POST" && pathname === "/api/codex/run") return runCodexStream(req, res);
+    if (req.method === "POST" && pathname === "/api/terminal/run") return await runTerminalCommand(req, res);
+    if (req.method === "POST" && pathname === "/api/codex/run") return await runCodexStream(req, res);
     if (pathname.startsWith("/api/")) return sendError(res, 404, "Unknown API route.");
-    return serveStatic(req, res);
+    return await serveStatic(req, res);
   } catch (error) {
+    if (res.headersSent) {
+      console.error("Request failed after response headers were sent:", error);
+      res.destroy(error);
+      return;
+    }
     if (error instanceof SyntaxError) {
       return sendError(res, 400, "Invalid JSON body.");
     }
@@ -2030,7 +2800,18 @@ async function route(req, res) {
   }
 }
 
-const server = createServer(route);
+const server = createServer((req, res) => {
+  route(req, res).catch((error) => {
+    console.error("Unhandled request failure:", error);
+    if (res.headersSent) {
+      res.destroy(error);
+      return;
+    }
+    sendError(res, error.statusCode || 500, error.statusCode && error.statusCode < 500
+      ? error.message
+      : "服务暂时不可用，请稍后重试。");
+  });
+});
 const terminalWss = new WebSocketServer({ noServer: true });
 
 terminalWss.on("connection", (ws, req) => {
@@ -2060,17 +2841,8 @@ server.on("upgrade", (req, socket, head) => {
 
 server.listen(port, host, () => {
   console.log(`Codex WebUI listening on http://${host}:${port}`);
+  console.log(`Operation log: ${actionLogFile}`);
   if (!["127.0.0.1", "::1", "localhost"].includes(host) && !accessPassword) {
     console.warn("WARNING: Codex WebUI is reachable beyond localhost without a password. Set CODEX_WEBUI_PASSWORD.");
   }
 });
-
-const previewCleanupTimer = setInterval(async () => {
-  try {
-    const state = await loadState();
-    await cleanPreviewCacheIfDue(state.filePreview);
-  } catch (error) {
-    console.error("Preview cache cleanup failed:", error);
-  }
-}, 60 * 1000);
-previewCleanupTimer.unref?.();

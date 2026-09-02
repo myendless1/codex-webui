@@ -1,6 +1,6 @@
 {
   "name": "@myendless1/codex-webui",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Browser-based local console for Codex CLI, MCP, skills, and terminal sessions.",
   "type": "module",
   "bin": {
@@ -8,7 +8,9 @@
   },
   "files": [
     "server.js",
-    "public"
+    "public",
+    "README_EN.md",
+    "docs/images/feature-overview.png"
   ],
   "repository": {
     "type": "git",

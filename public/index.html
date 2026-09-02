@@ -6,8 +6,13 @@
     <meta name="color-scheme" content="light">
     <meta name="mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-title" content="Codex WebUI">
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="theme-color" content="#ffffff">
     <title>Codex WebUI</title>
+    <link rel="manifest" href="/manifest.webmanifest">
+    <link rel="icon" href="/app-icon.svg" type="image/svg+xml">
+    <link rel="apple-touch-icon" href="/app-icon-180.png">
     <link rel="stylesheet" href="/vendor/@xterm/xterm/css/xterm.css">
     <link rel="stylesheet" href="/styles.css">
   </head>
@@ -41,7 +46,7 @@
           </div>
           <div class="topbar-actions">
             <button class="button icon ghost topbar-browser-fullscreen" type="button" data-action="toggle-browser-fullscreen" aria-label="进入浏览器全屏" title="进入浏览器全屏"></button>
-            <button class="button icon ghost topbar-terminal-toggle" type="button" data-action="toggle-terminal" aria-label="全屏终端" title="全屏终端" hidden></button>
+            <button class="button icon ghost topbar-terminal-toggle" type="button" data-action="toggle-terminal" aria-label="打开终端" title="打开终端" hidden></button>
             <button class="button icon ghost topbar-new-session" type="button" data-action="open-new-session-sheet" aria-label="新建对话" title="新建对话">+</button>
           </div>
           <canvas id="signalCanvas" class="signal-canvas" width="420" height="72" aria-hidden="true"></canvas>
@@ -59,6 +64,7 @@
     <div class="sheet-backdrop" data-new-session-sheet hidden></div>
     <nav class="mobile-nav" data-mobile-nav aria-label="移动端导航"></nav>
     <div class="approval-dialog-layer" data-approval-dialog hidden></div>
+    <div class="video-preview-layer" data-video-preview-layer hidden></div>
     <div class="toast-zone" data-toasts aria-live="polite"></div>
     <script src="/app.js" type="module"></script>
   </body>

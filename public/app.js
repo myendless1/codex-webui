@@ -13,10 +13,10 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 });
 
 const previewableImagePattern = /\.(?:svg|png|jpe?g|gif|webp|avif)$/i;
+const previewableVideoPattern = /\.(?:mp4|webm|mov|m4v|ogv)$/i;
 const defaultFilePreviewSettings = {
   extensions: ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
-  maxFileSizeMb: 20,
-  cleanupIntervalMinutes: 30
+  maxFileSizeMb: 20
 };
 
 function previewableFilePattern() {
@@ -44,9 +44,23 @@ function localPreviewPath(value) {
   return isAllowedPreviewPath(decoded) ? decoded : "";
 }
 
-function filePreviewUrl(filePath) {
+function filePreviewUrl(filePath, sessionId = activeSession()?.id || state.newSessionId) {
   const cwd = activeSession()?.cwd || "";
-  return `/api/files/preview?${new URLSearchParams({ path: filePath, cwd })}`;
+  return `/api/files/preview?${new URLSearchParams({ path: filePath, cwd, sessionId })}`;
+}
+
+function configurePreviewLink(anchor, filePath) {
+  const previewUrl = filePreviewUrl(filePath);
+  anchor.href = previewUrl;
+  anchor.target = "_blank";
+  anchor.rel = "noopener noreferrer";
+  anchor.classList.add("file-preview-link");
+  if (previewableVideoPattern.test(filePath)) {
+    anchor.dataset.videoPreviewUrl = previewUrl;
+    anchor.dataset.videoPreviewName = filePath.split(/[\\/]/).at(-1) || "视频预览";
+    anchor.classList.add("video-preview-link");
+    anchor.title = "在对话中播放";
+  }
 }
 
 function decorateFilePreviews(html) {
@@ -67,10 +81,7 @@ function decorateFilePreviews(html) {
     for (const match of value.matchAll(filePattern)) {
       fragment.append(value.slice(offset, match.index));
       const anchor = document.createElement("a");
-      anchor.href = filePreviewUrl(match[0]);
-      anchor.target = "_blank";
-      anchor.rel = "noopener noreferrer";
-      anchor.className = "file-preview-link";
+      configurePreviewLink(anchor, match[0]);
       anchor.textContent = match[0];
       fragment.append(anchor);
       offset = match.index + match[0].length;
@@ -83,10 +94,8 @@ function decorateFilePreviews(html) {
     const filePath = code.textContent?.trim() || "";
     if (!localPreviewPath(filePath)) return;
     const anchor = document.createElement("a");
-    anchor.href = filePreviewUrl(filePath);
-    anchor.target = "_blank";
-    anchor.rel = "noopener noreferrer";
-    anchor.className = "file-preview-link code-link";
+    configurePreviewLink(anchor, filePath);
+    anchor.classList.add("code-link");
     anchor.append(code.cloneNode(true));
     code.replaceWith(anchor);
   });
@@ -95,8 +104,7 @@ function decorateFilePreviews(html) {
     const href = anchor.getAttribute("href") || "";
     const filePath = localPreviewPath(href);
     if (filePath) {
-      anchor.href = filePreviewUrl(filePath);
-      anchor.classList.add("file-preview-link");
+      configurePreviewLink(anchor, filePath);
     }
   });
 
@@ -105,12 +113,14 @@ function decorateFilePreviews(html) {
     const filePath = localPreviewPath(src);
     if (filePath && previewableImagePattern.test(filePath)) {
       image.src = filePreviewUrl(filePath);
-      image.classList.add("file-preview-image");
-      image.tabIndex = 0;
-      image.setAttribute("role", "link");
-      image.dataset.previewUrl = image.src;
-      image.title = "点击打开原图";
     }
+    image.classList.add("file-preview-image");
+    image.tabIndex = 0;
+    image.setAttribute("role", "link");
+    image.dataset.previewUrl = image.getAttribute("src") || src;
+    image.title = "点击打开原图";
+    image.loading = "lazy";
+    image.decoding = "async";
   });
 
   return template.innerHTML;
@@ -120,6 +130,42 @@ function renderMarkdown(content) {
   const html = marked.parse(String(content || ""));
   const sanitized = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
   return decorateFilePreviews(sanitized);
+}
+
+function openVideoPreview(url, name = "视频预览") {
+  const layer = $("[data-video-preview-layer]");
+  if (!layer) return;
+  layer.innerHTML = `
+    <section class="video-preview-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(name)}">
+      <header class="video-preview-header">
+        <strong>${escapeHtml(name)}</strong>
+        <button class="button icon ghost" type="button" data-action="close-video-preview" aria-label="关闭视频">×</button>
+      </header>
+      <video class="video-preview-player" src="${escapeHtml(url)}" controls playsinline preload="metadata"></video>
+      <footer class="video-preview-footer">
+        <span>关闭后会立即释放视频资源</span>
+        <a class="button ghost slim" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">新窗口打开</a>
+      </footer>
+    </section>`;
+  layer.hidden = false;
+  document.body.classList.add("video-preview-open");
+  const player = layer.querySelector("video");
+  player?.play().catch(() => {});
+}
+
+function closeVideoPreview() {
+  const layer = $("[data-video-preview-layer]");
+  if (!layer || layer.hidden) return;
+  const player = layer.querySelector("video");
+  player?.pause();
+  layer.hidden = true;
+  document.body.classList.remove("video-preview-open");
+  requestAnimationFrame(() => {
+    if (!player) return;
+    player.removeAttribute("src");
+    player.load();
+    if (layer.hidden && layer.contains(player)) layer.innerHTML = "";
+  });
 }
 
 const views = [
@@ -155,8 +201,22 @@ function createId() {
   return `id-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function createUploadId() {
+  try {
+    if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  } catch {
+    // Keep uploads idempotent even when a LAN HTTP origin hides randomUUID.
+  }
+  const randomHex = () => Math.floor(Math.random() * 16).toString(16);
+  return `${Array.from({ length: 8 }, randomHex).join("")}-${Array.from({ length: 4 }, randomHex).join("")}-4${Array.from({ length: 3 }, randomHex).join("")}-${["8", "9", "a", "b"][Math.floor(Math.random() * 4)]}${Array.from({ length: 3 }, randomHex).join("")}-${Array.from({ length: 12 }, randomHex).join("")}`;
+}
+
 function isUuid(value) {
   return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(String(value || ""));
+}
+
+function validSessionStorageId(value) {
+  return /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}$/.test(String(value || ""));
 }
 
 function readJsonStorage(key, fallback) {
@@ -189,6 +249,11 @@ const state = {
   codexSessions: [],
   attachmentsBySession: {},
   uploadingSessionKeys: new Set(),
+  uploadingSessionCounts: new Map(),
+  attachmentUploadControllers: new Map(),
+  newSessionId: validSessionStorageId(localStorage.getItem("codex-webui:new-session-id"))
+    ? localStorage.getItem("codex-webui:new-session-id")
+    : createId(),
   selectedHost: localStorage.getItem("codex-webui:host") || "local-codex",
   theme: localStorage.getItem("codex-webui:theme") === "dark" ? "dark" : "light",
   selectedModel: localStorage.getItem("codex-webui:model") || "",
@@ -206,7 +271,8 @@ const state = {
   mcpQuery: "",
   mcpForm: null,
   settingsTab: localStorage.getItem("codex-webui:settings-tab") || "mcp",
-  settingsSection: localStorage.getItem("codex-webui:settings-section") || "connections",
+  settingsSection: localStorage.getItem("codex-webui:settings-section") || "app",
+  installHelpOpen: false,
   hostFormOpen: false,
   collapsedHostSessions: readJsonStorage("codex-webui:collapsed-host-sessions", {}),
   collapsedCwdGroups: readJsonStorage("codex-webui:collapsed-cwd-groups", {}),
@@ -227,11 +293,13 @@ const state = {
   busy: false,
   sessionRuns: {},
   approvals: [],
+  approvalItems: new Map(),
   approvalBusy: false,
   approvalFocusId: null,
-  promptDrafts: readJsonStorage("codex-webui:prompt-drafts", {}),
-  events: [],
   sessions: loadSessions(),
+  promptDrafts: readJsonStorage("codex-webui:prompt-drafts", {}),
+  promptFullscreenKey: null,
+  events: [],
   sessionSettings: readJsonStorage("codex-webui:session-settings", {}),
   activeSessionId: sessionIdFromUrl() || localStorage.getItem("codex-webui:active-session") || null,
   newSessionCwd: localStorage.getItem("codex-webui:cwd") || "",
@@ -239,13 +307,16 @@ const state = {
   localSkillPrefs: normalizeSkillPrefs(readJsonStorage("codex-webui:skill-prefs", {}))
 };
 
+let deferredInstallPrompt = null;
+let appInstallCompleted = false;
+
 if (!["mcp", "skills"].includes(state.settingsTab)) {
   state.settingsTab = "mcp";
   localStorage.setItem("codex-webui:settings-tab", state.settingsTab);
 }
 
-if (!["mcp", "skills", "file-preview"].includes(state.settingsSection)) {
-  state.settingsSection = "mcp";
+if (!["app", "mcp", "skills", "file-preview"].includes(state.settingsSection)) {
+  state.settingsSection = "app";
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
 }
 
@@ -254,6 +325,7 @@ state.sessions.forEach((session) => {
 });
 state.selectedHost = "local-codex";
 localStorage.setItem("codex-webui:host", state.selectedHost);
+localStorage.setItem("codex-webui:new-session-id", state.newSessionId);
 
 const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
@@ -264,16 +336,41 @@ function formValues(form) {
 
 function loadSessions() {
   const sessions = readJsonStorage("codex-webui:sessions", []);
-  return Array.isArray(sessions) ? sessions : [];
+  if (!Array.isArray(sessions)) return [];
+
+  const retained = sessions.filter(sessionHasMessages);
+  const discardedIds = new Set(sessions.filter((session) => !sessionHasMessages(session)).map((session) => session?.id).filter(Boolean));
+  if (!discardedIds.size) return retained;
+
+  localStorage.setItem("codex-webui:sessions", JSON.stringify(retained));
+  const settings = readJsonStorage("codex-webui:session-settings", {});
+  const drafts = readJsonStorage("codex-webui:prompt-drafts", {});
+  for (const sessionId of discardedIds) {
+    delete settings[sessionId];
+    delete drafts[sessionId];
+  }
+  localStorage.setItem("codex-webui:session-settings", JSON.stringify(settings));
+  localStorage.setItem("codex-webui:prompt-drafts", JSON.stringify(drafts));
+  if (discardedIds.has(localStorage.getItem("codex-webui:active-session"))) {
+    localStorage.removeItem("codex-webui:active-session");
+  }
+  return retained;
+}
+
+function sessionHasMessages(session) {
+  return Array.isArray(session?.messages) && session.messages.length > 0;
 }
 
 function saveSessions() {
-  localStorage.setItem("codex-webui:sessions", JSON.stringify(state.sessions.filter((session) => session.source !== "codex").slice(0, 12)));
+  const sessions = state.sessions
+    .filter((session) => session.source !== "codex" && sessionHasMessages(session))
+    .slice(0, 12);
+  localStorage.setItem("codex-webui:sessions", JSON.stringify(sessions));
   localStorage.removeItem("codex-webui:session");
 }
 
 function attachmentKeyForSession(session = activeSession()) {
-  return session?.id || "__new__";
+  return session?.id || state.newSessionId;
 }
 
 function sessionAttachments(session = activeSession()) {
@@ -284,21 +381,80 @@ function sessionAttachments(session = activeSession()) {
 
 function moveSessionAttachments(fromKey, toKey) {
   if (!fromKey || !toKey || fromKey === toKey) return;
-  if (state.attachmentsBySession[fromKey]?.length) state.attachmentsBySession[toKey] = state.attachmentsBySession[fromKey];
+  if (state.attachmentsBySession[fromKey]?.length) {
+    const existing = state.attachmentsBySession[toKey] || [];
+    const moved = state.attachmentsBySession[fromKey];
+    state.attachmentsBySession[toKey] = [...existing, ...moved]
+      .filter((attachment, index, items) => items.findIndex((item) => item.id === attachment.id) === index);
+  }
   delete state.attachmentsBySession[fromKey];
+}
+
+function beginAttachmentUpload(sessionKey) {
+  const count = (state.uploadingSessionCounts.get(sessionKey) || 0) + 1;
+  state.uploadingSessionCounts.set(sessionKey, count);
+  state.uploadingSessionKeys.add(sessionKey);
+}
+
+function endAttachmentUpload(sessionKey) {
+  const count = Math.max(0, (state.uploadingSessionCounts.get(sessionKey) || 1) - 1);
+  if (count) {
+    state.uploadingSessionCounts.set(sessionKey, count);
+    return;
+  }
+  state.uploadingSessionCounts.delete(sessionKey);
+  state.uploadingSessionKeys.delete(sessionKey);
+}
+
+function attachmentUploadInProgress(sessionKey) {
+  return state.uploadingSessionKeys.has(sessionKey);
+}
+
+function attachmentPreviewKind(attachment) {
+  const mime = String(attachment?.mime || "").toLowerCase();
+  const name = String(attachment?.name || "").toLowerCase();
+  if (mime.startsWith("image/") || /\.(?:png|jpe?g|gif|webp|avif|svg)$/.test(name)) return "image";
+  if (mime.startsWith("video/") || /\.(?:mp4|webm|mov|m4v|ogv)$/.test(name)) return "video";
+  return "file";
+}
+
+function renderAttachmentPreview(attachment) {
+  const previewUrl = attachment.previewUrl || attachment.url || "";
+  const kind = attachmentPreviewKind(attachment);
+  if (!previewUrl || kind === "file") return `<span class="file-chip-icon">${iconFile}</span>`;
+  if (kind === "video") {
+    return `<video class="attachment-thumbnail" src="${escapeHtml(previewUrl)}" muted playsinline preload="metadata" aria-label="${escapeHtml(attachment.name)}"></video>`;
+  }
+  const width = Number(attachment.width) > 0 ? Math.round(Number(attachment.width)) : 0;
+  const height = Number(attachment.height) > 0 ? Math.round(Number(attachment.height)) : 0;
+  const dimensions = width && height ? ` width="${width}" height="${height}"` : "";
+  return `<img class="attachment-thumbnail" src="${escapeHtml(previewUrl)}" alt="${escapeHtml(attachment.name)}"${dimensions} loading="lazy" decoding="async">`;
+}
+
+function renderMessageAttachments(attachments) {
+  if (!Array.isArray(attachments) || !attachments.length) return "";
+  return `<div class="message-attachments">${attachments.map((attachment) => `
+    <a class="message-attachment ${attachmentPreviewKind(attachment) !== "file" ? "has-preview" : ""}" href="${escapeHtml(attachment.url || attachment.previewUrl || "#")}" target="_blank" rel="noopener noreferrer" title="${attachmentPreviewKind(attachment) === "image" ? "点击查看原图" : escapeHtml(attachment.name)}">
+      ${renderAttachmentPreview(attachment)}
+      <span>${escapeHtml(attachment.name)}</span>
+    </a>`).join("")}</div>`;
 }
 
 function renderAttachmentChips(sessionKey) {
   return (state.attachmentsBySession[sessionKey] || []).map((attachment) => `
-    <span class="file-chip">
-      <span>${escapeHtml(attachment.name)}</span>
-      <button type="button" title="移除附件" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
-    </span>
+    <article class="file-chip ${attachmentPreviewKind(attachment) !== "file" ? "file-chip-preview" : ""} ${attachment.uploading ? "uploading" : ""}">
+      <span class="file-chip-visual">${renderAttachmentPreview(attachment)}</span>
+      <span class="file-chip-copy">
+        <span class="file-chip-name">${escapeHtml(attachment.name)}</span>
+        ${attachment.uploading ? `<small>${escapeHtml(attachment.statusText || "正在上传…")}</small>` : ""}
+      </span>
+      <button type="button" title="移除附件" aria-label="移除 ${escapeHtml(attachment.name)}" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
+    </article>
   `).join("");
 }
 
 function updateAttachmentTray(sessionKey) {
-  const form = $(`[data-session-key="${CSS.escape(sessionKey)}"]`);
+  const form = $(`[data-attachment-key="${CSS.escape(sessionKey)}"]`);
   const tray = form?.querySelector(".attachment-tray");
   if (tray) tray.innerHTML = renderAttachmentChips(sessionKey);
 }
@@ -362,6 +518,55 @@ function captureVisiblePromptDraft() {
   if (input && form) savePromptDraft(form.dataset.sessionKey, input.value);
 }
 
+function resizePromptTextarea(textarea) {
+  if (!(textarea instanceof HTMLTextAreaElement)) return;
+  const shell = textarea.closest(".prompt-shell");
+  if (shell?.classList.contains("prompt-fullscreen")) {
+    textarea.style.height = "";
+    textarea.style.overflowY = "auto";
+    return;
+  }
+  textarea.style.height = "0px";
+  const maxHeight = Number.parseFloat(getComputedStyle(textarea).maxHeight) || 180;
+  const nextHeight = Math.min(textarea.scrollHeight, maxHeight);
+  textarea.style.height = `${nextHeight}px`;
+  textarea.style.overflowY = textarea.scrollHeight > maxHeight ? "auto" : "hidden";
+}
+
+function syncPromptEditorState() {
+  const fullscreenShell = state.promptFullscreenKey
+    ? $(`[data-session-key="${CSS.escape(state.promptFullscreenKey)}"] .prompt-shell`)
+    : null;
+  if (state.promptFullscreenKey && !fullscreenShell) state.promptFullscreenKey = null;
+  document.body.classList.toggle("prompt-editor-fullscreen", Boolean(fullscreenShell));
+  $$('textarea[name="prompt"]').forEach(resizePromptTextarea);
+}
+
+function setPromptFullscreen(shell, expanded) {
+  if (!(shell instanceof HTMLElement)) return;
+  const form = shell.closest("[data-session-key]");
+  const sessionKey = form?.dataset.sessionKey || null;
+  $$(".prompt-shell.prompt-fullscreen").forEach((item) => item.classList.remove("prompt-fullscreen"));
+  shell.classList.toggle("prompt-fullscreen", expanded);
+  state.promptFullscreenKey = expanded ? sessionKey : null;
+  document.body.classList.toggle("prompt-editor-fullscreen", expanded);
+  const button = shell.querySelector('[data-action="toggle-prompt-fullscreen"]');
+  if (button) {
+    button.setAttribute("aria-pressed", String(expanded));
+    button.setAttribute("aria-label", expanded ? "退出全屏编辑" : "全屏编辑");
+    button.title = expanded ? "退出全屏编辑（Esc）" : "全屏编辑";
+    button.innerHTML = expanded ? iconBrowserFullscreenExit : iconBrowserFullscreenEnter;
+  }
+  const textarea = shell.querySelector('textarea[name="prompt"]');
+  resizePromptTextarea(textarea);
+  requestAnimationFrame(() => textarea?.focus({ preventScroll: true }));
+}
+
+function renderPromptFullscreenButton(sessionKey) {
+  const expanded = state.promptFullscreenKey === sessionKey;
+  return `<button class="prompt-fullscreen-toggle" type="button" data-action="toggle-prompt-fullscreen" data-keep-enabled="true" aria-label="${expanded ? "退出全屏编辑" : "全屏编辑"}" aria-pressed="${expanded}" title="${expanded ? "退出全屏编辑（Esc）" : "全屏编辑"}">${expanded ? iconBrowserFullscreenExit : iconBrowserFullscreenEnter}</button>`;
+}
+
 function executionSettings() {
   return {
     approval: state.selectedApproval,
@@ -374,7 +579,11 @@ function executionSettings() {
 function saveSessionSettings(sessionId = state.activeSessionId) {
   if (!sessionId) return;
   state.sessionSettings[sessionId] = executionSettings();
-  localStorage.setItem("codex-webui:session-settings", JSON.stringify(state.sessionSettings));
+  const session = state.sessions.find((item) => item.id === sessionId)
+    || state.codexSessions.find((item) => item.id === sessionId);
+  if (!session || session.source === "codex" || sessionHasMessages(session)) {
+    localStorage.setItem("codex-webui:session-settings", JSON.stringify(state.sessionSettings));
+  }
 }
 
 function applySessionSettings(sessionId) {
@@ -500,6 +709,13 @@ function knownWorkingDirectories() {
   return directories;
 }
 
+function sessionUpdatedAtMs(session) {
+  const updatedAt = new Date(session?.updatedAt || "").getTime();
+  if (Number.isFinite(updatedAt)) return updatedAt;
+  const createdAt = new Date(session?.createdAt || "").getTime();
+  return Number.isFinite(createdAt) ? createdAt : 0;
+}
+
 function sessionsByCwd(sessions) {
   const groups = new Map();
   for (const session of sessions) {
@@ -513,13 +729,9 @@ function sessionsByCwd(sessions) {
     .map(([cwd, items]) => ({
       cwd,
       label: cwdLabel(cwd) || "未指定目录",
-      sessions: items.slice().sort((a, b) => new Date(b.updatedAt || 0).getTime() - new Date(a.updatedAt || 0).getTime())
+      sessions: items.slice().sort((a, b) => sessionUpdatedAtMs(b) - sessionUpdatedAtMs(a))
     }))
-    .sort((a, b) => {
-      const aTime = Math.max(...a.sessions.map((item) => new Date(item.updatedAt || 0).getTime()), 0);
-      const bTime = Math.max(...b.sessions.map((item) => new Date(item.updatedAt || 0).getTime()), 0);
-      return bTime - aTime;
-    });
+    .sort((a, b) => sessionUpdatedAtMs(b.sessions[0]) - sessionUpdatedAtMs(a.sessions[0]));
 }
 
 function isCwdGroupCollapsed(cwd) {
@@ -560,12 +772,21 @@ function syncSessionUrl(sessionId = state.activeSessionId) {
 }
 
 function mergedSessions() {
-  const codex = state.codexSessions.map((session) => ({
-    ...session,
-    hostId: "local-codex",
-    source: "codex",
-    messages: session.messages || []
-  }));
+  const localById = new Map(state.sessions.map((session) => [session.id, session]));
+  const codex = state.codexSessions.map((summary) => {
+    const local = localById.get(summary.id);
+    const newestUpdatedAt = sessionUpdatedAtMs(local) > sessionUpdatedAtMs(summary)
+      ? local.updatedAt
+      : summary.updatedAt;
+    return {
+      ...summary,
+      ...local,
+      updatedAt: newestUpdatedAt,
+      hostId: "local-codex",
+      source: "codex",
+      messages: local?.messages || summary.messages || []
+    };
+  });
   const codexIds = new Set(codex.map((session) => session.id));
   return [
     ...state.sessions
@@ -634,16 +855,150 @@ async function api(path, options = {}) {
   const text = await response.text();
   const payload = text ? JSON.parse(text) : {};
   if (!response.ok) {
-    throw new Error(payload.error || `请求失败（${response.status}）`);
+    const error = new Error(payload.error || `请求失败（${response.status}）`);
+    error.statusCode = response.status;
+    throw error;
   }
   return payload;
 }
 
+const pendingActionLogStorageKey = "codex-webui:pending-action-events";
+const storedActionLogBuffer = readJsonStorage(pendingActionLogStorageKey, []);
+let actionLogBuffer = Array.isArray(storedActionLogBuffer) ? storedActionLogBuffer.slice(-200) : [];
+let actionLogTimer = null;
+let actionLogInFlight = false;
+
+function actionLogContext() {
+  const session = activeSession();
+  return {
+    route: `${location.pathname}${location.search}`,
+    view: state.activeView,
+    sessionId: session?.id || null,
+    sessionSource: session?.source || null,
+    draftSessionId: session ? null : state.newSessionId,
+    cwd: session?.cwd || state.newSessionCwd || null
+  };
+}
+
+function persistActionLogBuffer() {
+  try {
+    if (actionLogBuffer.length) localStorage.setItem(pendingActionLogStorageKey, JSON.stringify(actionLogBuffer.slice(-200)));
+    else localStorage.removeItem(pendingActionLogStorageKey);
+  } catch {
+    // The in-memory queue and browser console remain available if storage is full.
+  }
+}
+
+async function flushActionLogs(useBeacon = false) {
+  if (actionLogTimer) clearTimeout(actionLogTimer);
+  actionLogTimer = null;
+  if (!actionLogBuffer.length || actionLogInFlight) return;
+  const events = actionLogBuffer.splice(0, 100);
+  const body = JSON.stringify({ events });
+  if (useBeacon && navigator.sendBeacon) {
+    const sent = navigator.sendBeacon("/api/action-events", new Blob([body], { type: "application/json" }));
+    if (sent) {
+      persistActionLogBuffer();
+      return;
+    }
+  }
+  actionLogInFlight = true;
+  try {
+    const response = await fetch("/api/action-events", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body,
+      keepalive: true
+    });
+    if (!response.ok) throw new Error(`Operation log request failed (${response.status}).`);
+    persistActionLogBuffer();
+  } catch (error) {
+    actionLogBuffer = [...events, ...actionLogBuffer].slice(-500);
+    persistActionLogBuffer();
+    console.warn("Operation log delivery failed; queued for retry", error);
+    actionLogTimer = setTimeout(flushActionLogs, 2000);
+  } finally {
+    actionLogInFlight = false;
+    if (actionLogBuffer.length && !actionLogTimer) actionLogTimer = setTimeout(flushActionLogs, 150);
+  }
+}
+
+function logClientOperation(behavior, details = {}) {
+  const entry = {
+    clientTime: new Date().toISOString(),
+    eventId: globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random()}`,
+    behavior,
+    details: { ...actionLogContext(), ...details }
+  };
+  console.info(`[操作 ${entry.clientTime}] ${behavior}`, entry.details);
+  actionLogBuffer.push(entry);
+  persistActionLogBuffer();
+  if (actionLogBuffer.length >= 20) {
+    flushActionLogs();
+    return;
+  }
+  if (!actionLogTimer) actionLogTimer = setTimeout(flushActionLogs, 150);
+}
+
+function operationControlDetails(control) {
+  const dataset = Object.fromEntries(Object.entries(control.dataset || {})
+    .filter(([key]) => !["previewUrl", "videoPreviewUrl"].includes(key))
+    .slice(0, 16)
+    .map(([key, value]) => [key, String(value).slice(0, 240)]));
+  const rawLabel = control.getAttribute("aria-label")
+    || control.getAttribute("title")
+    || control.textContent
+    || control.getAttribute("name")
+    || control.tagName;
+  return {
+    control: control.tagName.toLowerCase(),
+    controlType: control.getAttribute("type") || null,
+    label: String(rawLabel).replace(/\s+/g, " ").trim().slice(0, 240),
+    disabled: Boolean(control.disabled),
+    dataset
+  };
+}
+
+function operationBehaviorForControl(control) {
+  const dataset = control.dataset || {};
+  const keyedBehavior = [
+    ["action", dataset.action],
+    ["approvalDecision", dataset.approvalDecision],
+    ["approvalOption", dataset.approvalOption],
+    ["modelOption", dataset.modelOption],
+    ["effortOption", dataset.effortOption],
+    ["sandboxOption", dataset.sandboxOption],
+    ["sessionId", dataset.sessionId],
+    ["deleteSession", dataset.deleteSession],
+    ["installPlugin", dataset.installPlugin],
+    ["removePlugin", dataset.removePlugin],
+    ["removeAttachment", dataset.removeAttachment],
+    ["settingsSection", dataset.settingsSection],
+    ["navTarget", dataset.navTarget]
+  ].find(([, value]) => value !== undefined);
+  if (keyedBehavior) return `control.${keyedBehavior[0]}.${String(keyedBehavior[1]).slice(0, 120)}`;
+  if (control.matches("label.file-button, input[type='file']")) return "control.open-file-picker";
+  if (control.getAttribute("type") === "submit") return "control.submit";
+  return "control.activate";
+}
+
+function recordOperationControlClick(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  const control = target?.closest("button, input[type='button'], input[type='submit'], input[type='checkbox'], input[type='file'], label.file-button, label.theme-switch, a.button, [role='button']");
+  if (!control) return;
+  if (control.matches("label.file-button, input[type='file']")) beginFilePickerSelection();
+  logClientOperation(operationBehaviorForControl(control), operationControlDetails(control));
+}
+
 function toast(message) {
   const zone = $("[data-toasts]");
-  const node = document.createElement("div");
+  if (!zone) return;
+  const node = document.createElement("button");
+  node.type = "button";
   node.className = "toast";
   node.textContent = message;
+  node.title = "点击关闭";
+  node.setAttribute("aria-label", `${message}，点击关闭`);
   zone.append(node);
   setTimeout(() => node.remove(), 3200);
 }
@@ -929,10 +1284,112 @@ function approvalTitle(approval) {
   return "批准命令执行";
 }
 
-function approvalDetails(approval) {
-  const params = approval.params || {};
-  const details = JSON.stringify(params, null, 2);
-  return details && details !== "{}" ? details : "Codex 请求继续执行此操作。";
+function approvalReason(approval) {
+  const reason = approval.params?.reason;
+  return typeof reason === "string" ? reason.trim() : "";
+}
+
+function approvalDisplayDetails(approval) {
+  const provided = approval.display && typeof approval.display === "object" ? approval.display : {};
+  const relatedItem = state.approvalItems.get(approval.params?.itemId || approval.params?.callId) || null;
+  const command = provided.command ?? approval.params?.command ?? approval.params?.cmd ?? relatedItem?.command;
+  let changes = Array.isArray(provided.changes) ? provided.changes : null;
+  if ((!changes || !changes.length) && Array.isArray(relatedItem?.changes)) {
+    changes = relatedItem.changes.map((change) => ({
+      path: change?.path,
+      kind: change?.kind?.type || change?.kind || change?.type || "update"
+    })).filter((change) => change.path);
+  }
+  if (!changes && Array.isArray(approval.params?.changes)) {
+    changes = approval.params.changes.map((change) => ({
+      path: change?.path,
+      kind: change?.kind?.type || change?.kind || change?.type || "update"
+    })).filter((change) => change.path);
+  }
+  if (!changes && approval.params?.fileChanges && typeof approval.params.fileChanges === "object") {
+    changes = Object.entries(approval.params.fileChanges).map(([filePath, change]) => ({
+      path: filePath,
+      kind: change?.kind?.type || change?.kind || change?.type || "update"
+    }));
+  }
+  return {
+    command: Array.isArray(command) ? command.map((part) => String(part)).join(" ").trim() : String(command || "").trim(),
+    cwd: String(provided.cwd || approval.params?.cwd || ""),
+    grantRoot: String(provided.grantRoot || approval.params?.grantRoot || ""),
+    changes: changes || [],
+    isFileChange: provided.isFileChange ?? ["item/fileChange/requestApproval", "applyPatchApproval"].includes(approval.method),
+    isCommand: provided.isCommand ?? ["item/commandExecution/requestApproval", "execCommandApproval"].includes(approval.method),
+    isPermission: provided.isPermission ?? approval.method === "item/permissions/requestApproval"
+  };
+}
+
+function approvalChangeLabel(kind) {
+  return { add: "新增", delete: "删除", update: "修改" }[kind] || "修改";
+}
+
+function approvalPathParts(filePath) {
+  const normalized = String(filePath || "").replace(/\\/g, "/");
+  const index = normalized.lastIndexOf("/");
+  return index < 0
+    ? { name: normalized, directory: "" }
+    : { name: normalized.slice(index + 1) || normalized, directory: normalized.slice(0, index) || "/" };
+}
+
+function approvalSummaryTitle(details) {
+  if (details.isFileChange) {
+    if (!details.changes.length) return details.grantRoot ? "写入工作区外目录" : "修改文件";
+    if (details.changes.length === 1) return `${approvalChangeLabel(details.changes[0].kind)} 1 个文件`;
+    return `修改 ${details.changes.length} 个文件`;
+  }
+  if (details.isPermission) return "授予额外权限";
+  return "执行命令";
+}
+
+function renderApprovalChanges(changes) {
+  if (!changes.length) return "";
+  const visible = changes.slice(0, 4);
+  return `
+    <ul class="approval-file-list">
+      ${visible.map((change) => {
+        const parts = approvalPathParts(change.path);
+        return `<li title="${escapeHtml(change.path)}">
+          <span class="approval-change-kind ${escapeHtml(change.kind || "update")}">${approvalChangeLabel(change.kind)}</span>
+          <span class="approval-file-path"><strong>${escapeHtml(parts.name)}</strong>${parts.directory ? `<small>${escapeHtml(parts.directory)}</small>` : ""}</span>
+        </li>`;
+      }).join("")}
+      ${changes.length > visible.length ? `<li class="approval-file-more">另有 ${changes.length - visible.length} 个文件</li>` : ""}
+    </ul>`;
+}
+
+function renderApprovalCommand(command) {
+  if (!command) return "";
+  const compact = command.replace(/\s+/g, " ").trim();
+  const shortened = compact.length > 160 ? `${compact.slice(0, 157)}…` : compact;
+  const needsDetails = command.includes("\n") || compact.length > 160;
+  return `
+    <code class="approval-command-preview">${escapeHtml(shortened)}</code>
+    ${needsDetails ? `<details class="approval-command"><summary>查看完整命令</summary><pre><code>${escapeHtml(command)}</code></pre></details>` : ""}`;
+}
+
+function renderApprovalSummary(approval) {
+  const details = approvalDisplayDetails(approval);
+  const scope = details.grantRoot || details.cwd;
+  return `
+    <section class="approval-summary" aria-label="待批准操作">
+      <div class="approval-summary-heading">
+        <span>待执行操作</span>
+        <strong>${escapeHtml(approvalSummaryTitle(details))}</strong>
+      </div>
+      ${renderApprovalChanges(details.changes)}
+      ${details.isCommand ? renderApprovalCommand(details.command) : ""}
+      ${scope ? `<p class="approval-scope"><span>${details.grantRoot ? "写入范围" : "工作目录"}</span><code>${escapeHtml(scope)}</code></p>` : ""}
+    </section>`;
+}
+
+function renderApprovalReason(approval) {
+  const reason = approvalReason(approval);
+  if (!reason) return "";
+  return `<div class="approval-reason"><span>申请原因</span><p>${escapeHtml(reason)}</p></div>`;
 }
 
 function renderApprovalDialog() {
@@ -954,10 +1411,11 @@ function renderApprovalDialog() {
           <p class="eyebrow">${state.approvals.length > 1 ? `${state.approvals.length} 项待处理` : "交互批准"}</p>
           <h2 id="approval-title">${escapeHtml(approvalTitle(approval))}</h2>
         </div>
-        <span class="approval-session">${escapeHtml(session ? displaySessionTitle(session) : "后台会话")}</span>
+        <span class="approval-session">会话：${escapeHtml(session ? displaySessionTitle(session) : "后台会话")}</span>
       </div>
-      <p class="approval-help">请确认下面的操作是否可以执行。拒绝只会取消本次操作，不会删除会话。</p>
-      <pre class="approval-details">${escapeHtml(approvalDetails(approval))}</pre>
+      <p class="approval-help">确认是否允许执行。拒绝只会取消本次操作，不会删除会话。</p>
+      ${renderApprovalSummary(approval)}
+      ${renderApprovalReason(approval)}
       <div class="approval-actions">
         <button class="button ghost" type="button" data-approval-decision="decline" data-approval-id="${escapeHtml(approval.id)}" data-keep-enabled="true" ${state.approvalBusy ? "disabled" : ""}>拒绝</button>
         <button class="button ghost" type="button" data-approval-decision="acceptForSession" data-approval-id="${escapeHtml(approval.id)}" data-keep-enabled="true" ${state.approvalBusy ? "disabled" : ""}>本会话允许</button>
@@ -1092,6 +1550,7 @@ function renderConsole() {
   if (!session) {
     disconnectTerminal();
     container.innerHTML = renderNewSessionSurface(canRun);
+    syncPromptEditorState();
     applyBusyState();
     renderSessionDrawer();
     renderNewSessionSheet();
@@ -1111,13 +1570,14 @@ function renderConsole() {
               <div class="transcript-inner">${renderTranscript(session)}</div>
             </div>
 
-            <form class="composer" data-composer data-session-key="${escapeHtml(session.id)}">
+            <form class="composer" data-composer data-session-key="${escapeHtml(session.id)}" data-attachment-key="${escapeHtml(session.id)}">
               <input type="hidden" name="cwd" value="${escapeHtml(session.cwd || locationWorkspace())}">
               <div class="attachment-tray">
                 ${renderAttachmentChips(session.id)}
               </div>
-              <div class="prompt-shell">
+              <div class="prompt-shell ${state.promptFullscreenKey === session.id ? "prompt-fullscreen" : ""}">
                 <textarea name="prompt" placeholder="${canRun ? (sessionRunning ? "任务正在执行中" : "随心输入") : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "required" : "disabled"}>${escapeHtml(state.promptDrafts[session.id] || "")}</textarea>
+                ${renderPromptFullscreenButton(session.id)}
                 <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="false">
                   ${renderComposerFooter({ canRun, lockPermissions: false, run: currentRun })}
                 </div>
@@ -1131,7 +1591,7 @@ function renderConsole() {
                   <span class="terminal-tab-icon">${iconTerminal}</span>
                   <span class="terminal-tab-title" title="${escapeHtml(terminalCwd(session))}">${escapeHtml(terminalTabTitle(session))}</span>
                 </div>
-                <button class="terminal-tab-action" type="button" data-action="toggle-terminal" title="缩小终端" aria-label="缩小终端">${iconTerminalMinimize}</button>
+                <button class="terminal-tab-action" type="button" data-action="toggle-terminal" title="返回对话" aria-label="返回对话">${iconConversationLayout}</button>
                 <button class="terminal-tab-new" type="button" data-action="restart-terminal" title="新建终端（重新连接）" aria-label="新建终端">+</button>
                 <div class="terminal-tabbar-actions">
                   <button class="terminal-tab-action" type="button" data-action="restart-terminal" title="重新连接终端" aria-label="重新连接终端">↻</button>
@@ -1154,6 +1614,7 @@ function renderConsole() {
     </div>
   `;
 
+  syncPromptEditorState();
   scrollTranscript();
   applyBusyState();
   initTerminal();
@@ -1183,17 +1644,18 @@ function renderNewSessionSurface(canRun) {
             <div class="transcript" data-transcript>
               <div class="transcript-inner"><div class="transcript-empty"></div></div>
             </div>
-            <form class="composer new-session-form" data-new-session-form data-session-key="__new__">
+            <form class="composer new-session-form" data-new-session-form data-session-key="__new__" data-attachment-key="${escapeHtml(state.newSessionId)}">
               <input type="hidden" name="cwd" value="${escapeHtml(state.newSessionCwd)}">
               <button class="project-select" type="button" data-action="open-directory-picker" ${canRun ? "" : "disabled"}>
                 <span class="project-select-icon">${iconFolder}</span>
                 <span class="project-select-path">${escapeHtml(state.newSessionCwd || "选择项目")}</span>
               </button>
               <div class="attachment-tray">
-                ${renderAttachmentChips("__new__")}
+                ${renderAttachmentChips(state.newSessionId)}
               </div>
-              <div class="prompt-shell">
+              <div class="prompt-shell ${state.promptFullscreenKey === "__new__" ? "prompt-fullscreen" : ""}">
                 <textarea name="prompt" placeholder="${canRun ? "随心输入" : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "" : "disabled"}>${escapeHtml(state.promptDrafts.__new__ || "")}</textarea>
+                ${renderPromptFullscreenButton("__new__")}
                 <div class="composer-footer" data-composer-footer data-can-run="${canRun}" data-lock-permissions="false">
                   ${renderComposerFooter({ canRun, lockPermissions: false })}
                 </div>
@@ -1463,26 +1925,30 @@ function renderSettingsSidebar() {
   const host = hostById();
   return `
     <section class="settings-sidebar-panel">
-      <button class="settings-back-link" type="button" data-action="back-to-console"><span aria-hidden="true">←</span> 返回应用</button>
+      <button class="settings-back-link" type="button" data-action="back-to-console"><span aria-hidden="true">←</span> 返回对话</button>
       <div class="settings-host-selector">
         <span class="settings-host-icon" aria-hidden="true">◎</span>
         <strong>${escapeHtml(host.name)}</strong>
         <span class="settings-ready-dot" aria-hidden="true"></span>
       </div>
-      <div class="settings-sidebar-list">
+      <div class="settings-sidebar-list" role="navigation" aria-label="设置分类">
         <p class="settings-nav-label">通用</p>
-        <button class="settings-connection-button ${state.settingsSection === "file-preview" ? "active" : ""}" type="button" data-settings-section="file-preview">
-          <span class="nav-icon">F</span>
-          <span><strong>文件预览</strong></span>
+        <button class="settings-connection-button ${state.settingsSection === "app" ? "active" : ""}" type="button" data-settings-section="app" ${state.settingsSection === "app" ? 'aria-current="page"' : ""}>
+          <span class="nav-icon">${iconInstall}</span>
+          <span><strong>桌面应用</strong><small>安装与启动方式</small></span>
+        </button>
+        <button class="settings-connection-button ${state.settingsSection === "file-preview" ? "active" : ""}" type="button" data-settings-section="file-preview" ${state.settingsSection === "file-preview" ? 'aria-current="page"' : ""}>
+          <span class="nav-icon">${iconFile}</span>
+          <span><strong>文件预览</strong><small>类型与缓存规则</small></span>
         </button>
         <p class="settings-nav-label">集成</p>
-        <button class="settings-connection-button ${state.settingsSection === "mcp" ? "active" : ""}" type="button" data-settings-section="mcp">
-          <span class="nav-icon">M</span>
-          <span><strong>MCP</strong></span>
+        <button class="settings-connection-button ${state.settingsSection === "mcp" ? "active" : ""}" type="button" data-settings-section="mcp" ${state.settingsSection === "mcp" ? 'aria-current="page"' : ""}>
+          <span class="nav-icon">${iconMcp}</span>
+          <span><strong>MCP 服务</strong><small>外部工具与服务</small></span>
         </button>
-        <button class="settings-connection-button ${state.settingsSection === "skills" ? "active" : ""}" type="button" data-settings-section="skills">
-          <span class="nav-icon">S</span>
-          <span><strong>Skill</strong></span>
+        <button class="settings-connection-button ${state.settingsSection === "skills" ? "active" : ""}" type="button" data-settings-section="skills" ${state.settingsSection === "skills" ? 'aria-current="page"' : ""}>
+          <span class="nav-icon">${iconSkill}</span>
+          <span><strong>Skills 与插件</strong><small>本地技能与 Plugin</small></span>
         </button>
       </div>
       <div class="settings-sidebar-footer">${renderThemeToggle("settings")}</div>
@@ -1520,13 +1986,13 @@ async function toggleSettingsHost(hostId) {
 }
 
 async function selectSettingsSection(section, hostId = state.selectedHost) {
-  const nextSection = ["mcp", "skills", "file-preview"].includes(section) ? section : "mcp";
+  const nextSection = ["app", "mcp", "skills", "file-preview"].includes(section) ? section : "app";
   state.settingsSection = nextSection;
   state.mcpView = "list";
   state.mcpEditName = null;
   state.mcpForm = null;
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
-  if (nextSection !== "file-preview" && state.hosts.some((host) => host.id === hostId) && hostId !== state.selectedHost) {
+  if (["mcp", "skills"].includes(nextSection) && state.hosts.some((host) => host.id === hostId) && hostId !== state.selectedHost) {
     state.selectedHost = hostId;
     localStorage.setItem("codex-webui:host", state.selectedHost);
     await Promise.allSettled([refreshMcp(), refreshPlugins()]);
@@ -1539,9 +2005,11 @@ function renderMessage(message, isRunning = false) {
   const body = message.role === "assistant"
     ? `<div class="markdown-body">${renderMarkdown(content)}</div>`
     : `<pre>${escapeHtml(content)}</pre>`;
+  const attachments = renderMessageAttachments(message.attachments);
   return `
     <article class="message ${message.role}">
       <strong>${escapeHtml(roleName(message.role))}</strong>
+      ${attachments}
       ${body}
     </article>
   `;
@@ -1567,7 +2035,10 @@ const iconArchive = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none"
 const iconGear = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 12a7.2 7.2 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7.3 7.3 0 0 0-2.1-1.2L14.3 3h-4l-.4 2.7a7.3 7.3 0 0 0-2.1 1.2l-2.3-1-2 3.4 2 1.5a7.2 7.2 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1a7.3 7.3 0 0 0 2.1 1.2l.4 2.7h4l.4-2.7a7.3 7.3 0 0 0 2.1-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>`;
 const iconSearch = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.8-3.8"/></svg>`;
 const iconTerminal = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="m7.5 9.5 3 2.5-3 2.5M12.5 15h4"/></svg>`;
-const iconTerminalMinimize = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 8h5V3M21 8h-5V3M16 21v-5h5M8 21v-5H3"/></svg>`;
+const iconInstall = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>`;
+const iconFile = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 12h6M9 16h6"/></svg>`;
+const iconMcp = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8.3 10.9 7.4-3.8M8.3 13.1l7.4 3.8"/></svg>`;
+const iconSkill = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 4.6L18 9.3l-4.3 1.8L12 16l-1.7-4.9L6 9.3l4.3-1.7zM18.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></svg>`;
 const iconConversationLayout = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 14h18M7 9h7"/></svg>`;
 const iconBrowserFullscreenEnter = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5"/></svg>`;
 const iconBrowserFullscreenExit = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v5H3M16 3v5h5M21 16h-5v5M3 16h5v5"/></svg>`;
@@ -1736,7 +2207,36 @@ function renderComposerFooter(flags = {}) {
   `;
 }
 
+let filePickerActive = false;
+let filePickerReleaseTimer = null;
+let composerFooterUpdateDeferred = false;
+
+function beginFilePickerSelection() {
+  filePickerActive = true;
+  if (filePickerReleaseTimer) clearTimeout(filePickerReleaseTimer);
+  filePickerReleaseTimer = null;
+}
+
+function finishFilePickerSelection(delayMs = 0) {
+  if (filePickerReleaseTimer) clearTimeout(filePickerReleaseTimer);
+  const release = () => {
+    filePickerReleaseTimer = null;
+    if (!filePickerActive) return;
+    filePickerActive = false;
+    if (composerFooterUpdateDeferred) {
+      composerFooterUpdateDeferred = false;
+      updateComposerFooters();
+    }
+  };
+  if (delayMs > 0) filePickerReleaseTimer = setTimeout(release, delayMs);
+  else release();
+}
+
 function updateComposerFooters() {
+  if (filePickerActive) {
+    composerFooterUpdateDeferred = true;
+    return;
+  }
   const currentRun = sessionRun();
   $$("[data-composer-footer]").forEach((footer) => {
     footer.innerHTML = renderComposerFooter({
@@ -1778,6 +2278,7 @@ function formatDate(value) {
 
 async function selectSession(sessionId) {
   captureVisiblePromptDraft();
+  discardEmptyLocalSessions(sessionId);
   let session = state.sessions.find((item) => item.id === sessionId);
   if (!session) {
     const summary = state.codexSessions.find((item) => item.id === sessionId);
@@ -1826,7 +2327,7 @@ async function selectSession(sessionId) {
 
 function createLocalSession(title, hostId = state.selectedHost, options = {}) {
   return {
-    id: createId(),
+    id: options.id || createId(),
     title,
     hostId,
     cwd: options.cwd || "",
@@ -1837,7 +2338,42 @@ function createLocalSession(title, hostId = state.selectedHost, options = {}) {
   };
 }
 
+function discardEmptyLocalSessions(exceptSessionId = null) {
+  const discarded = state.sessions.filter((session) => (
+    session.id !== exceptSessionId
+    && session.source !== "codex"
+    && !sessionHasMessages(session)
+  ));
+  if (!discarded.length) return;
+
+  const discardedIds = new Set(discarded.map((session) => session.id));
+  const sessionsWithFiles = discarded
+    .filter((session) => (state.attachmentsBySession[session.id] || []).length)
+    .map((session) => session.id);
+  state.sessions = state.sessions.filter((session) => !discardedIds.has(session.id));
+  for (const sessionId of discardedIds) {
+    delete state.sessionRuns[sessionId];
+    delete state.sessionSettings[sessionId];
+    delete state.attachmentsBySession[sessionId];
+    delete state.promptDrafts[sessionId];
+  }
+  if (discardedIds.has(state.activeSessionId)) {
+    state.activeSessionId = null;
+    localStorage.removeItem("codex-webui:active-session");
+  }
+  localStorage.setItem("codex-webui:session-settings", JSON.stringify(state.sessionSettings));
+  persistPromptDrafts();
+  saveSessions();
+
+  for (const sessionId of sessionsWithFiles) {
+    api(`/api/session-files/${encodeURIComponent(sessionId)}`, { method: "DELETE" }).catch((error) => {
+      console.warn(`Unable to clean up files for discarded session ${sessionId}`, error);
+    });
+  }
+}
+
 function newSession() {
+  discardEmptyLocalSessions();
   state.activeSessionId = null;
   localStorage.removeItem("codex-webui:active-session");
   state.directoryPicker.open = false;
@@ -1866,8 +2402,11 @@ async function startSessionWithCwd(cwd) {
   }
   state.newSessionCwd = directory;
   localStorage.setItem("codex-webui:cwd", directory);
-  const session = createLocalSession("新对话", state.selectedHost, { cwd: directory });
+  discardEmptyLocalSessions();
+  const session = createLocalSession("新对话", state.selectedHost, { cwd: directory, id: state.newSessionId });
   moveSessionAttachments("__new__", session.id);
+  state.newSessionId = createId();
+  localStorage.setItem("codex-webui:new-session-id", state.newSessionId);
   state.sessions.unshift(session);
   state.activeSessionId = session.id;
   localStorage.setItem("codex-webui:active-session", session.id);
@@ -1922,7 +2461,8 @@ async function submitNewSession(event, form = event.target) {
     toast("该主机的执行适配器尚未接入。");
     return;
   }
-  if (state.uploadingSessionKeys.has("__new__")) {
+  const draftSessionId = state.newSessionId;
+  if (attachmentUploadInProgress(draftSessionId)) {
     toast("附件仍在上传，请稍候再创建会话。");
     return;
   }
@@ -1941,8 +2481,11 @@ async function submitNewSession(event, form = event.target) {
   const preferences = persistPreferences(values, cwd);
   const prompt = String(values.prompt || "").trim();
   const name = cwd.split("/").filter(Boolean).pop() || `Session ${state.sessions.length + 1}`;
-  const session = createLocalSession(name, state.selectedHost, { cwd });
+  discardEmptyLocalSessions();
+  const session = createLocalSession(name, state.selectedHost, { cwd, id: draftSessionId });
   moveSessionAttachments("__new__", session.id);
+  state.newSessionId = createId();
+  localStorage.setItem("codex-webui:new-session-id", state.newSessionId);
   state.sessions.unshift(session);
   state.activeSessionId = session.id;
   localStorage.setItem("codex-webui:active-session", session.id);
@@ -1952,6 +2495,7 @@ async function submitNewSession(event, form = event.target) {
   saveSessions();
   const newPromptInput = form.querySelector("textarea[name='prompt']");
   if (newPromptInput) newPromptInput.value = "";
+  state.promptFullscreenKey = null;
   renderAll();
   if (prompt) {
     await sendPrompt({ prompt, cwd, ...preferences });
@@ -1994,10 +2538,18 @@ async function deleteSession(sessionId) {
   }
 
   setBusy(true);
+  let fileCleanupError = null;
   try {
     if (isCodex) {
       await api(`/api/codex/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
       state.codexSessions = state.codexSessions.filter((item) => item.id !== sessionId);
+    } else {
+      try {
+        await api(`/api/session-files/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+      } catch (error) {
+        fileCleanupError = error;
+        console.warn(`Unable to clean up files for deleted session ${sessionId}`, error);
+      }
     }
     state.sessions = state.sessions.filter((item) => item.id !== sessionId);
     delete state.sessionRuns[sessionId];
@@ -2012,7 +2564,9 @@ async function deleteSession(sessionId) {
     }
     saveSessions();
     await refreshCodexSessions();
-    toast(isCodex ? "Codex 会话已归档" : "本地会话已删除");
+    toast(isCodex
+      ? "Codex 会话已归档"
+      : (fileCleanupError ? "本地会话已删除，关联文件暂未清理" : "本地会话已删除"));
     renderAll();
   } catch (error) {
     toast(error.message);
@@ -2036,9 +2590,16 @@ async function clearAllSessions() {
     return;
   }
   setBusy(true);
+  let fileCleanupError = null;
   try {
     if (state.codexSessions.length) {
       await api("/api/codex/sessions", { method: "DELETE" });
+    }
+    try {
+      await api("/api/session-files", { method: "DELETE" });
+    } catch (error) {
+      fileCleanupError = error;
+      console.warn("Unable to clean up all stored session files", error);
     }
     state.sessions = [];
     state.codexSessions = [];
@@ -2052,7 +2613,7 @@ async function clearAllSessions() {
     state.sessionDrawerOpen = false;
     saveSessions();
     await refreshCodexSessions();
-    toast("已清空全部对话");
+    toast(fileCleanupError ? "已清空全部对话，关联文件暂未清理" : "已清空全部对话");
     renderAll();
   } catch (error) {
     toast(error.message);
@@ -2080,10 +2641,20 @@ async function clearCwdSessions(cwd) {
 
   const sessionIds = new Set(sessions.map((session) => session.id));
   const codexSessionIds = sessions.filter((session) => session.source === "codex").map((session) => session.id);
+  const localSessionIds = sessions.filter((session) => session.source !== "codex").map((session) => session.id);
   setBusy(true);
+  let fileCleanupFailed = false;
   try {
     for (const sessionId of codexSessionIds) {
       await api(`/api/codex/sessions/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+    }
+    for (const sessionId of localSessionIds) {
+      try {
+        await api(`/api/session-files/${encodeURIComponent(sessionId)}`, { method: "DELETE" });
+      } catch (error) {
+        fileCleanupFailed = true;
+        console.warn(`Unable to clean up files for deleted session ${sessionId}`, error);
+      }
     }
     state.sessions = state.sessions.filter((session) => !sessionIds.has(session.id));
     state.codexSessions = state.codexSessions.filter((session) => !sessionIds.has(session.id));
@@ -2103,7 +2674,7 @@ async function clearCwdSessions(cwd) {
     }
     saveSessions();
     await refreshCodexSessions();
-    toast(`已清空“${label}”下的对话`);
+    toast(fileCleanupFailed ? `已清空“${label}”下的对话，关联文件暂未清理` : `已清空“${label}”下的对话`);
     renderAll();
   } catch (error) {
     await refreshCodexSessions();
@@ -2430,6 +3001,23 @@ function toggleTerminal() {
   }
 }
 
+async function toggleBrowserFullscreen() {
+  const fullscreenElement = document.fullscreenElement || document.webkitFullscreenElement;
+  if (fullscreenElement) {
+    const exitFullscreen = document.exitFullscreen || document.webkitExitFullscreen;
+    if (exitFullscreen) await exitFullscreen.call(document);
+    return;
+  }
+
+  const root = document.documentElement;
+  const requestFullscreen = root.requestFullscreen || root.webkitRequestFullscreen;
+  if (!requestFullscreen) {
+    toast("当前浏览器不支持页面全屏");
+    return;
+  }
+  await requestFullscreen.call(root);
+}
+
 async function submitPrompt(event, form = event.target) {
   event.preventDefault();
   if (!hostCanRunCodex(state.selectedHost)) {
@@ -2440,7 +3028,8 @@ async function submitPrompt(event, form = event.target) {
     toast("请先暂停当前会话的任务。");
     return;
   }
-  if (state.uploadingSessionKeys.has(form.dataset.sessionKey)) {
+  const attachmentKey = form.dataset.attachmentKey || form.dataset.sessionKey;
+  if (attachmentUploadInProgress(attachmentKey)) {
     toast("附件仍在上传，请稍候再发送。");
     return;
   }
@@ -2464,21 +3053,23 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
     return;
   }
   session.cwd = cwd;
-  session.messages.push({ role: "user", content: prompt });
+  const attachmentKey = attachmentKeyForSession(session);
+  const runAttachments = sessionAttachments(session).slice();
+  session.messages.push({ role: "user", content: prompt, attachments: runAttachments });
   const assistant = { role: "assistant", content: "" };
   session.messages.push(assistant);
   session.title = humanizeSessionTitle(prompt, session.cwd);
   session.updatedAt = new Date().toISOString();
+  saveSessionSettings(session.id);
   saveSessions();
   const sessionKey = session.id;
   const run = { id: null, sessionKey, threadId: session.codexThreadId || null, status: "starting", controller: new AbortController() };
   state.sessionRuns[sessionKey] = run;
-  const attachmentKey = attachmentKeyForSession(session);
-  const runAttachments = sessionAttachments(session).slice();
   delete state.attachmentsBySession[attachmentKey];
   const visiblePrompt = $(`[data-session-key="${CSS.escape(sessionKey)}"] textarea[name='prompt']`);
   if (visiblePrompt) visiblePrompt.value = "";
   savePromptDraft(sessionKey, "");
+  state.promptFullscreenKey = null;
   renderConsole();
 
   const streamedItemIds = new Set();
@@ -2508,6 +3099,7 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
       onEvent(eventPayload) {
         if (eventPayload.sequence) run.lastSequence = eventPayload.sequence;
         if (handleApprovalEvent(eventPayload)) return;
+        if (handleConversationImages(eventPayload, assistant, session)) return;
         if (eventPayload.type === "webui.run") {
           run.id = eventPayload.runId;
           run.status = eventPayload.status || "starting";
@@ -2575,7 +3167,7 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
     await refreshRunStatuses();
     saveSessions();
     if (activeSession() === session) {
-      renderConsole();
+      renderConsolePreservingTranscript();
     } else {
       renderSidebarContent();
       renderSessionDrawer();
@@ -2637,13 +3229,34 @@ function adoptCodexThread(session, threadId) {
   }
 }
 
-function updateLastAssistantMessage(content, session) {
+function updateLastAssistantMessage(content, session, attachments = undefined) {
   if (activeSession() !== session) return;
+  const transcript = $("[data-transcript]");
+  const previousScrollTop = transcript?.scrollTop || 0;
+  const shouldStickToBottom = transcriptIsAtBottom(transcript, 48);
+  const preserveForImage = attachments !== undefined || containsConversationImageMarkup(content);
   const messages = $$("[data-transcript] .message.assistant");
-  const body = messages.at(-1)?.querySelector(".markdown-body");
+  const messageNode = messages.at(-1);
+  const body = messageNode?.querySelector(".markdown-body");
   if (!body) return;
   body.innerHTML = renderMarkdown(content || "...");
-  scrollTranscript();
+  if (attachments !== undefined) {
+    messageNode.querySelector(".message-attachments")?.remove();
+    const attachmentHtml = renderMessageAttachments(attachments);
+    if (attachmentHtml) body.insertAdjacentHTML("beforebegin", attachmentHtml);
+  }
+  if (preserveForImage) {
+    if (transcript) transcript.scrollTop = previousScrollTop;
+  } else if (shouldStickToBottom) {
+    scrollTranscript();
+  }
+}
+
+function containsConversationImageMarkup(content) {
+  const value = String(content || "");
+  return /<image\b/i.test(value)
+    || /!\[[^\]]*\]\(\s*<?(?:data:image\/|\/|\.{1,2}\/)/i.test(value)
+    || /<img\b[^>]*\bsrc=(?:"|'|)(?:data:image\/|\/|\.{1,2}\/)/i.test(value);
 }
 
 async function streamCodex({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, sessionKey, attachments, signal, onEvent }) {
@@ -2736,6 +3349,7 @@ async function attachSessionRun(session) {
     await consumeCodexEventResponse(response, (eventPayload) => {
       if (eventPayload.sequence) run.lastSequence = eventPayload.sequence;
       if (handleApprovalEvent(eventPayload)) return;
+      if (handleConversationImages(eventPayload, assistant, session)) return;
       if (eventPayload.type === "webui.run") run.id = eventPayload.runId || run.id;
       if (eventPayload.type === "webui.started") run.status = "running";
       if (eventPayload.type === "webui.status") run.status = eventPayload.status || run.status;
@@ -2787,7 +3401,7 @@ async function attachSessionRun(session) {
       } catch {
         // The session file may take a moment to flush; keep the streamed copy.
       }
-      if (activeSession() === session) renderConsole();
+      if (activeSession() === session) renderConsolePreservingTranscript();
       renderSidebarContent();
       renderSessionDrawer();
     } else {
@@ -2800,6 +3414,31 @@ async function attachSessionRun(session) {
 }
 
 function handleApprovalEvent(eventPayload) {
+  if (eventPayload.type === "codex.event") {
+    const data = eventPayload.data;
+    if (["item/started", "item/completed"].includes(data?.method)) {
+      const item = data.params?.item;
+      if (item?.id && ["commandExecution", "fileChange"].includes(item.type)) {
+        const existing = state.approvalItems.get(item.id) || {};
+        state.approvalItems.set(item.id, {
+          ...existing,
+          ...item,
+          changes: item.changes?.length ? item.changes : (existing.changes || item.changes)
+        });
+      }
+    }
+    if (data?.method === "item/fileChange/patchUpdated" && data.params?.itemId) {
+      const existing = state.approvalItems.get(data.params.itemId) || {};
+      state.approvalItems.set(data.params.itemId, {
+        ...existing,
+        id: data.params.itemId,
+        type: "fileChange",
+        changes: data.params.changes || existing.changes || []
+      });
+    }
+    if (state.approvalItems.size > 200) state.approvalItems.delete(state.approvalItems.keys().next().value);
+    return false;
+  }
   if (eventPayload.type === "webui.approval" && eventPayload.approval) {
     const approval = eventPayload.approval;
     state.approvals = [
@@ -2819,6 +3458,25 @@ function handleApprovalEvent(eventPayload) {
     return true;
   }
   return false;
+}
+
+function handleConversationImages(eventPayload, message, session) {
+  if (eventPayload.type !== "webui.images" || !Array.isArray(eventPayload.attachments)) return false;
+  message.content = stripArchivedImageMarkup(message.content);
+  message.attachments = [...(message.attachments || []), ...eventPayload.attachments]
+    .filter((attachment, index, items) => items.findIndex((item) => item.url === attachment.url) === index);
+  session.updatedAt = new Date().toISOString();
+  updateLastAssistantMessage(message.content, session, message.attachments);
+  return true;
+}
+
+function stripArchivedImageMarkup(content) {
+  return String(content || "")
+    .replace(/<image\b[^>]*>\s*(?:<\/image>)?/gi, "")
+    .replace(/!\[[^\]]*\]\(\s*<?(?:data:image\/[^)\s]+|(?:\/|\.{1,2}\/)[^)\s]+)>?(?:\s+["'][^"']*["'])?\s*\)/gi, "")
+    .replace(/<img\b[^>]*\bsrc=(?:"(?:data:image\/|\/|\.{1,2}\/)[^"]+"|'(?:data:image\/|\/|\.{1,2}\/)[^']+')[^>]*>/gi, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 
 function eventOutput(eventPayload) {
@@ -2886,46 +3544,197 @@ function appendOutput(existing, next) {
   return `${base}${base ? "\n" : ""}${next}`;
 }
 
-function fileToDataUrl(file) {
+function attachmentUploadLimitBytes() {
+  const limit = Number(state.status?.maxUploadBytes);
+  return Number.isFinite(limit) && limit > 0 ? limit : 64 * 1024 * 1024;
+}
+
+function waitForUploadRetry(delayMs, signal) {
   return new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onload = () => resolve(reader.result);
-    reader.onerror = () => reject(reader.error || new Error("Failed to read file."));
-    reader.readAsDataURL(file);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("上传已取消。", "AbortError"));
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, delayMs);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 
-async function uploadFiles(fileList, sessionKey = attachmentKeyForSession()) {
-  const files = Array.from(fileList || []);
-  if (!files.length) {
-    return;
-  }
-  const oversized = files.find((file) => file.size > 16 * 1024 * 1024);
-  if (oversized) {
-    toast(`${oversized.name} 超过 16 MB，未上传。`);
-    return;
-  }
-  if (state.uploadingSessionKeys.has(sessionKey)) {
-    toast("这个会话已有附件正在上传。");
-    return;
-  }
-  state.uploadingSessionKeys.add(sessionKey);
-  try {
-    for (const file of files) {
-      const data = await fileToDataUrl(file);
-      const payload = await api("/api/uploads", {
+function uploadErrorCanRetry(error) {
+  const status = Number(error?.statusCode || 0);
+  return !status || [408, 425, 429, 499, 500, 502, 503, 504].includes(status);
+}
+
+async function uploadBinaryAttachment(file, sessionId, uploadId, signal, onRetry) {
+  const maxAttempts = 3;
+  let lastError;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    if (signal?.aborted) throw new DOMException("上传已取消。", "AbortError");
+    try {
+      const query = new URLSearchParams({ sessionId, name: file.name, uploadId, attempt: String(attempt) });
+      const response = await fetch(`/api/uploads?${query}`, {
         method: "POST",
-        body: JSON.stringify({ name: file.name, size: file.size, mime: file.type, data })
+        headers: { "content-type": file.type || "application/octet-stream" },
+        body: file,
+        signal
       });
-      if (!Array.isArray(state.attachmentsBySession[sessionKey])) state.attachmentsBySession[sessionKey] = [];
-      state.attachmentsBySession[sessionKey].push(payload.attachment);
+      const text = await response.text();
+      let payload = {};
+      try {
+        payload = text ? JSON.parse(text) : {};
+      } catch {
+        payload = {};
+      }
+      if (!response.ok) {
+        const error = new Error(payload.error || `上传请求失败（${response.status}）`);
+        error.statusCode = response.status;
+        throw error;
+      }
+      if (!payload.attachment?.id) throw new Error("服务端未返回附件信息。");
+      return payload.attachment;
+    } catch (error) {
+      if (signal?.aborted || error?.name === "AbortError") throw error;
+      lastError = error;
+      if (attempt >= maxAttempts || !uploadErrorCanRetry(error)) throw error;
+      const delayMs = attempt * 1500;
+      onRetry?.({ attempt: attempt + 1, maxAttempts, delayMs, error });
+      logClientOperation("attachment.upload.retry-scheduled", {
+        uploadSessionId: sessionId,
+        uploadId,
+        name: file.name,
+        nextAttempt: attempt + 1,
+        maxAttempts,
+        delayMs,
+        statusCode: error.statusCode || null,
+        error: error.message || String(error)
+      });
+      await waitForUploadRetry(delayMs, signal);
     }
-    toast(`${files.length} 个附件已上传`);
-    updateAttachmentTray(sessionKey);
-  } catch (error) {
-    toast(error.message);
+  }
+  throw lastError || new Error("附件上传失败。");
+}
+
+async function uploadFiles(fileList, sessionKey = attachmentKeyForSession()) {
+  const files = Array.from(fileList || []).filter((file) => file.size > 0);
+  if (!files.length) {
+    toast("请选择非空文件。");
+    logClientOperation("attachment.selection.empty", { uploadSessionId: sessionKey });
+    return;
+  }
+  const limitBytes = attachmentUploadLimitBytes();
+  const acceptedFiles = files.filter((file) => file.size <= limitBytes);
+  const rejectedCount = files.length - acceptedFiles.length;
+  if (!acceptedFiles.length) {
+    toast(`所选文件均超过 ${Math.round(limitBytes / 1024 / 1024)} MB，未上传。`);
+    logClientOperation("attachment.selection.rejected", {
+      uploadSessionId: sessionKey,
+      reason: "size-limit",
+      limitBytes,
+      files: files.slice(0, 32).map((file) => ({ name: file.name, size: file.size, type: file.type }))
+    });
+    return;
+  }
+  beginAttachmentUpload(sessionKey);
+  let uploadedCount = 0;
+  let failedCount = rejectedCount;
+  let canceledCount = 0;
+  const failureMessages = [];
+  logClientOperation("attachment.upload.batch-started", {
+    uploadSessionId: sessionKey,
+    fileCount: files.length,
+    totalBytes: files.reduce((sum, file) => sum + file.size, 0),
+    files: files.slice(0, 32).map((file) => ({ name: file.name, size: file.size, type: file.type }))
+  });
+  try {
+    for (const file of acceptedFiles) {
+      const uploadId = createUploadId();
+      const pendingId = `pending-${uploadId}`;
+      const controller = new AbortController();
+      state.attachmentUploadControllers.set(pendingId, controller);
+      const previewable = attachmentPreviewKind({ name: file.name, mime: file.type }) !== "file";
+      const localPreviewUrl = previewable ? URL.createObjectURL(file) : "";
+      if (!Array.isArray(state.attachmentsBySession[sessionKey])) state.attachmentsBySession[sessionKey] = [];
+      state.attachmentsBySession[sessionKey].push({
+        id: pendingId,
+        name: file.name,
+        size: file.size,
+        mime: file.type,
+        previewUrl: localPreviewUrl,
+        uploading: true,
+        statusText: "正在上传（1/3）…"
+      });
+      updateAttachmentTray(sessionKey);
+      try {
+        logClientOperation("attachment.upload.started", {
+          uploadSessionId: sessionKey,
+          pendingId,
+          name: file.name,
+          size: file.size,
+          type: file.type
+        });
+        const attachment = await uploadBinaryAttachment(file, sessionKey, uploadId, controller.signal, ({ attempt, maxAttempts }) => {
+          const pending = (state.attachmentsBySession[sessionKey] || []).find((item) => item.id === pendingId);
+          if (pending) pending.statusText = `连接中断，正在重试（${attempt}/${maxAttempts}）…`;
+          updateAttachmentTray(sessionKey);
+        });
+        const sessionAttachments = state.attachmentsBySession[sessionKey] || [];
+        const index = sessionAttachments.findIndex((attachment) => attachment.id === pendingId);
+        if (index !== -1) state.attachmentsBySession[sessionKey][index] = attachment;
+        uploadedCount += 1;
+        logClientOperation("attachment.upload.succeeded", {
+          uploadSessionId: sessionKey,
+          pendingId,
+          attachmentId: attachment.id,
+          name: file.name,
+          size: attachment.size
+        });
+      } catch (error) {
+        state.attachmentsBySession[sessionKey] = (state.attachmentsBySession[sessionKey] || []).filter((attachment) => attachment.id !== pendingId);
+        if (controller.signal.aborted || error?.name === "AbortError") {
+          canceledCount += 1;
+          logClientOperation("attachment.upload.canceled", {
+            uploadSessionId: sessionKey,
+            pendingId,
+            uploadId,
+            name: file.name,
+            size: file.size
+          });
+        } else {
+          failedCount += 1;
+          failureMessages.push(`${file.name}：${error.message}`);
+          console.error(`Failed to upload ${file.name}`, error);
+          logClientOperation("attachment.upload.failed", {
+            uploadSessionId: sessionKey,
+            pendingId,
+            uploadId,
+            name: file.name,
+            size: file.size,
+            type: file.type,
+            statusCode: error.statusCode || null,
+            error: error.message || String(error)
+          });
+        }
+      } finally {
+        state.attachmentUploadControllers.delete(pendingId);
+        if (localPreviewUrl) URL.revokeObjectURL(localPreviewUrl);
+        updateAttachmentTray(sessionKey);
+      }
+    }
+    if (uploadedCount && !failedCount) toast(`${uploadedCount} 个附件已上传${canceledCount ? `，${canceledCount} 个已取消` : ""}`);
+    else if (uploadedCount) toast(`${uploadedCount} 个附件已上传，${failedCount} 个失败：${failureMessages[0] || "文件过大"}`);
+    else if (canceledCount && !failedCount) toast("附件上传已取消");
+    else toast(`附件上传失败：${failureMessages[0] || "请检查文件大小和网络后重试"}`);
   } finally {
-    state.uploadingSessionKeys.delete(sessionKey);
+    endAttachmentUpload(sessionKey);
+    logClientOperation("attachment.upload.batch-finished", {
+      uploadSessionId: sessionKey,
+      uploadedCount,
+      failedCount,
+      canceledCount
+    });
   }
 }
 
@@ -2935,17 +3744,20 @@ function renderSettings() {
     return;
   }
   const host = hostById();
-  const isFilePreview = state.settingsSection === "file-preview";
-  const sectionTitle = isFilePreview ? "文件预览" : (state.settingsSection === "skills" ? "Skill" : "MCP");
-  const sectionSubtitle = isFilePreview ? "临时可浏览目录与复制规则" : `${host.name} · ${host.endpoint || ""}`;
+  const sectionMeta = {
+    app: ["桌面应用", "安装、独立启动与移动端使用"],
+    "file-preview": ["文件预览", "会话文件目录与复制规则"],
+    skills: ["Skills 与插件", `管理 ${host.name} 的本地技能与 Codex Plugin`],
+    mcp: ["MCP 服务", `管理 ${host.name} 连接的外部工具与服务`]
+  }[state.settingsSection] || ["设置", "Codex WebUI"];
   container.innerHTML = `
     <div class="mobile-settings-panel">${renderSettingsSidebar()}</div>
     <section class="settings-stage">
       <div class="settings-stage-header">
         <div class="settings-title-row">
           <div>
-            <h3>${escapeHtml(sectionTitle)}</h3>
-            <p class="fine">${escapeHtml(sectionSubtitle)}</p>
+            <h3>${escapeHtml(sectionMeta[0])}</h3>
+            <p class="fine">${escapeHtml(sectionMeta[1])}</p>
           </div>
         </div>
       </div>
@@ -2999,6 +3811,9 @@ function settingsTabLabel(tab) {
 }
 
 function renderSettingsContent() {
+  if (state.settingsSection === "app") {
+    return renderAppInstallContent();
+  }
   if (state.settingsSection === "file-preview") {
     return renderFilePreviewSettingsContent();
   }
@@ -3008,6 +3823,107 @@ function renderSettingsContent() {
   return renderMcpSettingsContent();
 }
 
+function webAppIsStandalone() {
+  return appInstallCompleted
+    || window.matchMedia("(display-mode: standalone)").matches
+    || window.navigator.standalone === true;
+}
+
+function installPlatform() {
+  const userAgent = navigator.userAgent || "";
+  const ios = /iPhone|iPad|iPod/i.test(userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const safari = /Safari/i.test(userAgent) && !/Chrome|Chromium|CriOS|Edg|OPR|FxiOS/i.test(userAgent);
+  if (ios) return "ios";
+  if (safari && /Macintosh/i.test(userAgent)) return "mac-safari";
+  return "standard";
+}
+
+function installGuideMarkup(platform) {
+  if (platform === "ios") {
+    return `
+      <ol class="install-steps">
+        <li><span>1</span><div><strong>打开分享菜单</strong><p>在 Safari 工具栏点击“分享”图标。</p></div></li>
+        <li><span>2</span><div><strong>添加到主屏幕</strong><p>向下滚动并选择“添加到主屏幕”，然后确认名称。</p></div></li>
+        <li><span>3</span><div><strong>从桌面启动</strong><p>以后从主屏幕图标打开，即可获得没有 Safari 工具栏的独立窗口。</p></div></li>
+      </ol>`;
+  }
+  if (platform === "mac-safari") {
+    return `
+      <ol class="install-steps">
+        <li><span>1</span><div><strong>使用 Safari 菜单</strong><p>选择“文件”→“添加到程序坞”。</p></div></li>
+        <li><span>2</span><div><strong>确认应用名称</strong><p>点击“添加”，Codex WebUI 会出现在程序坞与应用程序目录。</p></div></li>
+      </ol>`;
+  }
+  return `
+    <ol class="install-steps">
+      <li><span>1</span><div><strong>使用浏览器安装入口</strong><p>在 Chrome 或 Edge 地址栏点击安装图标，也可从浏览器菜单选择“安装 Codex WebUI”。</p></div></li>
+      <li><span>2</span><div><strong>独立窗口启动</strong><p>安装后可从桌面、开始菜单或应用列表打开。</p></div></li>
+    </ol>`;
+}
+
+function renderAppInstallContent() {
+  const installed = webAppIsStandalone();
+  const platform = installPlatform();
+  const canPrompt = Boolean(deferredInstallPrompt);
+  const buttonLabel = installed ? "已作为应用运行" : (canPrompt ? "安装 Codex WebUI" : (state.installHelpOpen ? "收起安装步骤" : "添加到桌面"));
+  const platformLabel = platform === "ios" ? "iPhone / iPad" : (platform === "mac-safari" ? "macOS Safari" : "当前浏览器");
+  return `
+    <div class="settings-content-stack">
+      <section class="install-hero settings-surface">
+        <div class="install-app-icon" aria-hidden="true"><img src="/app-icon.svg" alt=""></div>
+        <div class="install-hero-copy">
+          <span class="settings-kicker">CODEX WEBUI</span>
+          <h3>像原生应用一样打开工作台</h3>
+          <p>固定到桌面或主屏幕，获得独立窗口、更稳定的移动端视口，以及更快捷的启动方式。</p>
+          <div class="install-actions">
+            <button class="button primary install-button" type="button" data-action="install-app" ${installed ? "disabled" : ""}>${iconInstall}${escapeHtml(buttonLabel)}</button>
+            <span class="install-status ${installed ? "installed" : ""}">${installed ? "已安装" : escapeHtml(platformLabel)}</span>
+          </div>
+        </div>
+      </section>
+
+      ${state.installHelpOpen && !installed ? `
+        <section class="settings-surface install-guide" data-install-guide>
+          <div class="settings-surface-header">
+            <div><span class="settings-kicker">安装步骤</span><h3>${escapeHtml(platformLabel)}</h3></div>
+          </div>
+          ${installGuideMarkup(platform)}
+          ${!window.isSecureContext && platform === "standard" ? `<p class="install-warning">当前页面不是 HTTPS。Chrome/Edge 通常只在 HTTPS 或本机 localhost 上提供安装提示；局域网使用建议配置 HTTPS 反向代理。</p>` : ""}
+        </section>
+      ` : ""}
+
+      <section class="settings-surface app-benefits">
+        <div class="settings-surface-header"><div><span class="settings-kicker">使用体验</span><h3>安装后会发生什么</h3></div></div>
+        <div class="benefit-grid">
+          <article><span>${iconConversationLayout}</span><strong>独立窗口</strong><p>隐藏常规浏览器工具栏，专注于会话与终端。</p></article>
+          <article><span>${iconInstall}</span><strong>快速启动</strong><p>从桌面、程序坞或手机主屏幕直接进入。</p></article>
+          <article><span>${iconTerminal}</span><strong>保持本机能力</strong><p>仍然连接同一个 WebUI 服务与 Codex CLI。</p></article>
+        </div>
+      </section>
+    </div>
+  `;
+}
+
+async function requestWebAppInstall() {
+  if (webAppIsStandalone()) {
+    toast("Codex WebUI 已作为独立应用运行");
+    return;
+  }
+  if (deferredInstallPrompt) {
+    const promptEvent = deferredInstallPrompt;
+    deferredInstallPrompt = null;
+    await promptEvent.prompt();
+    const choice = await promptEvent.userChoice;
+    if (choice?.outcome === "accepted") toast("正在安装 Codex WebUI");
+    else state.installHelpOpen = true;
+    renderSettings();
+    return;
+  }
+  state.installHelpOpen = !state.installHelpOpen;
+  renderSettings();
+  if (state.installHelpOpen) requestAnimationFrame(() => $("[data-install-guide]")?.scrollIntoView({ behavior: "smooth", block: "nearest" }));
+}
+
 function renderFilePreviewSettingsContent() {
   const settings = state.filePreviewSettings || defaultFilePreviewSettings;
   return `
@@ -3015,7 +3931,7 @@ function renderFilePreviewSettingsContent() {
       <div class="panel-header">
         <div>
           <h3>可复制文件规则</h3>
-          <p>符合后缀和大小规则的本机文件可复制到临时可浏览目录，不限制文件所在位置。</p>
+          <p>符合后缀和大小规则的本机文件会复制到当前会话目录，并在删除会话时一并删除。</p>
         </div>
       </div>
       <div class="panel-body">
@@ -3027,13 +3943,8 @@ function renderFilePreviewSettingsContent() {
           <label>单文件大小上限（MB）
             <input name="maxFileSizeMb" type="number" min="0.1" max="1024" step="0.1" value="${escapeHtml(settings.maxFileSizeMb)}" required>
           </label>
-          <label>自动清空间隔（分钟）
-            <input name="cleanupIntervalMinutes" type="number" min="1" max="10080" step="1" value="${escapeHtml(settings.cleanupIntervalMinutes)}" required>
-            <small>默认每 30 分钟清空一次临时可浏览目录。</small>
-          </label>
           <div class="toolbar-row full-width">
             <button class="button primary slim" type="submit">保存设置</button>
-            <button class="button ghost slim" type="button" data-action="clear-preview-cache">立即清空临时目录</button>
           </div>
         </form>
       </div>
@@ -3363,8 +4274,7 @@ async function submitFilePreviewSettings(event, form) {
       method: "PUT",
       body: JSON.stringify({
         extensions,
-        maxFileSizeMb: Number(values.maxFileSizeMb),
-        cleanupIntervalMinutes: Number(values.cleanupIntervalMinutes)
+        maxFileSizeMb: Number(values.maxFileSizeMb)
       })
     });
     state.filePreviewSettings = payload.settings;
@@ -3488,7 +4398,7 @@ function renderLocalSkillCard(skill) {
       <div>
         <div class="item-meta">
           <span class="badge ${enabled ? "ok" : "warn"}">${enabled ? "enabled" : "muted"}</span>
-          <span class="badge">local</span>
+          <span class="badge">${escapeHtml(skill.source || "local")}</span>
         </div>
         <h3>${escapeHtml(skill.name)}</h3>
         <p>${escapeHtml(skill.description || "No description.")}</p>
@@ -3647,6 +4557,125 @@ function scrollTranscript() {
   }
 }
 
+function renderConsolePreservingTranscript() {
+  const previous = $("[data-transcript]");
+  if (!previous) {
+    renderConsole();
+    return;
+  }
+  const previousScrollTop = previous.scrollTop;
+  renderConsole();
+  const transcript = $("[data-transcript]");
+  if (!transcript) return;
+  const restore = () => {
+    transcript.scrollTop = Math.min(previousScrollTop, Math.max(0, transcript.scrollHeight - transcript.clientHeight));
+  };
+  restore();
+  requestAnimationFrame(restore);
+}
+
+const pullUpRefreshThreshold = 150;
+const wheelRefreshThreshold = 180;
+let pullUpRefreshGesture = null;
+let wheelRefreshDistance = 0;
+let lastWheelRefreshAt = 0;
+let pullUpRefreshResetTimer = null;
+let pullUpRefreshReloading = false;
+
+function transcriptIsAtBottom(transcript, tolerance = 2) {
+  if (!(transcript instanceof HTMLElement)) return false;
+  const remaining = transcript.scrollHeight - transcript.clientHeight - transcript.scrollTop;
+  return remaining <= tolerance;
+}
+
+function updatePullUpRefreshIndicator(progress = 0, ready = false, label = "") {
+  let indicator = $("[data-pull-up-refresh]");
+  if (!indicator) {
+    indicator = document.createElement("div");
+    indicator.className = "pull-up-refresh";
+    indicator.dataset.pullUpRefresh = "";
+    indicator.setAttribute("role", "status");
+    indicator.setAttribute("aria-live", "polite");
+    ($("[data-app-shell]") || document.body).append(indicator);
+  }
+  const visible = progress > 0 || pullUpRefreshReloading;
+  indicator.style.setProperty("--pull-progress", String(Math.min(1, Math.max(0, progress))));
+  indicator.classList.toggle("visible", visible);
+  indicator.classList.toggle("ready", ready);
+  indicator.textContent = label || (ready ? "松手刷新" : "继续上拉刷新");
+}
+
+function resetPullUpRefreshIndicator(delay = 0) {
+  if (pullUpRefreshResetTimer) clearTimeout(pullUpRefreshResetTimer);
+  pullUpRefreshResetTimer = setTimeout(() => {
+    pullUpRefreshResetTimer = null;
+    if (!pullUpRefreshReloading) updatePullUpRefreshIndicator(0);
+  }, delay);
+}
+
+function reloadCurrentPageFromTranscript() {
+  if (pullUpRefreshReloading) return;
+  pullUpRefreshReloading = true;
+  persistPromptDrafts();
+  updatePullUpRefreshIndicator(1, true, "正在刷新…");
+  setTimeout(() => window.location.reload(), 120);
+}
+
+function touchByIdentifier(touchList, identifier) {
+  return Array.from(touchList || []).find((touch) => touch.identifier === identifier);
+}
+
+function handleTranscriptTouchStart(event) {
+  const transcript = event.target instanceof Element ? event.target.closest("[data-transcript]") : null;
+  if (!transcript || event.touches.length !== 1 || !transcriptIsAtBottom(transcript)) {
+    pullUpRefreshGesture = null;
+    return;
+  }
+  const touch = event.touches[0];
+  pullUpRefreshGesture = { transcript, identifier: touch.identifier, startY: touch.clientY, distance: 0 };
+}
+
+function handleTranscriptTouchMove(event) {
+  if (!pullUpRefreshGesture || pullUpRefreshReloading) return;
+  const touch = touchByIdentifier(event.touches, pullUpRefreshGesture.identifier);
+  if (!touch || !pullUpRefreshGesture.transcript.isConnected || !transcriptIsAtBottom(pullUpRefreshGesture.transcript, 4)) {
+    pullUpRefreshGesture = null;
+    resetPullUpRefreshIndicator();
+    return;
+  }
+  pullUpRefreshGesture.distance = Math.max(0, pullUpRefreshGesture.startY - touch.clientY);
+  const progress = pullUpRefreshGesture.distance / pullUpRefreshThreshold;
+  updatePullUpRefreshIndicator(progress, progress >= 1);
+}
+
+function handleTranscriptTouchEnd(event) {
+  if (!pullUpRefreshGesture) return;
+  const endedTouch = touchByIdentifier(event.changedTouches, pullUpRefreshGesture.identifier);
+  if (!endedTouch) return;
+  const shouldRefresh = pullUpRefreshGesture.distance >= pullUpRefreshThreshold;
+  pullUpRefreshGesture = null;
+  if (shouldRefresh) reloadCurrentPageFromTranscript();
+  else resetPullUpRefreshIndicator();
+}
+
+function handleTranscriptWheel(event) {
+  if (pullUpRefreshReloading || event.ctrlKey) return;
+  const transcript = event.target instanceof Element ? event.target.closest("[data-transcript]") : null;
+  if (!transcript || event.deltaY <= 0 || !transcriptIsAtBottom(transcript)) {
+    wheelRefreshDistance = 0;
+    resetPullUpRefreshIndicator();
+    return;
+  }
+  const now = performance.now();
+  if (now - lastWheelRefreshAt > 400) wheelRefreshDistance = 0;
+  lastWheelRefreshAt = now;
+  wheelRefreshDistance += Math.min(event.deltaY, 60);
+  const progress = wheelRefreshDistance / wheelRefreshThreshold;
+  updatePullUpRefreshIndicator(progress, progress >= 1, progress >= 1 ? "正在刷新…" : "继续向下滚动刷新");
+  if (progress >= 1) reloadCurrentPageFromTranscript();
+  else resetPullUpRefreshIndicator(650);
+}
+
 function nowTime() {
   return new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
@@ -3702,6 +4731,24 @@ function startSignalCanvas() {
 async function handleDocumentClick(event) {
   const target = event.target instanceof Element ? event.target : null;
   if (!target) {
+    return;
+  }
+
+  const toastNode = target.closest(".toast");
+  if (toastNode) {
+    toastNode.remove();
+    return;
+  }
+
+  const previewVideo = target.closest("[data-video-preview-url]");
+  if (previewVideo) {
+    event.preventDefault();
+    openVideoPreview(previewVideo.dataset.videoPreviewUrl, previewVideo.dataset.videoPreviewName);
+    return;
+  }
+
+  if (target.matches("[data-video-preview-layer]")) {
+    closeVideoPreview();
     return;
   }
 
@@ -3871,7 +4918,10 @@ async function handleDocumentClick(event) {
   }
 
   if (button.dataset.removeAttachment) {
-    const key = button.closest("[data-session-key]")?.dataset.sessionKey || attachmentKeyForSession();
+    const form = button.closest("[data-session-key]");
+    const key = form?.dataset.attachmentKey || form?.dataset.sessionKey || attachmentKeyForSession();
+    const controller = state.attachmentUploadControllers.get(button.dataset.removeAttachment);
+    if (controller) controller.abort("user-canceled");
     state.attachmentsBySession[key] = (state.attachmentsBySession[key] || []).filter((attachment) => attachment.id !== button.dataset.removeAttachment);
     updateAttachmentTray(key);
     return;
@@ -3983,6 +5033,17 @@ async function handleDocumentClick(event) {
     case "copy-terminal-selection":
       await copyTerminalSelection();
       break;
+    case "install-app":
+      await requestWebAppInstall();
+      break;
+    case "toggle-browser-fullscreen":
+      await toggleBrowserFullscreen();
+      break;
+    case "toggle-prompt-fullscreen": {
+      const shell = button.closest(".prompt-shell");
+      setPromptFullscreen(shell, !shell?.classList.contains("prompt-fullscreen"));
+      break;
+    }
     case "toggle-terminal":
       toggleTerminal();
       break;
@@ -4051,11 +5112,9 @@ async function handleDocumentClick(event) {
       state.skillQuery = "";
       renderSettings();
       break;
-    case "clear-preview-cache": {
-      const payload = await api("/api/settings/file-preview/cache", { method: "DELETE" });
-      toast(`临时目录已清空（${payload.removed || 0} 个文件）`);
+    case "close-video-preview":
+      closeVideoPreview();
       break;
-    }
     default:
       break;
   }
@@ -4092,17 +5151,11 @@ function handleDocumentInput(event) {
   if (target instanceof HTMLTextAreaElement && target.name === "prompt") {
     const form = target.closest("[data-session-key]");
     if (form) savePromptDraft(form.dataset.sessionKey, target.value);
+    resizePromptTextarea(target);
     return;
   }
   if (target.matches("[data-theme-toggle]")) {
     setTheme(target.checked ? "dark" : "light");
-    return;
-  }
-
-  if (target.matches("[data-file-input]")) {
-    const sessionKey = target.closest("[data-session-key]")?.dataset.sessionKey || attachmentKeyForSession();
-    uploadFiles(target.files, sessionKey).catch(reportClientError);
-    target.value = "";
     return;
   }
 
@@ -4156,27 +5209,149 @@ function handleDocumentInput(event) {
 
 function reportClientError(error) {
   console.error(error);
+  logClientOperation("client.operation.failed", {
+    error: error?.message || String(error),
+    stack: error?.stack?.slice(0, 4000) || null
+  });
   toast("页面操作未完成，请重试。");
 }
 
-function syncMobileViewport() {
-  const viewport = window.visualViewport;
-  const height = viewport?.height || window.innerHeight || document.documentElement.clientHeight;
-  const offsetTop = viewport?.offsetTop || 0;
-  document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
-  document.documentElement.style.setProperty("--app-offset-top", `${Math.round(offsetTop)}px`);
-  document.body.classList.toggle("keyboard-open", Boolean(viewport && window.innerHeight - viewport.height > 120));
+let mobileViewportCorrectionTimer = null;
+let mobileViewportBaselineHeight = 0;
+let mobileViewportBaselineWidth = 0;
+
+function mobileKeyboardTarget() {
+  const target = document.activeElement;
+  if (target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return true;
+  if (target instanceof HTMLInputElement) {
+    return !["button", "checkbox", "color", "file", "hidden", "radio", "range", "reset", "submit"].includes(target.type);
+  }
+  return Boolean(target instanceof HTMLElement && target.isContentEditable);
 }
 
+function applyMobileViewport() {
+  const mobileLayout = window.matchMedia("(max-width: 900px)").matches;
+  if (!mobileLayout) {
+    mobileViewportBaselineHeight = 0;
+    mobileViewportBaselineWidth = 0;
+    document.documentElement.style.removeProperty("--app-height");
+    document.documentElement.style.removeProperty("--app-offset-top");
+    document.body.classList.remove("keyboard-open");
+    return;
+  }
+
+  const viewport = window.visualViewport;
+  const height = viewport?.height || window.innerHeight || document.documentElement.clientHeight;
+  const width = viewport?.width || window.innerWidth || document.documentElement.clientWidth;
+  const offsetTop = viewport?.offsetTop || 0;
+  const keyboardTarget = mobileKeyboardTarget();
+  const orientationChanged = mobileViewportBaselineWidth
+    && Math.abs(width - mobileViewportBaselineWidth) > 80;
+
+  if (orientationChanged) {
+    mobileViewportBaselineWidth = width;
+    mobileViewportBaselineHeight = Math.max(height, window.innerHeight || 0);
+  } else if (!keyboardTarget || !mobileViewportBaselineHeight) {
+    mobileViewportBaselineWidth = width;
+    mobileViewportBaselineHeight = keyboardTarget
+      ? Math.max(height, window.innerHeight || 0)
+      : Math.max(mobileViewportBaselineHeight, height, window.innerHeight || 0);
+  }
+
+  // Browser chrome also changes visualViewport while the user scrolls. Only an
+  // editable control plus a substantial loss of height represents a keyboard.
+  const keyboardOpen = keyboardTarget && mobileViewportBaselineHeight - height > 120;
+  document.body.classList.toggle("keyboard-open", keyboardOpen);
+
+  if (keyboardOpen) {
+    document.documentElement.style.setProperty("--app-height", `${Math.round(height)}px`);
+    document.documentElement.style.setProperty("--app-offset-top", `${Math.round(offsetTop)}px`);
+  } else {
+    // In the resting state CSS owns the layout through 100dvh. This keeps the
+    // composer at the bottom and prevents address-bar motion from lifting it.
+    document.documentElement.style.removeProperty("--app-height");
+    document.documentElement.style.removeProperty("--app-offset-top");
+  }
+}
+
+function syncMobileViewport() {
+  applyMobileViewport();
+  if (mobileViewportCorrectionTimer) clearTimeout(mobileViewportCorrectionTimer);
+  // iOS standalone mode can report a stale visualViewport offset during the
+  // first keyboard resize event. Read it once more after WebKit settles.
+  mobileViewportCorrectionTimer = setTimeout(() => {
+    mobileViewportCorrectionTimer = null;
+    applyMobileViewport();
+  }, 80);
+}
+
+document.addEventListener("click", recordOperationControlClick, true);
 document.addEventListener("click", (event) => {
   handleDocumentClick(event).catch(reportClientError);
 });
 document.addEventListener("submit", (event) => {
+  const form = event.target instanceof HTMLFormElement ? event.target : null;
+  if (form) {
+    const formType = form.matches("[data-new-session-form]") ? "new-session"
+      : form.matches("[data-composer]") ? "composer"
+        : form.matches("[data-mcp-form]") ? "mcp"
+          : form.matches("[data-file-preview-settings-form]") ? "file-preview-settings"
+            : form.matches("[data-host-form]") ? "host" : "other";
+    logClientOperation(`form.submit.${formType}`, {
+      sessionKey: form.dataset.sessionKey || null,
+      uploadSessionId: form.dataset.attachmentKey || null
+    });
+  }
   handleDocumentSubmit(event).catch(reportClientError);
 });
 document.addEventListener("input", handleDocumentInput);
+document.addEventListener("focusin", syncMobileViewport);
+document.addEventListener("focusout", () => requestAnimationFrame(syncMobileViewport));
+document.addEventListener("change", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || !target.matches("[data-file-input]")) return;
+  const form = target.closest("[data-session-key]");
+  const sessionKey = form?.dataset.attachmentKey || attachmentKeyForSession();
+  const selectedFiles = Array.from(target.files || []);
+  logClientOperation("attachment.files-selected", {
+    uploadSessionId: sessionKey,
+    fileCount: selectedFiles.length,
+    files: selectedFiles.slice(0, 32).map((file) => ({ name: file.name, size: file.size, type: file.type }))
+  });
+  uploadFiles(selectedFiles, sessionKey).catch(reportClientError);
+  target.value = "";
+  finishFilePickerSelection();
+});
+document.addEventListener("cancel", (event) => {
+  const target = event.target;
+  if (!(target instanceof HTMLInputElement) || !target.matches("[data-file-input]")) return;
+  logClientOperation("attachment.file-picker-canceled", {
+    uploadSessionId: target.closest("[data-attachment-key]")?.dataset.attachmentKey || attachmentKeyForSession()
+  });
+  finishFilePickerSelection();
+}, true);
+document.addEventListener("touchstart", handleTranscriptTouchStart, { passive: true });
+document.addEventListener("touchmove", handleTranscriptTouchMove, { passive: true });
+document.addEventListener("touchend", handleTranscriptTouchEnd, { passive: true });
+document.addEventListener("touchcancel", () => {
+  pullUpRefreshGesture = null;
+  resetPullUpRefreshIndicator();
+}, { passive: true });
+document.addEventListener("wheel", handleTranscriptWheel, { passive: true });
 document.addEventListener("keydown", (event) => {
   const target = event.target instanceof Element ? event.target : null;
+  if (event.key === "Escape") {
+    const fullscreenShell = $(".prompt-shell.prompt-fullscreen");
+    if (fullscreenShell) {
+      event.preventDefault();
+      setPromptFullscreen(fullscreenShell, false);
+      return;
+    }
+  }
+  if (event.key === "Escape" && !$("[data-video-preview-layer]")?.hidden) {
+    closeVideoPreview();
+    return;
+  }
   if (target?.matches("[data-preview-url]") && (event.key === "Enter" || event.key === " ")) {
     event.preventDefault();
     window.open(target.dataset.previewUrl, "_blank", "noopener,noreferrer");
@@ -4208,10 +5383,30 @@ document.addEventListener("keydown", (event) => {
 });
 window.addEventListener("resize", () => {
   syncMobileViewport();
+  $$('textarea[name="prompt"]').forEach(resizePromptTextarea);
   fitTerminal();
 });
+function handleFullscreenChange() {
+  renderTopbar();
+  syncMobileViewport();
+  requestAnimationFrame(fitTerminal);
+}
+document.addEventListener("fullscreenchange", handleFullscreenChange);
+document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
 window.visualViewport?.addEventListener("resize", syncMobileViewport);
 window.visualViewport?.addEventListener("scroll", syncMobileViewport);
+window.addEventListener("beforeinstallprompt", (event) => {
+  event.preventDefault();
+  deferredInstallPrompt = event;
+  if (state.activeView === "settings" && state.settingsSection === "app") renderSettings();
+});
+window.addEventListener("appinstalled", () => {
+  deferredInstallPrompt = null;
+  appInstallCompleted = true;
+  state.installHelpOpen = false;
+  toast("Codex WebUI 已安装");
+  if (state.activeView === "settings") renderSettings();
+});
 let backgroundPollTimer = null;
 let backgroundPollRunning = false;
 
@@ -4239,11 +5434,18 @@ async function pollBackgroundState() {
 
 document.addEventListener("visibilitychange", () => {
   if (document.hidden) return;
+  if (filePickerActive) finishFilePickerSelection(1200);
   if (backgroundPollTimer) clearTimeout(backgroundPollTimer);
   backgroundPollTimer = setTimeout(pollBackgroundState, 0);
   if (state.terminalShouldReconnect && !state.terminalConnected) scheduleTerminalReconnect();
 });
-window.addEventListener("pagehide", persistPromptDrafts);
+window.addEventListener("focus", () => {
+  if (filePickerActive) finishFilePickerSelection(1200);
+});
+window.addEventListener("pagehide", () => {
+  persistPromptDrafts();
+  flushActionLogs(true);
+});
 window.addEventListener("error", (event) => reportClientError(event.error || event.message));
 window.addEventListener("unhandledrejection", (event) => reportClientError(event.reason));
 
@@ -4251,5 +5453,6 @@ renderShell();
 renderAll();
 syncMobileViewport();
 startSignalCanvas();
+if (actionLogBuffer.length && !actionLogTimer) actionLogTimer = setTimeout(flushActionLogs, 500);
 refreshAll().catch(reportClientError);
 backgroundPollTimer = setTimeout(pollBackgroundState, 2000);

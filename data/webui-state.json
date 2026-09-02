@@ -12,7 +12,6 @@
   "hostSettings": {},
   "filePreview": {
     "extensions": ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
-    "maxFileSizeMb": 20,
-    "cleanupIntervalMinutes": 30
+    "maxFileSizeMb": 20
   }
 }
