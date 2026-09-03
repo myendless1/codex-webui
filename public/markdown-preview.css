@@ -1,0 +1,135 @@
+:root {
+  color-scheme: light;
+  --ink: #18181b;
+  --muted: #71717a;
+  --line: #e4e4e7;
+  --line-strong: #d4d4d8;
+  --surface: #ffffff;
+  --surface-alt: #f7f7f8;
+  --mono: "JetBrains Mono", "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
+  --sans: "Aptos", "IBM Plex Sans", "Segoe UI", sans-serif;
+  background: var(--surface);
+}
+
+:root.theme-dark {
+  color-scheme: dark;
+  --ink: #f0f0ed;
+  --muted: #a1a19b;
+  --line: #363634;
+  --line-strong: #4a4a47;
+  --surface: #181817;
+  --surface-alt: #282827;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  min-height: 100vh;
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--sans);
+  background: var(--surface);
+}
+
+.markdown-preview-header {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  gap: 24px;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 60px;
+  padding: 10px max(20px, calc((100vw - 920px) / 2));
+  background: color-mix(in srgb, var(--surface) 92%, transparent);
+  border-bottom: 1px solid var(--line);
+  backdrop-filter: blur(12px);
+}
+
+.markdown-preview-header div { min-width: 0; }
+.markdown-preview-header strong,
+.markdown-preview-header span { display: block; }
+.markdown-preview-header span {
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--muted);
+  font: 12px/1.3 var(--mono);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.markdown-preview-header a {
+  flex: 0 0 auto;
+  color: var(--ink);
+  font-size: 13px;
+  text-underline-offset: 3px;
+}
+
+.markdown-preview-shell {
+  width: min(100% - 40px, 920px);
+  margin: 0 auto;
+  padding: 42px 0 80px;
+}
+
+.markdown-body {
+  font-size: 16px;
+  line-height: 1.72;
+  overflow-wrap: break-word;
+}
+.markdown-body > :first-child { margin-top: 0; }
+.markdown-body > :last-child { margin-bottom: 0; }
+.markdown-body p,
+.markdown-body ul,
+.markdown-body ol,
+.markdown-body blockquote,
+.markdown-body pre,
+.markdown-body table { margin: 0 0 16px; }
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3,
+.markdown-body h4,
+.markdown-body h5,
+.markdown-body h6 {
+  margin: 28px 0 12px;
+  font-weight: 650;
+  line-height: 1.3;
+}
+.markdown-body h1 { padding-bottom: 10px; font-size: 2em; border-bottom: 1px solid var(--line); }
+.markdown-body h2 { padding-bottom: 8px; font-size: 1.5em; border-bottom: 1px solid var(--line); }
+.markdown-body h3 { font-size: 1.25em; }
+.markdown-body h4 { font-size: 1.1em; }
+.markdown-body ul,
+.markdown-body ol { padding-left: 1.7em; }
+.markdown-body li + li { margin-top: 5px; }
+.markdown-body code {
+  padding: 2px 5px;
+  font: 0.88em var(--mono);
+  background: var(--surface-alt);
+  border: 1px solid var(--line);
+  border-radius: 5px;
+}
+.markdown-body pre {
+  padding: 14px 16px;
+  overflow: auto;
+  background: var(--surface-alt);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+.markdown-body pre code { padding: 0; font-size: 13px; line-height: 1.55; background: transparent; border: 0; }
+.markdown-body blockquote { padding-left: 15px; color: var(--muted); border-left: 3px solid var(--line-strong); }
+.markdown-body table { display: block; max-width: 100%; overflow: auto; border-collapse: collapse; }
+.markdown-body th,
+.markdown-body td { padding: 7px 12px; border: 1px solid var(--line); text-align: left; }
+.markdown-body th { background: var(--surface-alt); }
+.markdown-body a { color: #2563eb; text-underline-offset: 3px; }
+.theme-dark .markdown-body a { color: #93c5fd; }
+.markdown-body hr { margin: 24px 0; border: 0; border-top: 1px solid var(--line); }
+.markdown-body img { max-width: 100%; height: auto; border-radius: 8px; }
+.markdown-preview-error { padding: 16px; color: #b42318; background: #fff1f0; border: 1px solid #f0b8b3; border-radius: 8px; }
+.theme-dark .markdown-preview-error { color: #ffb4ab; background: #351817; border-color: #743631; }
+
+@media (max-width: 600px) {
+  .markdown-preview-header { padding: 10px 16px; }
+  .markdown-preview-header span { max-width: 68vw; }
+  .markdown-preview-shell { width: min(100% - 28px, 920px); padding: 28px 0 56px; }
+  .markdown-body { font-size: 15px; }
+}

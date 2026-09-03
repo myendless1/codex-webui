@@ -74,8 +74,9 @@ const previewMimeTypes = new Map([
   [".ogv", "video/ogg"]
 ]);
 
+const legacyDefaultFilePreviewExtensions = ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"];
 const defaultFilePreviewSettings = {
-  extensions: ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
+  extensions: ["md", ...legacyDefaultFilePreviewExtensions],
   maxFileSizeMb: 20
 };
 
@@ -364,12 +365,18 @@ function directoryRootCandidates() {
     .split(path.delimiter)
     .map((entry) => entry.trim())
     .filter(Boolean);
-  const candidates = configured.length ? configured : [os.homedir(), process.cwd()];
+  const candidates = configured.length
+    ? configured
+    : [path.parse(process.cwd()).root, os.homedir(), process.cwd()];
   return [...new Set(candidates.map((entry) => path.resolve(entry)))];
 }
 
 function isWithinDirectoryRoot(directoryPath, rootPath) {
-  return directoryPath === rootPath || directoryPath.startsWith(`${rootPath}${path.sep}`);
+  const relativePath = path.relative(rootPath, directoryPath);
+  return relativePath === ""
+    || (relativePath !== ".."
+      && !relativePath.startsWith(`..${path.sep}`)
+      && !path.isAbsolute(relativePath));
 }
 
 async function availableDirectoryRoots() {
@@ -435,8 +442,12 @@ function normalizeFilePreviewSettings(value) {
     .filter((entry) => /^[a-z0-9][a-z0-9_-]{0,15}$/.test(entry)))]
     .slice(0, 64);
   const maxFileSizeMb = Number(source.maxFileSizeMb);
+  const usesLegacyDefaults = extensions.length === legacyDefaultFilePreviewExtensions.length
+    && legacyDefaultFilePreviewExtensions.every((extension) => extensions.includes(extension));
   return {
-    extensions: extensions.length ? extensions : [...defaultFilePreviewSettings.extensions],
+    extensions: extensions.length
+      ? (usesLegacyDefaults ? ["md", ...extensions] : extensions)
+      : [...defaultFilePreviewSettings.extensions],
     maxFileSizeMb: Number.isFinite(maxFileSizeMb) && maxFileSizeMb >= 0.1 && maxFileSizeMb <= 1024
       ? Math.round(maxFileSizeMb * 10) / 10
       : defaultFilePreviewSettings.maxFileSizeMb

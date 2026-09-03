@@ -10,7 +10,7 @@
     "server.js",
     "public",
     "README_EN.md",
-    "docs/images/feature-overview.png"
+    "docs"
   ],
   "repository": {
     "type": "git",
@@ -27,7 +27,7 @@
     "dev": "node server.js",
     "dev:lan": "HOST=0.0.0.0 node server.js",
     "start": "node server.js",
-    "check": "node --check server.js && node --check public/app.js",
+    "check": "node --check server.js && node --check public/app.js && node --check public/markdown-preview.js",
     "test": "npm run check",
     "prepack": "npm test"
   },

@@ -15,28 +15,65 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 const previewableImagePattern = /\.(?:svg|png|jpe?g|gif|webp|avif)$/i;
 const previewableVideoPattern = /\.(?:mp4|webm|mov|m4v|ogv)$/i;
 const defaultFilePreviewSettings = {
-  extensions: ["json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
+  extensions: ["md", "json", "svg", "png", "jpg", "jpeg", "gif", "webp", "avif", "mp4", "webm", "mov", "m4v", "ogv"],
   maxFileSizeMb: 20
 };
 
 function previewableFilePattern() {
   const extensions = state?.filePreviewSettings?.extensions || defaultFilePreviewSettings.extensions;
   const alternation = extensions.map((entry) => String(entry).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
-  return new RegExp(`(?:/[^\\s<>"'\\x60]+)+\\.(?:${alternation})(?=$|[\\s\\]),.;!?，。；：！？、}])`, "gi");
+  return new RegExp(`(?:/[^\\s<>"'\\x60]+)+\\.(?:${alternation})(?::\\d+(?::\\d+)?)?(?=$|[\\s\\]),.;!?，。；：！？、}])`, "gi");
+}
+
+function filePreviewLocation(value) {
+  const reference = String(value || "");
+  const match = reference.match(/^(.*):(\d+)(?::(\d+))?$/);
+  return {
+    path: match ? match[1] : reference,
+    line: match ? Number(match[2]) : null,
+    column: match?.[3] ? Number(match[3]) : null
+  };
 }
 
 function isAllowedPreviewPath(filePath) {
-  const extension = String(filePath || "").split(/[?#]/, 1)[0].match(/\.([a-z0-9_-]+)$/i)?.[1]?.toLowerCase();
+  const location = filePreviewLocation(String(filePath || "").split(/[?#]/, 1)[0]);
+  const extension = location.path.match(/\.([a-z0-9_-]+)$/i)?.[1]?.toLowerCase();
   const allowed = state?.filePreviewSettings?.extensions || defaultFilePreviewSettings.extensions;
   return Boolean(extension && allowed.includes(extension));
 }
 
 function localPreviewPath(value) {
   const raw = String(value || "");
-  if (!raw || raw.startsWith("#") || /^[a-z][a-z0-9+.-]*:/i.test(raw)) return "";
+  if (!raw || raw.startsWith("#")) return "";
   let decoded = raw;
+  if (/^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(raw)) {
+    try {
+      const url = new URL(raw, location.href);
+      if (url.origin !== location.origin) return "";
+      if (["/api/files/preview", "/markdown-preview.html"].includes(url.pathname)) {
+        decoded = String(url.searchParams.get("path") || "");
+        const line = url.searchParams.get("line");
+        const column = url.searchParams.get("column");
+        if (line) decoded += `:${line}${column ? `:${column}` : ""}`;
+      } else {
+        decoded = url.pathname;
+      }
+    } catch {
+      return "";
+    }
+  } else if (raw.startsWith("/api/files/preview?") || raw.startsWith("/markdown-preview.html?")) {
+    try {
+      const url = new URL(raw, location.href);
+      decoded = String(url.searchParams.get("path") || "");
+      const line = url.searchParams.get("line");
+      const column = url.searchParams.get("column");
+      if (line) decoded += `:${line}${column ? `:${column}` : ""}`;
+    } catch {
+      return "";
+    }
+  }
   try {
-    decoded = decodeURIComponent(raw);
+    decoded = decodeURIComponent(decoded);
   } catch {
     // Keep the original path when it contains a literal percent sign.
   }
@@ -46,18 +83,38 @@ function localPreviewPath(value) {
 
 function filePreviewUrl(filePath, sessionId = activeSession()?.id || state.newSessionId) {
   const cwd = activeSession()?.cwd || "";
-  return `/api/files/preview?${new URLSearchParams({ path: filePath, cwd, sessionId })}`;
+  const location = filePreviewLocation(filePath);
+  return `/api/files/preview?${new URLSearchParams({ path: location.path, cwd, sessionId })}`;
+}
+
+function markdownPreviewUrl(filePath, sessionId = activeSession()?.id || state.newSessionId) {
+  const cwd = activeSession()?.cwd || "";
+  const location = filePreviewLocation(filePath);
+  const params = new URLSearchParams({ path: location.path, cwd, sessionId });
+  if (location.line) params.set("line", String(location.line));
+  if (location.column) params.set("column", String(location.column));
+  return `/markdown-preview.html?${params}`;
 }
 
 function configurePreviewLink(anchor, filePath) {
+  const location = filePreviewLocation(filePath);
+  const actualPath = location.path;
   const previewUrl = filePreviewUrl(filePath);
-  anchor.href = previewUrl;
+  const markdown = /\.md$/i.test(actualPath);
+  const targetUrl = markdown ? markdownPreviewUrl(filePath) : previewUrl;
+  anchor.href = targetUrl;
   anchor.target = "_blank";
   anchor.rel = "noopener noreferrer";
   anchor.classList.add("file-preview-link");
-  if (previewableVideoPattern.test(filePath)) {
+  if (markdown) {
+    anchor.dataset.markdownPreviewUrl = targetUrl;
+    anchor.dataset.markdownPreviewName = actualPath.split(/[\\/]/).at(-1) || "Markdown 预览";
+    anchor.classList.add("markdown-preview-link");
+    anchor.title = "在对话中预览 Markdown";
+  }
+  if (previewableVideoPattern.test(actualPath)) {
     anchor.dataset.videoPreviewUrl = previewUrl;
-    anchor.dataset.videoPreviewName = filePath.split(/[\\/]/).at(-1) || "视频预览";
+    anchor.dataset.videoPreviewName = actualPath.split(/[\\/]/).at(-1) || "视频预览";
     anchor.classList.add("video-preview-link");
     anchor.title = "在对话中播放";
   }
@@ -151,6 +208,71 @@ function openVideoPreview(url, name = "视频预览") {
   document.body.classList.add("video-preview-open");
   const player = layer.querySelector("video");
   player?.play().catch(() => {});
+}
+
+function openMarkdownPreview(url, name = "Markdown 预览") {
+  const layer = $("[data-markdown-preview-layer]");
+  if (!layer || !url) return;
+  layer.innerHTML = `
+    <section class="markdown-preview-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(name)}">
+      <header class="markdown-preview-dialog-header">
+        <strong>${escapeHtml(name)}</strong>
+        <button class="button icon ghost" type="button" data-action="close-markdown-preview" aria-label="关闭 Markdown 预览">×</button>
+      </header>
+      <iframe class="markdown-preview-frame" src="${escapeHtml(url)}" title="${escapeHtml(name)}"></iframe>
+      <footer class="markdown-preview-dialog-footer">
+        <span>Markdown 预览</span>
+        <a class="button ghost slim" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">新窗口打开</a>
+      </footer>
+    </section>`;
+  layer.hidden = false;
+  document.body.classList.add("markdown-preview-open");
+  layer.querySelector("[data-action='close-markdown-preview']")?.focus();
+}
+
+function closeMarkdownPreview() {
+  const layer = $("[data-markdown-preview-layer]");
+  if (!layer || layer.hidden) return;
+  const frame = layer.querySelector("iframe");
+  layer.hidden = true;
+  document.body.classList.remove("markdown-preview-open");
+  if (frame) frame.src = "about:blank";
+  layer.innerHTML = "";
+}
+
+function handlePreviewMessage(event) {
+  if (event.origin !== location.origin || event.data?.type !== "codex-webui:close-markdown-preview") return;
+  const frame = $("[data-markdown-preview-layer] iframe");
+  if (frame?.contentWindow !== event.source) return;
+  closeMarkdownPreview();
+}
+
+function openImagePreview(url, name = "图片预览") {
+  const layer = $("[data-image-preview-layer]");
+  if (!layer || !url) return;
+  layer.innerHTML = `
+    <section class="image-preview-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(name)}">
+      <header class="image-preview-header">
+        <strong>${escapeHtml(name)}</strong>
+        <button class="button icon ghost" type="button" data-action="close-image-preview" aria-label="关闭图片预览">×</button>
+      </header>
+      <img class="image-preview-player" src="${escapeHtml(url)}" alt="${escapeHtml(name)}">
+      <footer class="image-preview-footer">
+        <span>可缩放页面查看图片细节</span>
+        <a class="button ghost slim" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">新窗口打开</a>
+      </footer>
+    </section>`;
+  layer.hidden = false;
+  document.body.classList.add("image-preview-open");
+  layer.querySelector("[data-action='close-image-preview']")?.focus();
+}
+
+function closeImagePreview() {
+  const layer = $("[data-image-preview-layer]");
+  if (!layer || layer.hidden) return;
+  layer.hidden = true;
+  document.body.classList.remove("image-preview-open");
+  layer.innerHTML = "";
 }
 
 function closeVideoPreview() {
@@ -262,6 +384,11 @@ const state = {
   selectedSandbox: localStorage.getItem("codex-webui:sandbox") || "workspace-write",
   selectedEffort: localStorage.getItem("codex-webui:effort") || "",
   composerMenu: null,
+  sessionFilterOpen: false,
+  sessionFilterPlacement: null,
+  sessionActivityFilter: "all",
+  sessionStatusFilter: "all",
+  sessionQuery: "",
   modelMenuPanel: "root",
   modelMenuAdvanced: false,
   skillFilter: "all",
@@ -433,24 +560,35 @@ function renderAttachmentPreview(attachment) {
 
 function renderMessageAttachments(attachments) {
   if (!Array.isArray(attachments) || !attachments.length) return "";
-  return `<div class="message-attachments">${attachments.map((attachment) => `
-    <a class="message-attachment ${attachmentPreviewKind(attachment) !== "file" ? "has-preview" : ""}" href="${escapeHtml(attachment.url || attachment.previewUrl || "#")}" target="_blank" rel="noopener noreferrer" title="${attachmentPreviewKind(attachment) === "image" ? "点击查看原图" : escapeHtml(attachment.name)}">
+  return `<div class="message-attachments">${attachments.map((attachment) => {
+    const kind = attachmentPreviewKind(attachment);
+    const url = attachment.url || attachment.previewUrl || "#";
+    return `
+    <a class="message-attachment ${kind !== "file" ? "has-preview" : ""}" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" title="${kind === "image" ? "点击查看原图" : escapeHtml(attachment.name)}"${kind === "image" ? ` data-preview-url="${escapeHtml(url)}" data-preview-name="${escapeHtml(attachment.name)}"` : ""}>
       ${renderAttachmentPreview(attachment)}
       <span>${escapeHtml(attachment.name)}</span>
-    </a>`).join("")}</div>`;
+    </a>`;
+  }).join("")}</div>`;
 }
 
 function renderAttachmentChips(sessionKey) {
-  return (state.attachmentsBySession[sessionKey] || []).map((attachment) => `
+  return (state.attachmentsBySession[sessionKey] || []).map((attachment) => {
+    const kind = attachmentPreviewKind(attachment);
+    const previewUrl = attachment.previewUrl || attachment.url || "";
+    const previewAttributes = kind === "image" && previewUrl
+      ? ` role="button" tabindex="0" data-preview-url="${escapeHtml(previewUrl)}" data-preview-name="${escapeHtml(attachment.name)}" title="点击查看原图"`
+      : "";
+    return `
     <article class="file-chip ${attachmentPreviewKind(attachment) !== "file" ? "file-chip-preview" : ""} ${attachment.uploading ? "uploading" : ""}">
-      <span class="file-chip-visual">${renderAttachmentPreview(attachment)}</span>
+      <span class="file-chip-visual"${previewAttributes}>${renderAttachmentPreview(attachment)}</span>
       <span class="file-chip-copy">
         <span class="file-chip-name">${escapeHtml(attachment.name)}</span>
         ${attachment.uploading ? `<small>${escapeHtml(attachment.statusText || "正在上传…")}</small>` : ""}
       </span>
       <button type="button" title="移除附件" aria-label="移除 ${escapeHtml(attachment.name)}" data-remove-attachment="${escapeHtml(attachment.id)}">×</button>
     </article>
-  `).join("");
+  `;
+  }).join("");
 }
 
 function updateAttachmentTray(sessionKey) {
@@ -732,6 +870,70 @@ function sessionsByCwd(sessions) {
       sessions: items.slice().sort((a, b) => sessionUpdatedAtMs(b) - sessionUpdatedAtMs(a))
     }))
     .sort((a, b) => sessionUpdatedAtMs(b.sessions[0]) - sessionUpdatedAtMs(a.sessions[0]));
+}
+
+function sessionFilterIsActive() {
+  return state.sessionActivityFilter !== "all"
+    || state.sessionStatusFilter !== "all"
+    || Boolean(state.sessionQuery.trim());
+}
+
+function sessionRunPresentation(session) {
+  const run = sessionRun(session);
+  const waitingApproval = state.approvals.some((approval) => (
+    approval.sessionKey === session.id || approval.threadId === session.id || approval.runId === run?.id
+  ));
+  if (waitingApproval) return { key: "waiting", label: "等待批准", className: "waiting" };
+  if (runIsActive(run)) {
+    return {
+      key: "running",
+      label: run.status === "pausing" ? "暂停中" : "运行中",
+      className: "running"
+    };
+  }
+  if (run?.status === "paused") return { key: "paused", label: "已暂停", className: "paused" };
+  if (run?.status === "failed") return { key: "failed", label: "未完成", className: "failed" };
+  return { key: "completed", label: "已完成", className: run?.status || "completed" };
+}
+
+function sessionMatchesActivityFilter(session, now = new Date()) {
+  if (state.sessionActivityFilter === "all") return true;
+  const updatedAt = sessionUpdatedAtMs(session);
+  if (!updatedAt) return false;
+  if (state.sessionActivityFilter === "today") {
+    const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    return updatedAt >= startOfToday;
+  }
+  const durations = { "5h": 5 * 60 * 60 * 1000, "30m": 30 * 60 * 1000 };
+  return updatedAt >= now.getTime() - (durations[state.sessionActivityFilter] || 0);
+}
+
+function sessionSearchText(session) {
+  const messageText = (session.messages || []).map((message) => {
+    if (typeof message?.content === "string") return message.content;
+    try {
+      return JSON.stringify(message?.content || "");
+    } catch {
+      return "";
+    }
+  }).join(" ");
+  return `${displaySessionTitle(session)} ${session.title || ""} ${session.cwd || ""} ${messageText}`.toLocaleLowerCase();
+}
+
+function filteredSessions(sessions) {
+  const query = state.sessionQuery.trim().toLocaleLowerCase();
+  const now = new Date();
+  return sessions.filter((session) => (
+    sessionMatchesActivityFilter(session, now)
+    && (state.sessionStatusFilter === "all" || sessionRunPresentation(session).key === state.sessionStatusFilter)
+    && (!query || sessionSearchText(session).includes(query))
+  ));
+}
+
+function resetSessionFilters() {
+  state.sessionActivityFilter = "all";
+  state.sessionStatusFilter = "all";
+  state.sessionQuery = "";
 }
 
 function isCwdGroupCollapsed(cwd) {
@@ -1061,7 +1263,14 @@ function applyTheme() {
   const dark = state.theme === "dark";
   shell.classList.toggle("theme-dark", dark);
   shell.classList.toggle("theme-light", !dark);
+  document.documentElement.classList.toggle("theme-dark", dark);
+  document.documentElement.classList.toggle("theme-light", !dark);
   document.body.classList.toggle("theme-dark", dark);
+  document.body.classList.toggle("theme-light", !dark);
+  const themeColor = document.querySelector('meta[name="theme-color"]');
+  if (themeColor) themeColor.content = dark ? "#181817" : "#ffffff";
+  const colorScheme = document.querySelector('meta[name="color-scheme"]');
+  if (colorScheme) colorScheme.content = dark ? "dark" : "light";
 }
 
 function setTheme(theme) {
@@ -1109,12 +1318,17 @@ function applySidebarState() {
     return;
   }
   shell.classList.toggle("sidebar-collapsed", state.sidebarCollapsed);
-  $$("[data-sidebar-toggle]").forEach((button) => {
-    const label = state.sidebarCollapsed ? "显示侧边栏" : "隐藏侧边栏";
-    button.textContent = state.sidebarCollapsed ? "›" : "‹";
-    button.title = label;
-    button.setAttribute("aria-label", label);
-  });
+  syncNavigationToggleLabel();
+}
+
+function syncNavigationToggleLabel() {
+  const button = $(".mobile-menu-toggle");
+  if (!button) return;
+  const label = isMobileViewport()
+    ? "打开会话列表"
+    : (state.sidebarCollapsed ? "显示侧边栏" : "隐藏侧边栏");
+  button.title = label;
+  button.setAttribute("aria-label", label);
 }
 
 async function refreshAll() {
@@ -1500,7 +1714,12 @@ function renderTopbar() {
   $("[data-active-title]").textContent = session
     ? displaySessionTitle(session)
     : (state.activeView === "console" ? "新对话" : view.title);
-  $("[data-active-kicker]").textContent = session ? (cwdLabel(session.cwd) || selectedHostName()) : view.kicker;
+  const activeKicker = $("[data-active-kicker]");
+  const kickerText = session
+    ? (session.cwd || selectedHostName())
+    : (state.activeView === "console" ? (state.newSessionCwd || locationWorkspace() || view.kicker) : view.kicker);
+  activeKicker.textContent = kickerText;
+  activeKicker.title = kickerText;
   const browserFullscreenToggle = $(".topbar-browser-fullscreen");
   if (browserFullscreenToggle) {
     const fullscreenSupported = Boolean(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
@@ -1560,10 +1779,6 @@ function renderConsole() {
   container.innerHTML = `
     <div class="console-grid ${state.terminalCollapsed ? "terminal-collapsed" : ""}">
       <section class="workbench-surface">
-        <div class="workbench-header">
-          <p class="session-location" title="${escapeHtml(session.cwd || locationWorkspace())}">${escapeHtml(session.cwd || locationWorkspace())}</p>
-        </div>
-
         <div class="workbench-body ${state.terminalCollapsed ? "terminal-collapsed" : "terminal-fullscreen"}">
           <div class="conversation-column">
             <div class="transcript" data-transcript>
@@ -1685,7 +1900,7 @@ function renderDirectoryPicker() {
           <button class="button icon ghost" type="button" data-action="close-directory-picker" title="关闭" aria-label="关闭">×</button>
         </div>
         <div class="directory-roots">
-          ${picker.roots.map((root) => `<button class="button ghost slim ${root === picker.path ? "active" : ""}" type="button" data-directory-path="${escapeHtml(root)}">${escapeHtml(root)}</button>`).join("")}
+          ${picker.roots.map((root) => `<button class="button ghost slim ${root === picker.path ? "active" : ""}" type="button" data-directory-root="${escapeHtml(root)}" title="${escapeHtml(root)}" aria-label="${escapeHtml(`${cwdLabel(root) || "根目录"}，完整路径：${root}`)}">${escapeHtml(cwdLabel(root) || "/")}</button>`).join("")}
         </div>
         <p class="directory-current" title="${escapeHtml(picker.path)}">${escapeHtml(picker.path)}</p>
         <div class="directory-list">
@@ -1739,6 +1954,12 @@ function renderSidebarContent() {
   replaceHtmlPreservingScroll(container, renderSessionManager(activeSession(), "sidebar"));
 }
 
+function renderSessionSurfaces() {
+  renderSidebarContent();
+  renderSessionDrawer();
+  applyBusyState();
+}
+
 async function toggleHostSessions(hostId) {
   if (!state.hosts.some((host) => host.id === hostId)) {
     return;
@@ -1753,23 +1974,28 @@ async function toggleHostSessions(hostId) {
 }
 
 function renderSessionManager(active, placement = "content") {
-  const groups = sessionsByCwd(mergedSessions());
-  const total = groups.reduce((count, group) => count + group.sessions.length, 0);
+  const allSessions = mergedSessions();
+  const visibleSessions = filteredSessions(allSessions);
+  const groups = sessionsByCwd(visibleSessions);
+  const total = allSessions.length;
+  const visibleTotal = visibleSessions.length;
+  const filterActive = sessionFilterIsActive();
+  const popoverOpen = state.sessionFilterOpen && state.sessionFilterPlacement === placement;
   return `
-    <section class="panel session-panel ${placement === "sidebar" ? "sidebar-session-panel" : ""} ${placement === "drawer" ? "drawer-session-panel" : ""}">
+    <section class="panel session-panel ${placement === "sidebar" ? "sidebar-session-panel" : ""} ${placement === "drawer" ? "drawer-session-panel" : ""}" data-session-placement="${placement}">
       <div class="panel-header">
         <div>
           <h3>会话</h3>
-          <p>按工作目录收纳 · ${total} 个对话</p>
+          <p>按工作目录收纳 · ${filterActive ? `${visibleTotal} / ${total}` : total} 个对话</p>
         </div>
-        <div class="toolbar-row">
-          <button class="button ghost slim" type="button" title="清空全部对话" data-action="clear-all-sessions">清空</button>
+        <div class="toolbar-row session-toolbar">
+          <button class="button icon ghost session-filter-trigger ${filterActive ? "active" : ""}" type="button" title="筛选和搜索会话" aria-label="筛选和搜索会话${filterActive ? "，已启用" : ""}" aria-expanded="${popoverOpen}" data-action="toggle-session-filter">${iconFilter}</button>
           <button class="button icon ghost" type="button" title="新建对话" data-action="open-new-session-sheet">+</button>
         </div>
       </div>
       <div class="panel-body session-groups">
         ${groups.length ? groups.map((group) => {
-          const collapsed = isCwdGroupCollapsed(group.cwd);
+          const collapsed = filterActive ? false : isCwdGroupCollapsed(group.cwd);
           const isActiveGroup = String(active?.cwd || "") === group.cwd;
           return `
           <section class="session-group ${collapsed ? "collapsed" : ""}">
@@ -1789,24 +2015,79 @@ function renderSessionManager(active, placement = "content") {
             </div>
           </section>
         `;
-        }).join("") : `<div class="empty-state compact">还没有对话</div>`}
+        }).join("") : `<div class="empty-state compact session-filter-empty">${filterActive
+          ? `<span>没有匹配的会话</span><button class="session-filter-empty-reset" type="button" data-action="reset-session-filters">清除筛选</button>`
+          : "还没有对话"}</div>`}
       </div>
     </section>
   `;
+}
+
+function renderSessionFilterPopover(placement, visibleTotal, total) {
+  const activityOptions = [
+    ["all", "全部"], ["today", "今日"], ["5h", "5 小时"], ["30m", "30 分钟"]
+  ];
+  const statusOptions = [
+    ["all", "全部"], ["running", "运行中"], ["completed", "已完成"],
+    ["waiting", "等待批准"], ["paused", "已暂停"], ["failed", "未完成"]
+  ];
+  return `
+    <div class="session-filter-popover" role="dialog" aria-modal="true" aria-labelledby="session-filter-title" data-session-filter-popover data-filter-placement="${placement}">
+      <div class="session-filter-heading">
+        <strong id="session-filter-title">筛选会话</strong>
+        <button type="button" data-action="close-session-filter" aria-label="关闭筛选">×</button>
+      </div>
+      <label class="session-filter-search">
+        ${iconSearch}
+        <input type="search" value="${escapeHtml(state.sessionQuery)}" placeholder="搜索标题、消息或目录" aria-label="搜索会话" autocomplete="off" data-session-query>
+      </label>
+      <fieldset class="session-filter-section">
+        <legend>最近活跃</legend>
+        <div class="session-filter-options">
+          ${activityOptions.map(([value, label]) => `<button class="session-filter-option ${state.sessionActivityFilter === value ? "active" : ""}" type="button" data-session-activity-filter="${value}" aria-pressed="${state.sessionActivityFilter === value}">${label}</button>`).join("")}
+        </div>
+      </fieldset>
+      <fieldset class="session-filter-section">
+        <legend>状态</legend>
+        <div class="session-filter-options">
+          ${statusOptions.map(([value, label]) => `<button class="session-filter-option ${state.sessionStatusFilter === value ? "active" : ""}" type="button" data-session-status-filter="${value}" aria-pressed="${state.sessionStatusFilter === value}">${label}</button>`).join("")}
+        </div>
+      </fieldset>
+      <div class="session-filter-footer">
+        <span>${visibleTotal === total ? `共 ${total} 个` : `${visibleTotal} / ${total} 个`}</span>
+        <div>
+          <button type="button" data-action="reset-session-filters" ${sessionFilterIsActive() ? "" : "disabled"}>重置</button>
+          <button class="session-filter-clear-all" type="button" data-action="clear-all-sessions">删除所有会话</button>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderSessionFilterLayer() {
+  const layer = $("[data-session-filter-layer]");
+  if (!layer) return;
+  layer.hidden = !state.sessionFilterOpen;
+  document.body.classList.toggle("session-filter-open", state.sessionFilterOpen);
+  if (!state.sessionFilterOpen) {
+    layer.innerHTML = "";
+    return;
+  }
+  const allSessions = mergedSessions();
+  layer.innerHTML = renderSessionFilterPopover(
+    state.sessionFilterPlacement || "sidebar",
+    filteredSessions(allSessions).length,
+    allSessions.length
+  );
 }
 
 function renderSessionItem(item, active) {
   const isCodex = item.source === "codex";
   const actionLabel = isCodex ? "归档聊天" : "删除聊天";
   const title = displaySessionTitle(item);
-  const run = sessionRun(item);
-  const waitingApproval = state.approvals.some((approval) => approval.sessionKey === item.id || approval.threadId === item.id || approval.runId === run?.id);
-  const runStatus = waitingApproval
-    ? "等待批准"
-    : runIsActive(run)
-    ? (run.status === "pausing" ? "暂停中" : "运行中")
-    : (run?.status === "paused" ? "已暂停" : run?.status === "failed" ? "未完成" : "已完成");
-  const runClass = waitingApproval ? "waiting" : (runIsActive(run) ? "running" : (run?.status || "completed"));
+  const presentation = sessionRunPresentation(item);
+  const runStatus = presentation.label;
+  const runClass = presentation.className;
   return `
     <div class="session-item ${item.id === active?.id ? "active" : ""}" data-run-status="${runClass}">
       <button class="session-item-select" type="button" data-session-id="${item.id}" title="${escapeHtml(title)}">
@@ -1833,6 +2114,7 @@ function renderSessionDrawer() {
     </div>
     <div class="session-drawer-body">${renderSessionManager(activeSession(), "drawer")}</div>
     <div class="session-drawer-footer">
+      ${renderThemeToggle("drawer")}
       <button class="button ghost" type="button" data-nav="true" data-nav-target="settings">设置</button>
     </div>
   `, ".session-drawer-body");
@@ -1841,6 +2123,7 @@ function renderSessionDrawer() {
   backdrop.hidden = !state.sessionDrawerOpen;
   backdrop.classList.toggle("open", state.sessionDrawerOpen);
   document.body.classList.toggle("session-drawer-open", state.sessionDrawerOpen);
+  renderSessionFilterLayer();
 }
 
 function renderNewSessionSheet() {
@@ -2034,6 +2317,7 @@ const iconFolder = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" 
 const iconArchive = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="4.5" rx="1"/><path d="M5 9v8.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/></svg>`;
 const iconGear = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 12a7.2 7.2 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7.3 7.3 0 0 0-2.1-1.2L14.3 3h-4l-.4 2.7a7.3 7.3 0 0 0-2.1 1.2l-2.3-1-2 3.4 2 1.5a7.2 7.2 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1a7.3 7.3 0 0 0 2.1 1.2l.4 2.7h4l.4-2.7a7.3 7.3 0 0 0 2.1-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>`;
 const iconSearch = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.8-3.8"/></svg>`;
+const iconFilter = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>`;
 const iconTerminal = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4.5" width="18" height="15" rx="2.5"/><path d="m7.5 9.5 3 2.5-3 2.5M12.5 15h4"/></svg>`;
 const iconInstall = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v11m0 0 4-4m-4 4-4-4M5 15v4a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-4"/></svg>`;
 const iconFile = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 3h8l4 4v14H6zM14 3v5h5M9 12h6M9 16h6"/></svg>`;
@@ -2177,7 +2461,7 @@ function renderComposerFooter(flags = {}) {
   const canRun = flags.canRun !== false;
   const lockPermissions = flags.lockPermissions === true;
   const run = flags.run || null;
-  const composerLocked = !canRun || runIsActive(run);
+  const composerLocked = !canRun;
   const meta = approvalMeta();
   return `
     <input type="hidden" name="model" value="${escapeHtml(state.selectedModel)}">
@@ -2186,7 +2470,7 @@ function renderComposerFooter(flags = {}) {
     <input type="hidden" name="effort" value="${escapeHtml(state.selectedEffort)}">
     <div class="composer-toolbar">
       <div class="composer-toolbar-side">
-        <label class="round-action file-button" title="上传文件" aria-label="上传文件">
+        <label class="round-action file-button" title="上传文件，也可直接粘贴图片" aria-label="上传文件，也可直接粘贴图片">
           +
           <input type="file" data-file-input multiple ${composerLocked ? "disabled" : ""}>
         </label>
@@ -2582,10 +2866,10 @@ async function clearAllSessions() {
   }
   const total = mergedSessions().length;
   if (!total) {
-    toast("没有可清空的对话");
+    toast("没有可删除的会话");
     return;
   }
-  const ok = window.confirm(`清空全部 ${total} 个对话？Codex 原生会话会被归档，本地会话会被删除。`);
+  const ok = window.confirm(`删除所有 ${total} 个会话？Codex 原生会话会被归档，本地会话会被删除。`);
   if (!ok) {
     return;
   }
@@ -2611,9 +2895,11 @@ async function clearAllSessions() {
     state.activeSessionId = null;
     localStorage.removeItem("codex-webui:active-session");
     state.sessionDrawerOpen = false;
+    state.sessionFilterOpen = false;
+    state.sessionFilterPlacement = null;
     saveSessions();
     await refreshCodexSessions();
-    toast(fileCleanupError ? "已清空全部对话，关联文件暂未清理" : "已清空全部对话");
+    toast(fileCleanupError ? "已删除所有会话，关联文件暂未清理" : "已删除所有会话");
     renderAll();
   } catch (error) {
     toast(error.message);
@@ -3738,6 +4024,50 @@ async function uploadFiles(fileList, sessionKey = attachmentKeyForSession()) {
   }
 }
 
+function clipboardImageFiles(clipboardData) {
+  if (!clipboardData) return [];
+  const itemFiles = Array.from(clipboardData.items || [])
+    .filter((item) => item.kind === "file" && String(item.type || "").toLowerCase().startsWith("image/"))
+    .map((item) => item.getAsFile())
+    .filter(Boolean);
+  const files = itemFiles.length ? itemFiles : Array.from(clipboardData.files || [])
+    .filter((file) => String(file.type || "").toLowerCase().startsWith("image/"));
+  const extensions = { "image/png": "png", "image/jpeg": "jpg", "image/gif": "gif", "image/webp": "webp", "image/avif": "avif", "image/svg+xml": "svg" };
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return files.map((file, index) => {
+    if (/\.[a-z0-9]{2,8}$/i.test(file.name || "")) return file;
+    const extension = extensions[String(file.type || "").toLowerCase()] || "png";
+    return new File([file], `clipboard-image-${stamp}-${index + 1}.${extension}`, {
+      type: file.type || `image/${extension}`,
+      lastModified: file.lastModified || Date.now()
+    });
+  });
+}
+
+function handleDocumentPaste(event) {
+  const target = event.target instanceof Element ? event.target : null;
+  const form = target?.closest("[data-composer], [data-new-session-form]");
+  if (!(form instanceof HTMLFormElement)) return;
+
+  const imageFiles = clipboardImageFiles(event.clipboardData);
+  if (!imageFiles.length) return;
+  event.preventDefault();
+
+  const fileInput = form.querySelector("[data-file-input]");
+  if (fileInput?.disabled) {
+    toast("当前任务执行中，暂时无法上传粘贴的图片。");
+    return;
+  }
+
+  const sessionKey = form.dataset.attachmentKey || attachmentKeyForSession();
+  logClientOperation("attachment.images-pasted", {
+    uploadSessionId: sessionKey,
+    fileCount: imageFiles.length,
+    files: imageFiles.slice(0, 32).map((file) => ({ name: file.name, size: file.size, type: file.type }))
+  });
+  uploadFiles(imageFiles, sessionKey).catch(reportClientError);
+}
+
 function renderSettings() {
   const container = $('[data-view="settings"]');
   if (!container) {
@@ -3937,7 +4267,7 @@ function renderFilePreviewSettingsContent() {
       <div class="panel-body">
         <form class="form-grid file-preview-settings-form" data-file-preview-settings-form>
           <label class="full-width">允许的文件后缀
-            <textarea name="extensions" rows="4" placeholder="json, svg, png, jpg, mp4, webm">${escapeHtml(settings.extensions.join(", "))}</textarea>
+            <textarea name="extensions" rows="4" placeholder="md, json, svg, png, jpg, mp4, webm">${escapeHtml(settings.extensions.join(", "))}</textarea>
             <small>用逗号、分号、空格或换行分隔，不需要填写点号；最多 64 种。</small>
           </label>
           <label>单文件大小上限（MB）
@@ -4575,12 +4905,13 @@ function renderConsolePreservingTranscript() {
 }
 
 const pullUpRefreshThreshold = 150;
-const wheelRefreshThreshold = 180;
 let pullUpRefreshGesture = null;
-let wheelRefreshDistance = 0;
-let lastWheelRefreshAt = 0;
 let pullUpRefreshResetTimer = null;
 let pullUpRefreshReloading = false;
+
+function mobilePullUpRefreshEnabled() {
+  return window.matchMedia("(max-width: 900px) and (any-pointer: coarse)").matches;
+}
 
 function transcriptIsAtBottom(transcript, tolerance = 2) {
   if (!(transcript instanceof HTMLElement)) return false;
@@ -4626,6 +4957,10 @@ function touchByIdentifier(touchList, identifier) {
 }
 
 function handleTranscriptTouchStart(event) {
+  if (!mobilePullUpRefreshEnabled()) {
+    pullUpRefreshGesture = null;
+    return;
+  }
   const transcript = event.target instanceof Element ? event.target.closest("[data-transcript]") : null;
   if (!transcript || event.touches.length !== 1 || !transcriptIsAtBottom(transcript)) {
     pullUpRefreshGesture = null;
@@ -4656,24 +4991,6 @@ function handleTranscriptTouchEnd(event) {
   pullUpRefreshGesture = null;
   if (shouldRefresh) reloadCurrentPageFromTranscript();
   else resetPullUpRefreshIndicator();
-}
-
-function handleTranscriptWheel(event) {
-  if (pullUpRefreshReloading || event.ctrlKey) return;
-  const transcript = event.target instanceof Element ? event.target.closest("[data-transcript]") : null;
-  if (!transcript || event.deltaY <= 0 || !transcriptIsAtBottom(transcript)) {
-    wheelRefreshDistance = 0;
-    resetPullUpRefreshIndicator();
-    return;
-  }
-  const now = performance.now();
-  if (now - lastWheelRefreshAt > 400) wheelRefreshDistance = 0;
-  lastWheelRefreshAt = now;
-  wheelRefreshDistance += Math.min(event.deltaY, 60);
-  const progress = wheelRefreshDistance / wheelRefreshThreshold;
-  updatePullUpRefreshIndicator(progress, progress >= 1, progress >= 1 ? "正在刷新…" : "继续向下滚动刷新");
-  if (progress >= 1) reloadCurrentPageFromTranscript();
-  else resetPullUpRefreshIndicator(650);
 }
 
 function nowTime() {
@@ -4752,9 +5069,27 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  const previewMarkdown = target.closest("[data-markdown-preview-url]");
+  if (previewMarkdown && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+    event.preventDefault();
+    openMarkdownPreview(previewMarkdown.dataset.markdownPreviewUrl, previewMarkdown.dataset.markdownPreviewName);
+    return;
+  }
+
+  if (target.matches("[data-markdown-preview-layer]")) {
+    closeMarkdownPreview();
+    return;
+  }
+
   const previewImage = target.closest("[data-preview-url]");
   if (previewImage) {
-    window.open(previewImage.dataset.previewUrl, "_blank", "noopener,noreferrer");
+    event.preventDefault();
+    openImagePreview(previewImage.dataset.previewUrl, previewImage.dataset.previewName || previewImage.getAttribute("alt") || "图片预览");
+    return;
+  }
+
+  if (target.matches("[data-image-preview-layer]")) {
+    closeImagePreview();
     return;
   }
 
@@ -4766,6 +5101,20 @@ async function handleDocumentClick(event) {
   if (target.closest("[data-new-session-sheet]") && !target.closest(".sheet")) {
     closeNewSessionSheet();
     return;
+  }
+
+  if (target.matches("[data-session-filter-layer]")) {
+    state.sessionFilterOpen = false;
+    state.sessionFilterPlacement = null;
+    renderSessionSurfaces();
+    return;
+  }
+
+  if (state.sessionFilterOpen && !target.closest("[data-session-filter-popover], [data-action='toggle-session-filter']")) {
+    state.sessionFilterOpen = false;
+    state.sessionFilterPlacement = null;
+    renderSessionFilterLayer();
+    $$('[data-action="toggle-session-filter"]').forEach((trigger) => trigger.setAttribute("aria-expanded", "false"));
   }
 
   const navButton = target.closest("[data-nav-target]");
@@ -4836,6 +5185,18 @@ async function handleDocumentClick(event) {
 
   if (button.dataset.sessionId) {
     await selectSession(button.dataset.sessionId);
+    return;
+  }
+
+  if (button.dataset.sessionActivityFilter) {
+    state.sessionActivityFilter = button.dataset.sessionActivityFilter;
+    renderSessionSurfaces();
+    return;
+  }
+
+  if (button.dataset.sessionStatusFilter) {
+    state.sessionStatusFilter = button.dataset.sessionStatusFilter;
+    renderSessionSurfaces();
     return;
   }
 
@@ -4950,6 +5311,12 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  if (button.dataset.directoryRoot) {
+    toast(`完整路径：${button.dataset.directoryRoot}`);
+    await openDirectoryPicker(button.dataset.directoryRoot);
+    return;
+  }
+
   if (button.dataset.directoryPath) {
     await openDirectoryPicker(button.dataset.directoryPath);
     return;
@@ -5005,6 +5372,26 @@ async function handleDocumentClick(event) {
       break;
     case "clear-all-sessions":
       await clearAllSessions();
+      break;
+    case "toggle-session-filter": {
+      const placement = button.closest("[data-session-placement]")?.dataset.sessionPlacement || "sidebar";
+      const opening = !state.sessionFilterOpen || state.sessionFilterPlacement !== placement;
+      state.sessionFilterOpen = opening;
+      state.sessionFilterPlacement = opening ? placement : null;
+      renderSessionSurfaces();
+      if (opening) {
+        requestAnimationFrame(() => $(`[data-filter-placement="${placement}"] [data-session-query]`)?.focus());
+      }
+      break;
+    }
+    case "close-session-filter":
+      state.sessionFilterOpen = false;
+      state.sessionFilterPlacement = null;
+      renderSessionSurfaces();
+      break;
+    case "reset-session-filters":
+      resetSessionFilters();
+      renderSessionSurfaces();
       break;
     case "pick-new-directory":
       state.newSessionSheetOpen = false;
@@ -5115,6 +5502,12 @@ async function handleDocumentClick(event) {
     case "close-video-preview":
       closeVideoPreview();
       break;
+    case "close-image-preview":
+      closeImagePreview();
+      break;
+    case "close-markdown-preview":
+      closeMarkdownPreview();
+      break;
     default:
       break;
   }
@@ -5148,6 +5541,15 @@ async function handleDocumentSubmit(event) {
 
 function handleDocumentInput(event) {
   const target = event.target;
+  if (target.matches("[data-session-query]")) {
+    const placement = target.closest("[data-filter-placement]")?.dataset.filterPlacement || state.sessionFilterPlacement;
+    state.sessionQuery = target.value;
+    renderSessionSurfaces();
+    const queryInput = $(`[data-filter-placement="${placement}"] [data-session-query]`);
+    queryInput?.focus();
+    queryInput?.setSelectionRange(queryInput.value.length, queryInput.value.length);
+    return;
+  }
   if (target instanceof HTMLTextAreaElement && target.name === "prompt") {
     const form = target.closest("[data-session-key]");
     if (form) savePromptDraft(form.dataset.sessionKey, target.value);
@@ -5305,6 +5707,7 @@ document.addEventListener("submit", (event) => {
   handleDocumentSubmit(event).catch(reportClientError);
 });
 document.addEventListener("input", handleDocumentInput);
+document.addEventListener("paste", handleDocumentPaste);
 document.addEventListener("focusin", syncMobileViewport);
 document.addEventListener("focusout", () => requestAnimationFrame(syncMobileViewport));
 document.addEventListener("change", (event) => {
@@ -5337,9 +5740,16 @@ document.addEventListener("touchcancel", () => {
   pullUpRefreshGesture = null;
   resetPullUpRefreshIndicator();
 }, { passive: true });
-document.addEventListener("wheel", handleTranscriptWheel, { passive: true });
 document.addEventListener("keydown", (event) => {
   const target = event.target instanceof Element ? event.target : null;
+  if (event.key === "Escape" && state.sessionFilterOpen) {
+    const placement = state.sessionFilterPlacement;
+    state.sessionFilterOpen = false;
+    state.sessionFilterPlacement = null;
+    renderSessionSurfaces();
+    requestAnimationFrame(() => $(`[data-session-placement="${placement}"] [data-action="toggle-session-filter"]`)?.focus());
+    return;
+  }
   if (event.key === "Escape") {
     const fullscreenShell = $(".prompt-shell.prompt-fullscreen");
     if (fullscreenShell) {
@@ -5352,9 +5762,17 @@ document.addEventListener("keydown", (event) => {
     closeVideoPreview();
     return;
   }
+  if (event.key === "Escape" && !$("[data-markdown-preview-layer]")?.hidden) {
+    closeMarkdownPreview();
+    return;
+  }
+  if (event.key === "Escape" && !$("[data-image-preview-layer]")?.hidden) {
+    closeImagePreview();
+    return;
+  }
   if (target?.matches("[data-preview-url]") && (event.key === "Enter" || event.key === " ")) {
     event.preventDefault();
-    window.open(target.dataset.previewUrl, "_blank", "noopener,noreferrer");
+    openImagePreview(target.dataset.previewUrl, target.dataset.previewName || target.getAttribute("alt") || "图片预览");
     return;
   }
   const composer = target?.closest("[data-composer], [data-new-session-form]");
@@ -5381,8 +5799,10 @@ document.addEventListener("keydown", (event) => {
     toggleSidebar();
   }
 });
+window.addEventListener("message", handlePreviewMessage);
 window.addEventListener("resize", () => {
   syncMobileViewport();
+  syncNavigationToggleLabel();
   $$('textarea[name="prompt"]').forEach(resizePromptTextarea);
   fitTerminal();
 });
