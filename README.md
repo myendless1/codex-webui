@@ -6,7 +6,7 @@
 
 一个面向本机 Codex CLI 的浏览器工作台。它把真实 Codex 会话、审批、终端和文件交互放进统一的响应式界面，让本地 agent 工作流在桌面与移动设备上都清晰、可控。
 
-![Codex WebUI 桌面端深色界面](docs/images/desktop-dark.png)
+![Codex WebUI 桌面端与移动端深色界面](docs/images/responsive-overview.png)
 
 ## 项目理念
 

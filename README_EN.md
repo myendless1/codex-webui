@@ -6,7 +6,7 @@
 
 A browser workbench for the local Codex CLI. It brings real Codex sessions, approvals, terminals, and file interaction into one responsive interface, keeping local agent workflows clear and controllable on desktop and mobile.
 
-![Codex WebUI desktop interface in dark mode](docs/images/desktop-dark.png)
+![Codex WebUI responsive desktop and mobile interfaces in dark mode](docs/images/responsive-overview.png)
 
 ## Philosophy
 
