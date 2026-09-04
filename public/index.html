@@ -15,6 +15,8 @@
           document.documentElement.classList.add("theme-dark");
           document.querySelector('meta[name="theme-color"]').content = "#181817";
         }
+        const fontSizeOffset = Number.parseInt(localStorage.getItem("codex-webui:font-size-offset") || "0", 10);
+        document.documentElement.style.setProperty("--font-size-offset", `${Math.min(5, Math.max(-3, fontSizeOffset || 0))}px`);
       } catch {}
     </script>
     <title>Codex WebUI</title>
@@ -51,6 +53,7 @@
             <p class="eyebrow" data-active-kicker>Workspace</p>
           </div>
           <div class="topbar-actions">
+            <button class="button icon ghost topbar-note-toggle" type="button" data-action="toggle-workspace-note" data-keep-enabled="true" aria-label="打开工作区笔记" title="工作区笔记"></button>
             <button class="button icon ghost topbar-browser-fullscreen" type="button" data-action="toggle-browser-fullscreen" aria-label="进入浏览器全屏" title="进入浏览器全屏"></button>
             <button class="button icon ghost topbar-terminal-toggle" type="button" data-action="toggle-terminal" aria-label="打开终端" title="打开终端" hidden></button>
             <button class="button icon ghost topbar-new-session" type="button" data-action="open-new-session-sheet" aria-label="新建对话" title="新建对话">+</button>
@@ -68,12 +71,31 @@
     <div class="session-drawer-backdrop" data-session-drawer-backdrop hidden></div>
     <aside class="session-drawer" data-session-drawer aria-label="会话列表" aria-hidden="true"></aside>
     <div class="session-filter-layer" data-session-filter-layer hidden></div>
+    <div class="archived-session-layer" data-archived-session-layer hidden></div>
     <div class="sheet-backdrop" data-new-session-sheet hidden></div>
     <nav class="mobile-nav" data-mobile-nav aria-label="移动端导航"></nav>
     <div class="approval-dialog-layer" data-approval-dialog hidden></div>
     <div class="image-preview-layer" data-image-preview-layer hidden></div>
     <div class="video-preview-layer" data-video-preview-layer hidden></div>
     <div class="markdown-preview-layer" data-markdown-preview-layer hidden></div>
+    <aside class="workspace-note" data-workspace-note aria-label="工作区共享笔记" aria-hidden="true" hidden>
+      <header class="workspace-note-header" data-workspace-note-drag-handle>
+        <div class="workspace-note-title">
+          <span class="workspace-note-mark" aria-hidden="true"></span>
+          <strong>工作区笔记</strong>
+          <span class="workspace-note-status" data-workspace-note-status role="status" aria-live="polite">正在连接…</span>
+        </div>
+        <div class="workspace-note-actions">
+          <button type="button" data-action="toggle-workspace-note-fullscreen" data-keep-enabled="true" aria-label="全屏显示笔记" title="全屏显示笔记"></button>
+          <button type="button" data-action="close-workspace-note" data-keep-enabled="true" aria-label="关闭笔记" title="关闭笔记">×</button>
+        </div>
+      </header>
+      <textarea class="workspace-note-editor" data-workspace-note-editor data-keep-enabled="true" maxlength="524288" placeholder="记录想法…内容会自动保存，并在此工作区的设备间同步。" aria-label="工作区共享笔记内容"></textarea>
+      <footer class="workspace-note-footer">
+        <span data-workspace-note-scope>自动保存 · 工作区共享</span>
+        <span data-workspace-note-count>0 字</span>
+      </footer>
+    </aside>
     <div class="toast-zone" data-toasts aria-live="polite"></div>
     <script src="/app.js" type="module"></script>
   </body>

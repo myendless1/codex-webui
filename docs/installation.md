@@ -52,6 +52,29 @@ npm start
 | `CODEX_WEBUI_USER` | `codex` | HTTP Basic Auth 用户名 |
 | `CODEX_WEBUI_PASSWORD` | 空 | HTTP Basic Auth 密码 |
 | `ENABLE_TERMINAL` | `1` | 设为 `0` 可关闭内置终端 |
+| `CODEX_WEBUI_TUNNEL_PORTS` | 空 | 允许 WebSocket 隧道访问的本机 TCP 端口，以逗号分隔 |
+
+## WebSocket TCP 隧道
+
+服务端只会转发到显式允许的本机回环端口。比如开放服务端的 `127.0.0.1:8765`：
+
+```bash
+HOST=0.0.0.0 \
+CODEX_WEBUI_PASSWORD='请换成高强度密码' \
+CODEX_WEBUI_TUNNEL_PORTS=8765 \
+npm start
+```
+
+在远程客户端运行以下命令，即可把服务端的 8765 映射到客户端的 `127.0.0.1:8765`：
+
+```bash
+CODEX_WEBUI_PASSWORD='与服务端相同的密码' \
+node tunnel-client.js \
+  --server https://服务器地址:8787 \
+  --remote-port 8765
+```
+
+之后访问客户端的 `http://127.0.0.1:8765`。公网部署必须使用 HTTPS/WSS；客户端默认只监听回环地址。若 8765 已被客户端占用，可追加 `--local-port 18765`。
 
 ## 工作目录范围
 

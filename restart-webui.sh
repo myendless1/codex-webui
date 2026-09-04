@@ -112,6 +112,33 @@ if [[ ! "$restart_delay" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
 fi
 
 existing_supervisor="$(cat "$pid_file" 2>/dev/null || true)"
+
+# Recover from older/broken launches where more than one supervisor exists and
+# the pid file points at a retry loop instead of the supervisor that owns the
+# listening WebUI child. Restart the actual owner and retire the duplicates.
+active_supervisor=""
+mapfile -t project_server_pids < <(pgrep -f "^${node_bin//\//\\/} ${project_dir//\//\\/}/server\.js$" 2>/dev/null || true)
+for server_pid in "${project_server_pids[@]}"; do
+  candidate_parent="$(ps -o ppid= -p "$server_pid" 2>/dev/null | tr -d ' ')"
+  if supervisor_is_running "$candidate_parent"; then
+    active_supervisor="$candidate_parent"
+    break
+  fi
+done
+
+if [[ -n "$active_supervisor" ]]; then
+  mapfile -t project_supervisors < <(pgrep -f "${script_path//\//\\/} --supervise$" 2>/dev/null || true)
+  for supervisor_pid in "${project_supervisors[@]}"; do
+    if [[ "$supervisor_pid" != "$active_supervisor" ]] && supervisor_is_running "$supervisor_pid"; then
+      kill -TERM "$supervisor_pid" 2>/dev/null || true
+    fi
+  done
+  printf '%s\n' "$active_supervisor" >"$pid_file"
+  kill -USR1 "$active_supervisor"
+  echo "已清理重复守护进程，并请求实际 WebUI 服务重启（supervisor PID $active_supervisor），日志：$log_file"
+  exit 0
+fi
+
 if supervisor_is_running "$existing_supervisor"; then
   kill -USR1 "$existing_supervisor"
   echo "已请求 WebUI 守护进程重启服务（supervisor PID $existing_supervisor），日志：$log_file"

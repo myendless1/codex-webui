@@ -1,5 +1,6 @@
 import { marked } from "/vendor/marked/lib/marked.esm.js";
 import DOMPurify from "/vendor/dompurify/dist/purify.es.mjs";
+import { decorateMath, extractMarkdownMath } from "/math-render.js";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -27,6 +28,14 @@ function applyTheme() {
   }
   document.documentElement.classList.toggle("theme-dark", dark);
   document.querySelector('meta[name="theme-color"]').content = dark ? "#181817" : "#ffffff";
+}
+
+function applyFontSize() {
+  let offset = 0;
+  try {
+    offset = Number.parseInt(localStorage.getItem("codex-webui:font-size-offset") || "0", 10) || 0;
+  } catch {}
+  document.documentElement.style.setProperty("--font-size-offset", `${Math.min(5, Math.max(-3, offset))}px`);
 }
 
 function resolvedLocalPath(reference) {
@@ -94,6 +103,7 @@ function scrollToSourceLocation(markdown) {
 
 async function render() {
   applyTheme();
+  applyFontSize();
   const name = sourcePath.split("/").at(-1) || "Markdown 预览";
   const locationLabel = sourceLine ? `:${sourceLine}${sourceColumn ? `:${sourceColumn}` : ""}` : "";
   document.title = `${name} · Markdown 预览`;
@@ -113,8 +123,10 @@ async function render() {
       throw new Error(message);
     }
     const markdown = await response.text();
-    const html = marked.parse(markdown);
+    const prepared = extractMarkdownMath(markdown);
+    const html = marked.parse(prepared.markdown);
     content.innerHTML = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
+    decorateMath(content, prepared.formulas);
     decorateLocalReferences(content);
     scrollToSourceLocation(markdown);
   } catch (error) {
@@ -122,5 +134,17 @@ async function render() {
     content.textContent = error?.message || "Markdown 文件载入失败。";
   }
 }
+
+content.addEventListener("click", async (event) => {
+  const button = event.target.closest('[data-action="copy-math"]');
+  if (!button) return;
+  try {
+    await navigator.clipboard.writeText(button.dataset.mathSource || "");
+    button.textContent = "已复制";
+    setTimeout(() => { button.textContent = "复制源码"; }, 1400);
+  } catch {
+    button.textContent = "复制失败";
+  }
+});
 
 render();

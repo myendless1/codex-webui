@@ -1,5 +1,6 @@
 :root {
   color-scheme: light;
+  --font-size-offset: 0px;
   --ink: #18181b;
   --muted: #71717a;
   --line: #e4e4e7;
@@ -8,6 +9,7 @@
   --surface-alt: #f7f7f8;
   --mono: "JetBrains Mono", "SFMono-Regular", "Cascadia Mono", Consolas, monospace;
   --sans: "Aptos", "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-size: calc(16px + var(--font-size-offset));
   background: var(--surface);
 }
 
@@ -53,14 +55,16 @@ body {
   margin-top: 3px;
   overflow: hidden;
   color: var(--muted);
-  font: 12px/1.3 var(--mono);
+  font-family: var(--mono);
+  font-size: calc(12px + var(--font-size-offset, 0px));
+  line-height: 1.3;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 .markdown-preview-header a {
   flex: 0 0 auto;
   color: var(--ink);
-  font-size: 13px;
+  font-size: calc(13px + var(--font-size-offset, 0px));
   text-underline-offset: 3px;
 }
 
@@ -71,7 +75,7 @@ body {
 }
 
 .markdown-body {
-  font-size: 16px;
+  font-size: calc(16px + var(--font-size-offset, 0px));
   line-height: 1.72;
   overflow-wrap: break-word;
 }
@@ -114,7 +118,7 @@ body {
   border: 1px solid var(--line);
   border-radius: 8px;
 }
-.markdown-body pre code { padding: 0; font-size: 13px; line-height: 1.55; background: transparent; border: 0; }
+.markdown-body pre code { padding: 0; font-size: calc(13px + var(--font-size-offset, 0px)); line-height: 1.55; background: transparent; border: 0; }
 .markdown-body blockquote { padding-left: 15px; color: var(--muted); border-left: 3px solid var(--line-strong); }
 .markdown-body table { display: block; max-width: 100%; overflow: auto; border-collapse: collapse; }
 .markdown-body th,
@@ -124,6 +128,47 @@ body {
 .theme-dark .markdown-body a { color: #93c5fd; }
 .markdown-body hr { margin: 24px 0; border: 0; border-top: 1px solid var(--line); }
 .markdown-body img { max-width: 100%; height: auto; border-radius: 8px; }
+.math-inline,
+.math-formula { font-family: "STIX Two Math", "Cambria Math", "Times New Roman", serif; }
+.math-inline { display: inline-flex; align-items: baseline; padding: 0 0.12em; white-space: nowrap; }
+.math-block {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 70px;
+  margin: 20px 0;
+  padding: 18px 96px 18px 24px;
+  overflow-x: auto;
+  background: var(--surface-alt);
+  border: 1px solid var(--line);
+  border-radius: 9px;
+}
+.math-block .math-formula { display: inline-flex; align-items: center; gap: 0.2em; min-width: max-content; font-size: calc(20px + var(--font-size-offset, 0px)); line-height: 1.5; }
+.math-roman { font-family: var(--sans); font-size: 0.9em; font-style: normal; }
+.math-symbol { padding: 0 0.14em; font-size: 1.12em; }
+.math-space { min-width: 0.22em; }
+.math-unknown { color: var(--muted); font-family: var(--mono); font-size: 0.8em; }
+.math-formula sub,
+.math-formula sup { font-size: 0.68em; line-height: 0; }
+.math-overset { display: inline-flex; flex-direction: column; align-items: center; vertical-align: middle; line-height: 1; }
+.math-over { min-height: 1em; font-size: 0.58em; line-height: 1; }
+.math-over-base { font-size: 1em; line-height: 0.8; }
+.math-copy-button {
+  position: absolute;
+  top: 9px;
+  right: 9px;
+  min-height: 28px;
+  padding: 4px 9px;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  font-size: calc(12px + var(--font-size-offset, 0px));
+  cursor: pointer;
+}
+.math-copy-button:hover { color: var(--ink); border-color: var(--line-strong); }
 .markdown-preview-error { padding: 16px; color: #b42318; background: #fff1f0; border: 1px solid #f0b8b3; border-radius: 8px; }
 .theme-dark .markdown-preview-error { color: #ffb4ab; background: #351817; border-color: #743631; }
 
@@ -131,5 +176,5 @@ body {
   .markdown-preview-header { padding: 10px 16px; }
   .markdown-preview-header span { max-width: 68vw; }
   .markdown-preview-shell { width: min(100% - 28px, 920px); padding: 28px 0 56px; }
-  .markdown-body { font-size: 15px; }
+  .markdown-body { font-size: calc(15px + var(--font-size-offset, 0px)); }
 }

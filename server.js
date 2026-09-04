@@ -8,6 +8,7 @@ import path from "node:path";
 import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
+import { createConnection } from "node:net";
 import { WebSocketServer } from "ws";
 import pty from "node-pty";
 
@@ -16,13 +17,22 @@ const publicDir = path.join(__dirname, "public");
 const nodeModulesDir = path.join(__dirname, "node_modules");
 const dataDir = process.env.CODEX_WEBUI_DATA_DIR || path.join(os.homedir(), ".codex-webui");
 const stateFile = path.join(dataDir, "webui-state.json");
+const workspaceNotesFile = path.join(dataDir, "workspace-notes.json");
+const recentWorkspacesFile = path.join(dataDir, "recent-workspaces.json");
 const uploadDir = path.join(dataDir, "uploads");
 const sessionFilesDir = path.join(dataDir, "sessions");
 const actionLogFile = path.join(dataDir, "action-events.jsonl");
 const codexHome = process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
 const codexSessionsDir = path.join(codexHome, "sessions");
+const codexArchivedSessionsDir = path.join(codexHome, "archived_sessions");
 const codexBin = process.env.CODEX_BIN || "codex";
 const terminalEnabled = process.env.ENABLE_TERMINAL !== "0";
+const tunnelPorts = new Set(
+  String(process.env.CODEX_WEBUI_TUNNEL_PORTS || "")
+    .split(",")
+    .map((value) => Number(value.trim()))
+    .filter((value) => Number.isInteger(value) && value >= 1 && value <= 65535)
+);
 const host = process.env.HOST || "127.0.0.1";
 const port = Number(process.env.PORT || 8787);
 const accessUser = process.env.CODEX_WEBUI_USER || "codex";
@@ -39,7 +49,10 @@ const configuredMaxUploadMb = Number(process.env.CODEX_WEBUI_MAX_UPLOAD_MB || 64
 const maxUploadBytes = Math.round(
   (Number.isFinite(configuredMaxUploadMb) && configuredMaxUploadMb > 0 ? configuredMaxUploadMb : 64) * 1024 * 1024
 );
+const maxVisualizationBytes = 1024 * 1024;
 let actionLogWrite = Promise.resolve();
+let workspaceNoteWrite = Promise.resolve();
+let recentWorkspacesWrite = Promise.resolve();
 const recentActionEventIds = new Set();
 
 const mimeTypes = new Map([
@@ -94,6 +107,8 @@ const defaultState = {
   hostSettings: {},
   filePreview: defaultFilePreviewSettings
 };
+
+const defaultWorkspaceNote = { content: "", revision: 0, updatedAt: null };
 
 function sendJson(res, status, payload) {
   const body = JSON.stringify(payload);
@@ -165,6 +180,8 @@ function publicCodexRun(run) {
     id: run.id,
     sessionKey: run.sessionKey,
     threadId: run.threadId,
+    turnId: run.turnId || null,
+    replacesTurnId: run.replacesTurnId || null,
     status: run.status,
     approval: run.approval,
     cwd: run.cwd,
@@ -416,7 +433,9 @@ async function checkWorkingDirectory(req, res) {
   if (!(await directoryExists(directoryPath))) {
     return sendError(res, 404, `Working directory does not exist: ${directoryPath}`);
   }
-  sendJson(res, 200, { path: directoryPath, exists: true });
+  const workspace = await resolveWorkspacePath(directoryPath);
+  await rememberWorkspace(workspace);
+  sendJson(res, 200, { path: workspace, exists: true });
 }
 
 async function listDirectories(req, res) {
@@ -561,6 +580,125 @@ async function previewWorkspaceFile(req, res) {
   res.writeHead(range ? 206 : 200, headers);
   if (req.method === "HEAD") return res.end();
   createReadStream(cachedPath, { start, end }).pipe(res);
+}
+
+function visualizationHostStyle(theme) {
+  const dark = theme === "dark";
+  return `<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="${dark ? "dark" : "light"}">
+<style data-codex-visualization-host>
+:root {
+  color-scheme: ${dark ? "dark" : "light"};
+  --background: ${dark ? "rgb(24 24 24)" : "rgb(255 255 255)"};
+  --foreground: ${dark ? "rgb(255 255 255)" : "rgb(26 28 31)"};
+  --card: color-mix(in oklab, var(--foreground) 5%, var(--background));
+  --card-foreground: var(--foreground);
+  --popover: ${dark ? "rgb(45 45 45)" : "rgb(255 255 255)"};
+  --popover-foreground: var(--foreground);
+  --primary: ${dark ? "rgb(131 195 255)" : "rgb(51 156 255)"};
+  --primary-foreground: ${dark ? "rgb(13 13 13)" : "rgb(255 255 255)"};
+  --secondary: ${dark ? "rgb(54 54 54 / 96%)" : "rgb(255 255 255 / 96%)"};
+  --secondary-foreground: var(--foreground);
+  --muted: color-mix(in srgb, var(--foreground) 10%, transparent);
+  --muted-foreground: color-mix(in srgb, var(--foreground) 50%, transparent);
+  --accent: ${dark ? "rgb(13 39 63)" : "rgb(229 242 255)"};
+  --accent-foreground: var(--primary);
+  --destructive: ${dark ? "rgb(255 133 73)" : "rgb(226 85 7)"};
+  --border: color-mix(in srgb, var(--foreground) 10%, transparent);
+  --input: color-mix(in srgb, var(--foreground) 14%, transparent);
+  --ring: var(--primary);
+  --viz-series-1: var(--primary);
+  --viz-series-2: ${dark ? "rgb(245 154 86)" : "rgb(243 136 59)"};
+  --viz-series-3: ${dark ? "rgb(116 213 139)" : "rgb(93 201 119)"};
+  --viz-series-4: ${dark ? "rgb(240 143 192)" : "rgb(235 119 177)"};
+  --viz-series-5: ${dark ? "rgb(170 145 239)" : "rgb(155 121 236)"};
+  --viz-series-6: ${dark ? "rgb(90 203 194)" : "rgb(58 185 177)"};
+  background: transparent;
+}
+* { box-sizing: border-box; }
+html, body { min-width: 0; margin: 0; color: var(--foreground); background: transparent; }
+body { padding: 5px; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+</style>`;
+}
+
+const visualizationHostScript = `<script data-codex-visualization-host>
+(() => {
+  const reportSize = () => {
+    const height = Math.max(document.documentElement.scrollHeight, document.body?.scrollHeight || 0);
+    window.parent.postMessage({ type: "codex-webui:visualization-resize", height }, "*");
+  };
+  new ResizeObserver(reportSize).observe(document.documentElement);
+  window.addEventListener("load", reportSize);
+  requestAnimationFrame(reportSize);
+})();
+</script>`;
+
+function wrapVisualizationHtml(source, theme = "light") {
+  const hostStyle = visualizationHostStyle(theme);
+  if (/<html\b/i.test(source)) {
+    let html = source;
+    html = /<\/head\s*>/i.test(html)
+      ? html.replace(/<\/head\s*>/i, `${hostStyle}</head>`)
+      : html.replace(/<html\b[^>]*>/i, (tag) => `${tag}<head>${hostStyle}</head>`);
+    return /<\/body\s*>/i.test(html)
+      ? html.replace(/<\/body\s*>/i, `${visualizationHostScript}</body>`)
+      : `${html}${visualizationHostScript}`;
+  }
+  return `<!doctype html><html data-theme="${theme}"><head><meta charset="utf-8">${hostStyle}</head><body>${source}${visualizationHostScript}</body></html>`;
+}
+
+async function previewVisualization(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const requestedPath = String(url.searchParams.get("path") || "");
+  const requestedCwd = String(url.searchParams.get("cwd") || "");
+  const sessionId = normalizeSessionStorageId(url.searchParams.get("sessionId"));
+  const theme = url.searchParams.get("theme") === "dark" ? "dark" : "light";
+  if (!requestedPath) return sendError(res, 400, "Visualization path is required.");
+  if (!sessionId) return sendError(res, 400, "A valid session id is required for visualizations.");
+
+  const requestedFile = path.resolve(requestedCwd ? path.resolve(requestedCwd) : process.cwd(), requestedPath);
+  if (![".html", ".htm"].includes(path.extname(requestedFile).toLowerCase())) {
+    return sendError(res, 415, "Only HTML visualizations are supported.");
+  }
+
+  const archiveDir = path.join(sessionFilesDir, sessionId, "visualizations");
+  const archiveKey = createHash("sha256").update(requestedFile).digest("hex").slice(0, 32);
+  const archivedPath = path.join(archiveDir, `${archiveKey}.html`);
+  let sourcePath = archivedPath;
+  try {
+    const realFilePath = await fs.realpath(requestedFile);
+    const stat = await fs.stat(realFilePath);
+    if (!stat.isFile() || stat.size > maxVisualizationBytes) {
+      return sendError(res, 413, "Visualization must be an HTML file smaller than 1 MB.");
+    }
+    await fs.mkdir(archiveDir, { recursive: true });
+    await fs.copyFile(realFilePath, archivedPath);
+  } catch {
+    if (!existsSync(archivedPath)) return sendError(res, 404, "Visualization file was not found.");
+  }
+
+  const source = await fs.readFile(sourcePath, "utf8");
+  const body = wrapVisualizationHtml(source, theme);
+  res.writeHead(200, {
+    "content-type": "text/html; charset=utf-8",
+    "content-length": Buffer.byteLength(body),
+    "cache-control": "private, no-store",
+    "x-content-type-options": "nosniff",
+    "content-security-policy": [
+      "default-src 'none'",
+      "script-src 'unsafe-inline' https://cdnjs.cloudflare.com https://esm.sh https://cdn.jsdelivr.net https://unpkg.com",
+      "style-src 'unsafe-inline' https://fonts.googleapis.com https://fonts.bunny.net",
+      "font-src data: https://fonts.gstatic.com https://fonts.bunny.net",
+      "img-src data: blob: https:",
+      "media-src data: blob: https:",
+      "connect-src 'none'",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "sandbox allow-scripts"
+    ].join("; ")
+  });
+  if (req.method === "HEAD") return res.end();
+  res.end(body);
 }
 
 async function listModels(res) {
@@ -897,6 +1035,126 @@ async function loadState() {
 async function saveState(state) {
   await fs.mkdir(dataDir, { recursive: true });
   await fs.writeFile(stateFile, JSON.stringify(normalizeWebuiState(state), null, 2));
+}
+
+function normalizeWorkspaceNote(value) {
+  return {
+    content: typeof value?.content === "string" ? value.content.slice(0, 524288) : "",
+    revision: Math.max(0, Number.isSafeInteger(value?.revision) ? value.revision : 0),
+    updatedAt: typeof value?.updatedAt === "string" ? value.updatedAt : null
+  };
+}
+
+async function resolveWorkspacePath(value) {
+  const requested = typeof value === "string" ? value.trim() : "";
+  if (!requested) {
+    const error = new Error("Workspace path is required.");
+    error.statusCode = 400;
+    throw error;
+  }
+  const resolved = path.resolve(requested);
+  if (!(await directoryExists(resolved))) {
+    const error = new Error(`Working directory does not exist: ${resolved}`);
+    error.statusCode = 404;
+    throw error;
+  }
+  try {
+    return await fs.realpath(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+async function loadWorkspaceNotes() {
+  await fs.mkdir(dataDir, { recursive: true });
+  if (!existsSync(workspaceNotesFile)) return {};
+  try {
+    const stored = JSON.parse(await fs.readFile(workspaceNotesFile, "utf8"));
+    const source = stored?.notes && typeof stored.notes === "object" && !Array.isArray(stored.notes) ? stored.notes : {};
+    return Object.fromEntries(Object.entries(source).map(([workspace, note]) => [workspace, normalizeWorkspaceNote(note)]));
+  } catch (error) {
+    if (error?.code === "ENOENT") return {};
+    throw error;
+  }
+}
+
+async function loadRecentWorkspaces() {
+  if (!existsSync(recentWorkspacesFile)) return [];
+  try {
+    const stored = JSON.parse(await fs.readFile(recentWorkspacesFile, "utf8"));
+    return asArray(stored?.workspaces).filter((entry) => typeof entry === "string" && entry).slice(0, 100);
+  } catch (error) {
+    if (error?.code === "ENOENT") return [];
+    throw error;
+  }
+}
+
+async function rememberWorkspace(workspace) {
+  const write = async () => {
+    const current = await loadRecentWorkspaces();
+    const workspaces = [workspace, ...current.filter((entry) => entry !== workspace)].slice(0, 100);
+    await fs.mkdir(dataDir, { recursive: true });
+    const temporaryFile = `${recentWorkspacesFile}.${process.pid}.tmp`;
+    await fs.writeFile(temporaryFile, JSON.stringify({ workspaces }, null, 2));
+    await fs.rename(temporaryFile, recentWorkspacesFile);
+    return workspaces;
+  };
+  recentWorkspacesWrite = recentWorkspacesWrite.then(write, write);
+  return recentWorkspacesWrite;
+}
+
+function broadcastWorkspaceNote(workspace, note, clientId = null) {
+  const message = JSON.stringify({ type: "workspace-note", workspace, note, clientId });
+  for (const client of workspaceNoteWss.clients) {
+    if (client.workspace === workspace && client.readyState === client.OPEN) client.send(message);
+  }
+}
+
+async function getWorkspaceNote(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const workspace = await resolveWorkspacePath(url.searchParams.get("workspace"));
+  const notes = await loadWorkspaceNotes();
+  await rememberWorkspace(workspace);
+  sendJson(res, 200, { workspace, note: notes[workspace] || { ...defaultWorkspaceNote } });
+}
+
+async function updateWorkspaceNote(req, res) {
+  const body = await readBody(req, 2 * 1024 * 1024);
+  if (typeof body.content !== "string") return sendError(res, 400, "Note content must be a string.");
+  if (body.content.length > 524288) return sendError(res, 413, "Note content is too large.");
+  const workspace = await resolveWorkspacePath(body.workspace);
+  const clientId = typeof body.clientId === "string" ? body.clientId.slice(0, 128) : null;
+  const write = async () => {
+    const notes = await loadWorkspaceNotes();
+    const previous = notes[workspace] || defaultWorkspaceNote;
+    const note = {
+      content: body.content,
+      revision: previous.revision + 1,
+      updatedAt: new Date().toISOString()
+    };
+    notes[workspace] = note;
+    await fs.mkdir(dataDir, { recursive: true });
+    const temporaryFile = `${workspaceNotesFile}.${process.pid}.tmp`;
+    await fs.writeFile(temporaryFile, JSON.stringify({ version: 1, notes }, null, 2));
+    await fs.rename(temporaryFile, workspaceNotesFile);
+    broadcastWorkspaceNote(workspace, note, clientId);
+    return note;
+  };
+  workspaceNoteWrite = workspaceNoteWrite.then(write, write);
+  const note = await workspaceNoteWrite;
+  await rememberWorkspace(workspace);
+  sendJson(res, 200, { ok: true, workspace, note });
+}
+
+async function listRecentWorkspaces(res) {
+  const recent = await loadRecentWorkspaces();
+  const notes = await loadWorkspaceNotes();
+  const candidates = [...recent, ...Object.keys(notes).filter((entry) => !recent.includes(entry))];
+  const workspaces = [];
+  for (const workspace of candidates) {
+    if (await directoryExists(workspace)) workspaces.push(workspace);
+  }
+  sendJson(res, 200, { workspaces });
 }
 
 function normalizeWebuiState(state) {
@@ -1261,7 +1519,7 @@ function isInternalCodexAssessment(text) {
     && value.includes(">>> APPROVAL REQUEST START");
 }
 
-function appendCodexMessage(messages, role, content, timestamp) {
+function appendCodexMessage(messages, role, content, timestamp, turnId = null) {
   const extracted = extractMessageContent(content);
   let text = extracted.text;
   if (role === "user") {
@@ -1271,20 +1529,55 @@ function appendCodexMessage(messages, role, content, timestamp) {
     return;
   }
   const last = messages.at(-1);
-  if (last?.role === role) {
+  if (last?.role === role && (!turnId || !last.turnId || last.turnId === turnId)) {
     const mergedAttachments = [...asArray(last.attachments), ...extracted.attachments]
       .filter((attachment, index, items) => items.findIndex((item) => attachmentIdentity(item) === attachmentIdentity(attachment)) === index);
     if (!text || isRepeatedMessageSegment(last.content, text)) {
       if (mergedAttachments.length) last.attachments = mergedAttachments;
       last.timestamp = timestamp || last.timestamp;
+      last.turnId = last.turnId || turnId || undefined;
       return;
     }
     last.content = last.content ? `${last.content}\n\n${text}` : text;
     if (mergedAttachments.length) last.attachments = mergedAttachments;
     last.timestamp = timestamp || last.timestamp;
+    last.turnId = last.turnId || turnId || undefined;
     return;
   }
-  messages.push({ role, content: text, timestamp, ...(extracted.attachments.length ? { attachments: extracted.attachments } : {}) });
+  messages.push({
+    role,
+    content: text,
+    timestamp,
+    ...(turnId ? { turnId } : {}),
+    ...(extracted.attachments.length ? { attachments: extracted.attachments } : {})
+  });
+}
+
+function rollbackParsedTurns(summary, count) {
+  const numTurns = Math.max(0, Number(count) || 0);
+  if (!numTurns || !summary.messages.length) return;
+
+  const turnIds = [];
+  for (const message of summary.messages) {
+    if (message.turnId && !turnIds.includes(message.turnId)) turnIds.push(message.turnId);
+  }
+  if (turnIds.length) {
+    const removedTurnIds = new Set(turnIds.slice(-numTurns));
+    summary.messages = summary.messages.filter((message) => !removedTurnIds.has(message.turnId));
+  } else {
+    let firstRemovedIndex = summary.messages.length;
+    let remaining = numTurns;
+    for (let index = summary.messages.length - 1; index >= 0 && remaining > 0; index -= 1) {
+      if (summary.messages[index].role !== "user") continue;
+      firstRemovedIndex = index;
+      remaining -= 1;
+    }
+    summary.messages.splice(firstRemovedIndex);
+  }
+  summary.currentTurnId = summary.messages.findLast((message) => message.turnId)?.turnId || null;
+  summary.titleHints = summary.messages
+    .filter((message) => message.role === "user")
+    .map((message) => message.content);
 }
 
 function applyRolloutLine(summary, line) {
@@ -1317,6 +1610,7 @@ function applyRolloutLine(summary, line) {
   if (entry.type === "turn_context") {
     summary.cwd = payload.cwd || summary.cwd;
     summary.model = payload.model || summary.model;
+    summary.currentTurnId = payload.turn_id || summary.currentTurnId;
     return;
   }
 
@@ -1333,12 +1627,34 @@ function applyRolloutLine(summary, line) {
           summary.titleHints.push(normalized);
         }
       }
-      appendCodexMessage(summary.messages, payload.role === "assistant" ? "assistant" : payload.role, payload.content, timestamp);
+      const turnId = payload.internal_chat_message_metadata_passthrough?.turn_id || summary.currentTurnId;
+      appendCodexMessage(summary.messages, payload.role === "assistant" ? "assistant" : payload.role, payload.content, timestamp, turnId);
     }
     return;
   }
 
   if (entry.type === "event_msg") {
+    if (payload.type === "thread_rolled_back") {
+      rollbackParsedTurns(summary, payload.num_turns);
+      return;
+    }
+    if (payload.type === "turn_aborted") {
+      const turnId = payload.turn_id || summary.currentTurnId;
+      let matched = false;
+      for (const message of summary.messages) {
+        if (turnId && message.turnId === turnId) {
+          message.interrupted = true;
+          matched = true;
+        }
+      }
+      if (!matched) {
+        const latestUserIndex = summary.messages.findLastIndex((message) => message.role === "user");
+        for (let index = latestUserIndex; index >= 0 && index < summary.messages.length; index += 1) {
+          summary.messages[index].interrupted = true;
+        }
+      }
+      return;
+    }
     if (payload.type === "user_message") {
       const raw = extractMessageContent(payload.message).text;
       if (isInternalCodexAssessment(raw)) {
@@ -1349,10 +1665,10 @@ function applyRolloutLine(summary, line) {
       if (normalized) {
         summary.titleHints.push(normalized);
       }
-      appendCodexMessage(summary.messages, "user", payload.message, timestamp);
+      appendCodexMessage(summary.messages, "user", payload.message, timestamp, summary.currentTurnId);
     }
     if (payload.type === "agent_message") {
-      appendCodexMessage(summary.messages, "assistant", payload.message, timestamp);
+      appendCodexMessage(summary.messages, "assistant", payload.message, timestamp, summary.currentTurnId);
     }
   }
 }
@@ -1373,7 +1689,8 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
     messageCount: 0,
     messages: [],
     titleHints: [],
-    hiddenFromConversationList: false
+    hiddenFromConversationList: false,
+    currentTurnId: null
   };
 
   for (const line of raw.split(/\r?\n/)) {
@@ -1392,6 +1709,7 @@ async function parseCodexSessionFile(filePath, includeMessages = false) {
   summary.messageCount = summary.messages.length;
   summary.title = deriveSessionTitle(summary.messages, summary.cwd, summary.title, summary.titleHints);
   delete summary.titleHints;
+  delete summary.currentTurnId;
   if (!summary.id) {
     const match = filePath.match(/rollout-[^/]*-([0-9a-f-]{36})\.jsonl$/i);
     summary.id = match?.[1] || path.basename(filePath, ".jsonl");
@@ -1421,8 +1739,19 @@ async function parseCachedCodexSessionSummary(filePath) {
   if (cached?.fingerprint === fingerprint) return cached.summary;
   const summary = await parseCodexSessionFile(filePath, false);
   codexSessionSummaryCache.set(filePath, { fingerprint, summary });
-  if (summary?.id) codexSessionPathCache.set(summary.id, filePath);
   return summary;
+}
+
+function newestCodexSessionSummaries(sessions) {
+  const byId = new Map();
+  for (const session of sessions) {
+    if (!session?.id) continue;
+    const current = byId.get(session.id);
+    const currentTime = new Date(current?.updatedAt || 0).getTime() || 0;
+    const sessionTime = new Date(session.updatedAt || 0).getTime() || 0;
+    if (!current || sessionTime > currentTime) byId.set(session.id, session);
+  }
+  return [...byId.values()];
 }
 
 async function mapWithConcurrency(items, limit, mapper) {
@@ -1452,7 +1781,18 @@ async function findCodexSessionFile(sessionId) {
     }
   }
   const files = await walkFiles(codexSessionsDir, 500);
-  const filePath = files.find((candidate) => candidate.includes(sessionId)) || null;
+  const candidates = files.filter((candidate) => candidate.includes(sessionId));
+  let filePath = candidates[0] || null;
+  if (candidates.length > 1) {
+    const parsed = await mapWithConcurrency(candidates, 4, async (candidate) => {
+      try {
+        return await parseCachedCodexSessionSummary(candidate);
+      } catch {
+        return null;
+      }
+    });
+    filePath = newestCodexSessionSummaries(parsed.filter((session) => session?.id === sessionId))[0]?.path || filePath;
+  }
   if (filePath) codexSessionPathCache.set(sessionId, filePath);
   return filePath;
 }
@@ -1543,7 +1883,26 @@ async function listCodexSessions(res) {
       return null;
     }
   });
-  const sessions = parsed.filter((session) => session && !session.hiddenFromConversationList);
+  const sessions = newestCodexSessionSummaries(
+    parsed.filter((session) => session && !session.hiddenFromConversationList)
+  );
+  for (const session of sessions) codexSessionPathCache.set(session.id, session.path);
+  sessions.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  sendJson(res, 200, { sessions });
+}
+
+async function listArchivedCodexSessions(res) {
+  const files = await walkFiles(codexArchivedSessionsDir, 1000);
+  const parsed = await mapWithConcurrency(files, 8, async (filePath) => {
+    try {
+      return await parseCachedCodexSessionSummary(filePath);
+    } catch {
+      return null;
+    }
+  });
+  const sessions = newestCodexSessionSummaries(
+    parsed.filter((session) => session && !session.hiddenFromConversationList)
+  );
   sessions.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
   sendJson(res, 200, { sessions });
 }
@@ -1571,6 +1930,23 @@ async function archiveCodexSession(res, sessionId) {
   if (ok) await deleteSessionFiles(sessionId);
   sendJson(res, ok ? 200 : 502, {
     ok,
+    stdout: result.stdout.trim(),
+    stderr: result.stderr.trim(),
+    code: result.code
+  });
+}
+
+async function unarchiveCodexSession(res, sessionId) {
+  if (!isUuid(sessionId)) {
+    return sendError(res, 400, "Invalid Codex session id.");
+  }
+  const result = await runCodex(["unarchive", sessionId], { timeoutMs: 20000 });
+  const output = `${result.stdout}\n${result.stderr}`.trim();
+  const ok = result.ok && !/(^|\n)\s*(error:|Error:)|failed to unarchive session/i.test(output);
+  if (ok) codexSessionPathCache.delete(sessionId);
+  sendJson(res, ok ? 200 : 502, {
+    ok,
+    ...(ok ? {} : { error: result.stderr.trim() || result.stdout.trim() || "Failed to unarchive Codex session." }),
     stdout: result.stdout.trim(),
     stderr: result.stderr.trim(),
     code: result.code
@@ -2279,6 +2655,47 @@ async function handleTerminalSocket(ws, req) {
   });
 }
 
+function handleTunnelSocket(ws, req, targetPort) {
+  const target = createConnection({ host: "127.0.0.1", port: targetPort });
+  let closed = false;
+
+  const closeTunnel = (code, reason) => {
+    if (closed) return;
+    closed = true;
+    target.destroy();
+    if (ws.readyState === ws.OPEN || ws.readyState === ws.CONNECTING) {
+      ws.close(code, reason);
+    }
+  };
+
+  target.on("connect", () => {
+    console.log(`Tunnel connected: ${req.socket.remoteAddress || "unknown"} -> 127.0.0.1:${targetPort}`);
+  });
+  target.on("data", (chunk) => {
+    if (ws.readyState !== ws.OPEN) return closeTunnel(1001, "WebSocket closed");
+    target.pause();
+    ws.send(chunk, { binary: true }, (error) => {
+      if (error) return closeTunnel(1011, "Tunnel write failed");
+      if (!closed) target.resume();
+    });
+  });
+  target.on("end", () => closeTunnel(1000, "Target closed"));
+  target.on("error", (error) => {
+    console.warn(`Tunnel target 127.0.0.1:${targetPort} failed: ${error.message}`);
+    closeTunnel(1011, "Target connection failed");
+  });
+
+  ws.on("message", (data, isBinary) => {
+    if (!isBinary) return closeTunnel(1003, "Binary frames required");
+    if (!target.write(data) && ws._socket) {
+      ws._socket.pause();
+      target.once("drain", () => ws._socket?.resume());
+    }
+  });
+  ws.on("close", () => closeTunnel(1000, "Client closed"));
+  ws.on("error", () => closeTunnel(1011, "WebSocket failed"));
+}
+
 async function runCodexStream(req, res) {
   const body = await readBody(req, 256 * 1024);
   const prompt = String(body.prompt || "").trim();
@@ -2298,6 +2715,13 @@ async function runCodexStream(req, res) {
     ? body.approval
     : "approve-for-me";
   const sessionId = isUuid(body.sessionId) ? body.sessionId : null;
+  const replaceTurnId = isUuid(body.replaceTurnId) ? body.replaceTurnId : null;
+  if (body.replaceTurnId && !replaceTurnId) {
+    return sendError(res, 400, "The turn selected for replacement is invalid.");
+  }
+  if (replaceTurnId && !sessionId) {
+    return sendError(res, 400, "A persisted Codex session is required to replace a turn.");
+  }
   const sessionKey = String(body.sessionKey || sessionId || randomUUID()).slice(0, 128);
   const conflictingRun = [...codexRuns.values()].find((run) => (
     activeRunStatuses.has(run.status)
@@ -2328,6 +2752,8 @@ async function runCodexStream(req, res) {
     id: randomUUID(),
     sessionKey,
     threadId: sessionId,
+    turnId: null,
+    replacesTurnId: replaceTurnId,
     status: "starting",
     approval,
     cwd: processCwd,
@@ -2618,6 +3044,25 @@ async function runCodexStream(req, res) {
     const threadId = threadResult?.thread?.id || sessionId;
     if (!threadId) throw new Error("Codex app-server did not return a thread id.");
     activeThreadId = threadId;
+    if (replaceTurnId) {
+      const historyMode = threadResult?.thread?.historyMode || "legacy";
+      if (historyMode === "paginated") {
+        await Promise.race([
+          requestAppServer("thread/revert", { threadId, beforeTurnId: replaceTurnId }),
+          processExit
+        ]);
+      } else {
+        const latestTurnId = asArray(threadResult?.thread?.turns).at(-1)?.id || null;
+        if (latestTurnId && latestTurnId !== replaceTurnId) {
+          throw new Error("The selected turn is no longer the latest turn and was not replaced.");
+        }
+        await Promise.race([
+          requestAppServer("thread/rollback", { threadId, numTurns: 1 }),
+          processExit
+        ]);
+      }
+      writeEvent({ type: "webui.reverted", turnId: replaceTurnId });
+    }
     await moveSessionFiles(sessionKey, threadId);
     for (const attachment of resolvedAttachments) {
       const movedPath = await findUploadedAttachment(threadId, attachment?.id);
@@ -2643,6 +3088,8 @@ async function runCodexStream(req, res) {
     });
     const startedTurn = await Promise.race([requestAppServer("turn/start", turnParams), processExit]);
     activeTurnId = startedTurn?.turn?.id || null;
+    run.turnId = activeTurnId;
+    writeEvent({ type: "webui.turn", turnId: activeTurnId, replacesTurnId: replaceTurnId });
     const turn = await Promise.race([completed, processExit]);
     if (pendingImageArchives.size) await Promise.allSettled([...pendingImageArchives]);
     const ok = turn?.status === "completed";
@@ -2727,12 +3174,21 @@ async function route(req, res) {
   try {
     if (req.method === "GET" && pathname === "/api/status") return await getStatus(res);
     if (req.method === "POST" && pathname === "/api/action-events") return await recordClientActions(req, res);
+    if (req.method === "GET" && pathname === "/api/workspace-note") return await getWorkspaceNote(req, res);
+    if (["PUT", "POST"].includes(req.method) && pathname === "/api/workspace-note") return await updateWorkspaceNote(req, res);
+    if (req.method === "GET" && pathname === "/api/workspaces") return await listRecentWorkspaces(res);
     if (req.method === "GET" && pathname === "/api/models") return await listModels(res);
     if (req.method === "GET" && pathname === "/api/cwd") return await checkWorkingDirectory(req, res);
     if (req.method === "GET" && pathname === "/api/directories") return await listDirectories(req, res);
     if (["GET", "HEAD"].includes(req.method) && pathname === "/api/files/preview") return await previewWorkspaceFile(req, res);
+    if (["GET", "HEAD"].includes(req.method) && pathname === "/api/visualizations/preview") return await previewVisualization(req, res);
     if (req.method === "GET" && pathname === "/api/settings/file-preview") return await getFilePreviewSettings(res);
     if (req.method === "PUT" && pathname === "/api/settings/file-preview") return await updateFilePreviewSettings(req, res);
+    if (req.method === "GET" && pathname === "/api/codex/archived-sessions") return await listArchivedCodexSessions(res);
+    if (req.method === "POST" && pathname.startsWith("/api/codex/archived-sessions/") && pathname.endsWith("/unarchive")) {
+      const sessionId = decodeURIComponent(pathname.slice("/api/codex/archived-sessions/".length, -"/unarchive".length));
+      return await unarchiveCodexSession(res, sessionId);
+    }
     if (req.method === "GET" && pathname === "/api/codex/sessions") return await listCodexSessions(res);
     if (req.method === "GET" && pathname === "/api/codex/runs") return listCodexRuns(res);
     if (req.method === "GET" && pathname === "/api/codex/approvals") return listCodexApprovals(res);
@@ -2824,6 +3280,21 @@ const server = createServer((req, res) => {
   });
 });
 const terminalWss = new WebSocketServer({ noServer: true });
+const tunnelWss = new WebSocketServer({ noServer: true });
+const workspaceNoteWss = new WebSocketServer({ noServer: true });
+
+workspaceNoteWss.on("connection", async (ws, req) => {
+  try {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const workspace = await resolveWorkspacePath(url.searchParams.get("workspace"));
+    const notes = await loadWorkspaceNotes();
+    ws.workspace = workspace;
+    await rememberWorkspace(workspace);
+    ws.send(JSON.stringify({ type: "workspace-note", workspace, note: notes[workspace] || { ...defaultWorkspaceNote }, clientId: null }));
+  } catch {
+    ws.close(1011, "Workspace note unavailable");
+  }
+});
 
 terminalWss.on("connection", (ws, req) => {
   handleTerminalSocket(ws, req).catch((error) => {
@@ -2835,24 +3306,48 @@ terminalWss.on("connection", (ws, req) => {
   });
 });
 
+tunnelWss.on("connection", (ws, req, targetPort) => {
+  handleTunnelSocket(ws, req, targetPort);
+});
+
 server.on("upgrade", (req, socket, head) => {
   if (!requestIsAuthorized(req) || !requestOriginIsAllowed(req)) {
     socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
     return;
   }
   const url = new URL(req.url, `http://${req.headers.host}`);
-  if (url.pathname !== "/terminal") {
-    socket.destroy();
+  if (url.pathname === "/terminal") {
+    terminalWss.handleUpgrade(req, socket, head, (ws) => {
+      terminalWss.emit("connection", ws, req);
+    });
     return;
   }
-  terminalWss.handleUpgrade(req, socket, head, (ws) => {
-    terminalWss.emit("connection", ws, req);
-  });
+  if (url.pathname === "/workspace-note") {
+    workspaceNoteWss.handleUpgrade(req, socket, head, (ws) => {
+      workspaceNoteWss.emit("connection", ws, req);
+    });
+    return;
+  }
+  if (url.pathname === "/tunnel") {
+    const targetPort = Number(url.searchParams.get("port"));
+    if (!tunnelPorts.has(targetPort)) {
+      socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+      return;
+    }
+    tunnelWss.handleUpgrade(req, socket, head, (ws) => {
+      tunnelWss.emit("connection", ws, req, targetPort);
+    });
+    return;
+  }
+  socket.destroy();
 });
 
 server.listen(port, host, () => {
   console.log(`Codex WebUI listening on http://${host}:${port}`);
   console.log(`Operation log: ${actionLogFile}`);
+  if (tunnelPorts.size) {
+    console.log(`WebSocket tunnel targets: ${[...tunnelPorts].map((value) => `127.0.0.1:${value}`).join(", ")}`);
+  }
   if (!["127.0.0.1", "::1", "localhost"].includes(host) && !accessPassword) {
     console.warn("WARNING: Codex WebUI is reachable beyond localhost without a password. Set CODEX_WEBUI_PASSWORD.");
   }

@@ -24,6 +24,12 @@ A browser workbench for the local Codex CLI. It brings real Codex sessions, appr
 - Use a PTY terminal rooted in the current project and manage MCP servers, skills, and plugins.
 - Work across responsive desktop and mobile layouts, installable as a desktop or Home Screen app.
 
+## How this differs from ChatGPT Remote
+
+Remote in the official ChatGPT mobile app can control ChatGPT or Codex chats on a paired Mac or Windows computer. The desktop app can also connect to a remote development server over SSH, allowing the phone to operate that environment indirectly. This official workflow requires an online ChatGPT desktop host; it does not make the phone a direct client for arbitrary Codex CLI sessions on a Linux server. See the [OpenAI Remote connections documentation](https://learn.chatgpt.com/docs/remote-connections).
+
+Codex WebUI instead runs on the same machine as Codex CLI, reads that machine's native Codex sessions, and exposes them through a browser interface. This makes it particularly useful for Linux servers, NAS devices, headless development machines, and self-hosted mobile or multi-device access to local Codex workflows.
+
 ## Quick start
 
 Requires Node.js 20+ and an installed, authenticated Codex CLI:

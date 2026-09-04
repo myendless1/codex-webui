@@ -2,6 +2,7 @@ import { Terminal } from "/vendor/@xterm/xterm/lib/xterm.mjs";
 import { FitAddon } from "/vendor/@xterm/addon-fit/lib/addon-fit.mjs";
 import { marked } from "/vendor/marked/lib/marked.esm.js";
 import DOMPurify from "/vendor/dompurify/dist/purify.es.mjs";
+import { decorateMath, extractMarkdownMath } from "/math-render.js";
 
 marked.setOptions({ gfm: true, breaks: true });
 
@@ -21,7 +22,8 @@ const defaultFilePreviewSettings = {
 
 function previewableFilePattern() {
   const extensions = state?.filePreviewSettings?.extensions || defaultFilePreviewSettings.extensions;
-  const alternation = extensions.map((entry) => String(entry).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const previewExtensions = [...new Set([...extensions, "html", "htm"])];
+  const alternation = previewExtensions.map((entry) => String(entry).replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
   return new RegExp(`(?:/[^\\s<>"'\\x60]+)+\\.(?:${alternation})(?::\\d+(?::\\d+)?)?(?=$|[\\s\\]),.;!?，。；：！？、}])`, "gi");
 }
 
@@ -39,7 +41,7 @@ function isAllowedPreviewPath(filePath) {
   const location = filePreviewLocation(String(filePath || "").split(/[?#]/, 1)[0]);
   const extension = location.path.match(/\.([a-z0-9_-]+)$/i)?.[1]?.toLowerCase();
   const allowed = state?.filePreviewSettings?.extensions || defaultFilePreviewSettings.extensions;
-  return Boolean(extension && allowed.includes(extension));
+  return Boolean(extension && (allowed.includes(extension) || ["html", "htm"].includes(extension)));
 }
 
 function localPreviewPath(value) {
@@ -50,7 +52,7 @@ function localPreviewPath(value) {
     try {
       const url = new URL(raw, location.href);
       if (url.origin !== location.origin) return "";
-      if (["/api/files/preview", "/markdown-preview.html"].includes(url.pathname)) {
+      if (["/api/files/preview", "/api/visualizations/preview", "/markdown-preview.html"].includes(url.pathname)) {
         decoded = String(url.searchParams.get("path") || "");
         const line = url.searchParams.get("line");
         const column = url.searchParams.get("column");
@@ -61,7 +63,7 @@ function localPreviewPath(value) {
     } catch {
       return "";
     }
-  } else if (raw.startsWith("/api/files/preview?") || raw.startsWith("/markdown-preview.html?")) {
+  } else if (raw.startsWith("/api/files/preview?") || raw.startsWith("/api/visualizations/preview?") || raw.startsWith("/markdown-preview.html?")) {
     try {
       const url = new URL(raw, location.href);
       decoded = String(url.searchParams.get("path") || "");
@@ -96,12 +98,24 @@ function markdownPreviewUrl(filePath, sessionId = activeSession()?.id || state.n
   return `/markdown-preview.html?${params}`;
 }
 
+function visualizationPreviewUrl(filePath, sessionId = activeSession()?.id || state.newSessionId) {
+  const cwd = activeSession()?.cwd || "";
+  const location = filePreviewLocation(filePath);
+  return `/api/visualizations/preview?${new URLSearchParams({
+    path: location.path,
+    cwd,
+    sessionId,
+    theme: state.theme === "dark" ? "dark" : "light"
+  })}`;
+}
+
 function configurePreviewLink(anchor, filePath) {
   const location = filePreviewLocation(filePath);
   const actualPath = location.path;
   const previewUrl = filePreviewUrl(filePath);
   const markdown = /\.md$/i.test(actualPath);
-  const targetUrl = markdown ? markdownPreviewUrl(filePath) : previewUrl;
+  const html = /\.html?$/i.test(actualPath);
+  const targetUrl = markdown ? markdownPreviewUrl(filePath) : (html ? visualizationPreviewUrl(filePath) : previewUrl);
   anchor.href = targetUrl;
   anchor.target = "_blank";
   anchor.rel = "noopener noreferrer";
@@ -112,6 +126,12 @@ function configurePreviewLink(anchor, filePath) {
     anchor.classList.add("markdown-preview-link");
     anchor.title = "在对话中预览 Markdown";
   }
+  if (html) {
+    anchor.dataset.htmlPreviewUrl = targetUrl;
+    anchor.dataset.htmlPreviewName = actualPath.split(/[\\/]/).at(-1) || "HTML 预览";
+    anchor.classList.add("html-preview-link");
+    anchor.title = "在沙箱中预览 HTML";
+  }
   if (previewableVideoPattern.test(actualPath)) {
     anchor.dataset.videoPreviewUrl = previewUrl;
     anchor.dataset.videoPreviewName = actualPath.split(/[\\/]/).at(-1) || "视频预览";
@@ -120,9 +140,10 @@ function configurePreviewLink(anchor, filePath) {
   }
 }
 
-function decorateFilePreviews(html) {
+function decorateFilePreviews(html, formulas = []) {
   const template = document.createElement("template");
   template.innerHTML = html;
+  decorateMath(template.content, formulas);
 
   const walker = document.createTreeWalker(template.content, NodeFilter.SHOW_TEXT);
   const textNodes = [];
@@ -180,13 +201,84 @@ function decorateFilePreviews(html) {
     image.decoding = "async";
   });
 
+  template.content.querySelectorAll("pre").forEach((pre) => {
+    if (pre.parentElement?.classList.contains("code-block")) return;
+    const code = pre.querySelector(":scope > code");
+    const languageClass = Array.from(code?.classList || []).find((name) => name.startsWith("language-"));
+    const language = languageClass ? languageClass.slice("language-".length) : "";
+    const wrapper = document.createElement("div");
+    wrapper.className = "code-block";
+    const toolbar = document.createElement("div");
+    toolbar.className = "code-block-toolbar";
+    const label = document.createElement("span");
+    label.textContent = language;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "code-copy-button";
+    copy.dataset.action = "copy-code";
+    copy.setAttribute("aria-label", "复制代码");
+    copy.title = "复制代码";
+    copy.textContent = "复制";
+    toolbar.append(label, copy);
+    pre.replaceWith(wrapper);
+    wrapper.append(toolbar, pre);
+  });
+
   return template.innerHTML;
 }
 
+const visualizationReferencePattern = /\uE200visualize\uE202(\{[^\r\n]*\})\uE201/g;
+
+function visualizationEmbed(reference) {
+  let descriptor;
+  try {
+    descriptor = JSON.parse(reference);
+  } catch {
+    return "";
+  }
+  const filePath = String(descriptor?.path || "").trim();
+  if (!filePath || !/\.html?$/i.test(filePath) || /^[a-z][a-z0-9+.-]*:/i.test(filePath)) return "";
+  const title = String(descriptor.title || filePath.split(/[\\/]/).at(-1) || "HTML 可视化").slice(0, 200);
+  const wide = descriptor.mode === "wide";
+  return `<figure class="visualization-embed${wide ? " mode-wide" : ""}">
+    <iframe class="visualization-frame" src="${escapeHtml(visualizationPreviewUrl(filePath))}" title="${escapeHtml(title)}" sandbox="allow-scripts" loading="lazy"></iframe>
+    <figcaption>${escapeHtml(title)}</figcaption>
+  </figure>`;
+}
+
 function renderMarkdown(content) {
-  const html = marked.parse(String(content || ""));
-  const sanitized = DOMPurify.sanitize(html, { USE_PROFILES: { html: true } });
-  return decorateFilePreviews(sanitized);
+  const { markdown, formulas } = extractMarkdownMath(content);
+  const sections = [];
+  let offset = 0;
+  for (const match of markdown.matchAll(visualizationReferencePattern)) {
+    const embed = visualizationEmbed(match[1]);
+    if (!embed) continue;
+    const prose = markdown.slice(offset, match.index);
+    if (prose) sections.push(DOMPurify.sanitize(marked.parse(prose), { USE_PROFILES: { html: true } }));
+    sections.push(embed);
+    offset = match.index + match[0].length;
+  }
+  const remainder = markdown.slice(offset);
+  if (remainder || !sections.length) {
+    sections.push(DOMPurify.sanitize(marked.parse(remainder), { USE_PROFILES: { html: true } }));
+  }
+  return decorateFilePreviews(sections.join(""), formulas);
+}
+
+function reserveLastMessageLine(html, wide = false) {
+  const template = document.createElement("template");
+  template.innerHTML = html;
+  let target = template.content.lastElementChild;
+  while (target?.matches("ul, ol, blockquote") && target.lastElementChild) {
+    target = target.lastElementChild;
+  }
+  if (target?.matches("p, li, h1, h2, h3, h4, h5, h6")) {
+    const spacer = document.createElement("span");
+    spacer.className = `message-action-spacer${wide ? " wide" : ""}`;
+    spacer.setAttribute("aria-hidden", "true");
+    target.append(spacer);
+  }
+  return template.innerHTML;
 }
 
 function openVideoPreview(url, name = "视频预览") {
@@ -230,6 +322,26 @@ function openMarkdownPreview(url, name = "Markdown 预览") {
   layer.querySelector("[data-action='close-markdown-preview']")?.focus();
 }
 
+function openHtmlPreview(url, name = "HTML 预览") {
+  const layer = $("[data-markdown-preview-layer]");
+  if (!layer || !url) return;
+  layer.innerHTML = `
+    <section class="markdown-preview-dialog html-preview-dialog" role="dialog" aria-modal="true" aria-label="${escapeHtml(name)}">
+      <header class="markdown-preview-dialog-header">
+        <strong>${escapeHtml(name)}</strong>
+        <button class="button icon ghost" type="button" data-action="close-markdown-preview" aria-label="关闭 HTML 预览">×</button>
+      </header>
+      <iframe class="markdown-preview-frame html-preview-frame" src="${escapeHtml(url)}" title="${escapeHtml(name)}" sandbox="allow-scripts"></iframe>
+      <footer class="markdown-preview-dialog-footer">
+        <span>HTML 沙箱预览</span>
+        <a class="button ghost slim" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer">新窗口打开</a>
+      </footer>
+    </section>`;
+  layer.hidden = false;
+  document.body.classList.add("markdown-preview-open");
+  layer.querySelector("[data-action='close-markdown-preview']")?.focus();
+}
+
 function closeMarkdownPreview() {
   const layer = $("[data-markdown-preview-layer]");
   if (!layer || layer.hidden) return;
@@ -241,6 +353,13 @@ function closeMarkdownPreview() {
 }
 
 function handlePreviewMessage(event) {
+  if (event.data?.type === "codex-webui:visualization-resize") {
+    const frame = $$(".visualization-frame").find((candidate) => candidate.contentWindow === event.source);
+    if (!frame) return;
+    const height = Math.min(1200, Math.max(180, Number(event.data.height) || 360));
+    frame.style.height = `${Math.ceil(height)}px`;
+    return;
+  }
   if (event.origin !== location.origin || event.data?.type !== "codex-webui:close-markdown-preview") return;
   const frame = $("[data-markdown-preview-layer] iframe");
   if (frame?.contentWindow !== event.source) return;
@@ -360,6 +479,11 @@ function normalizeSkillPrefs(value) {
   return value;
 }
 
+function storedFontSizeOffset() {
+  const value = Number.parseInt(localStorage.getItem("codex-webui:font-size-offset") || "0", 10);
+  return Number.isFinite(value) ? Math.min(5, Math.max(-3, value)) : 0;
+}
+
 const state = {
   activeView: initialViewId(),
   status: null,
@@ -369,6 +493,7 @@ const state = {
   filePreviewSettings: { ...defaultFilePreviewSettings, extensions: [...defaultFilePreviewSettings.extensions] },
   hosts: [],
   codexSessions: [],
+  archivedSessions: [],
   attachmentsBySession: {},
   uploadingSessionKeys: new Set(),
   uploadingSessionCounts: new Map(),
@@ -378,6 +503,7 @@ const state = {
     : createId(),
   selectedHost: localStorage.getItem("codex-webui:host") || "local-codex",
   theme: localStorage.getItem("codex-webui:theme") === "dark" ? "dark" : "light",
+  fontSizeOffset: storedFontSizeOffset(),
   selectedModel: localStorage.getItem("codex-webui:model") || "",
   models: [],
   selectedApproval: localStorage.getItem("codex-webui:approval") || "approve-for-me",
@@ -386,11 +512,15 @@ const state = {
   composerMenu: null,
   sessionFilterOpen: false,
   sessionFilterPlacement: null,
+  archivedSessionOpen: false,
+  archivedSessionQuery: "",
+  archivedSessionLoading: false,
+  archivedSessionError: "",
+  restoringArchivedSessionId: null,
   sessionActivityFilter: "all",
   sessionStatusFilter: "all",
   sessionQuery: "",
   modelMenuPanel: "root",
-  modelMenuAdvanced: false,
   skillFilter: "all",
   skillQuery: "",
   mcpView: "list",
@@ -431,18 +561,34 @@ const state = {
   activeSessionId: sessionIdFromUrl() || localStorage.getItem("codex-webui:active-session") || null,
   newSessionCwd: localStorage.getItem("codex-webui:cwd") || "",
   directoryPicker: { open: false, intent: null, path: "", parent: null, roots: [], directories: [] },
-  localSkillPrefs: normalizeSkillPrefs(readJsonStorage("codex-webui:skill-prefs", {}))
+  localSkillPrefs: normalizeSkillPrefs(readJsonStorage("codex-webui:skill-prefs", {})),
+  workspaceNote: { content: "", revision: 0, updatedAt: null },
+  workspaceNoteWorkspace: "",
+  workspaceNoteOpen: localStorage.getItem("codex-webui:workspace-note-open") === "true",
+  workspaceNoteFullscreen: false,
+  workspaceNoteDirty: false,
+  workspaceNoteConnected: false,
+  workspaceNoteClientId: createId(),
+  recentWorkspaces: [],
+  editingRequest: null
 };
 
 let deferredInstallPrompt = null;
 let appInstallCompleted = false;
+let workspaceNoteSaveTimer = null;
+const workspaceNoteSaving = new Set();
+let workspaceNoteRetryTimer = null;
+let workspaceNoteSocket = null;
+let workspaceNoteReconnectTimer = null;
+let workspaceNoteDrag = null;
+let workspaceNoteResizeObserver = null;
 
 if (!["mcp", "skills"].includes(state.settingsTab)) {
   state.settingsTab = "mcp";
   localStorage.setItem("codex-webui:settings-tab", state.settingsTab);
 }
 
-if (!["app", "mcp", "skills", "file-preview"].includes(state.settingsSection)) {
+if (!["app", "appearance", "mcp", "skills", "file-preview"].includes(state.settingsSection)) {
   state.settingsSection = "app";
   localStorage.setItem("codex-webui:settings-section", state.settingsSection);
 }
@@ -604,6 +750,39 @@ function sessionRun(session = activeSession()) {
 
 function runIsActive(run = sessionRun()) {
   return ["starting", "running", "pausing", "reconnecting"].includes(run?.status);
+}
+
+function latestUserMessageIndex(session) {
+  if (!Array.isArray(session?.messages)) return -1;
+  for (let index = session.messages.length - 1; index >= 0; index -= 1) {
+    if (session.messages[index]?.role === "user") return index;
+  }
+  return -1;
+}
+
+function canEditInterruptedRequest(session, messageIndex) {
+  const run = sessionRun(session);
+  if (!session || runIsActive(run)) return false;
+  if (messageIndex !== latestUserMessageIndex(session)) return false;
+  const message = session.messages[messageIndex];
+  const trailingMessages = session.messages.slice(messageIndex + 1);
+  return Boolean(
+    message?.interrupted
+    || trailingMessages.some((item) => item.interrupted)
+    || run?.status === "paused"
+  );
+}
+
+function markTurnInterrupted(session, turnId = null) {
+  if (!Array.isArray(session?.messages)) return;
+  const latestUserIndex = latestUserMessageIndex(session);
+  if (latestUserIndex < 0) return;
+  for (let index = latestUserIndex; index < session.messages.length; index += 1) {
+    const message = session.messages[index];
+    if (!turnId || !message.turnId || message.turnId === turnId) {
+      message.interrupted = true;
+    }
+  }
 }
 
 function draftKeyForSession(session = activeSession()) {
@@ -832,6 +1011,12 @@ function displaySessionTitle(session) {
 function knownWorkingDirectories() {
   const seen = new Set();
   const directories = [];
+  for (const workspace of state.recentWorkspaces) {
+    const cwd = String(workspace || "").trim();
+    if (!cwd || seen.has(cwd)) continue;
+    seen.add(cwd);
+    directories.push(cwd);
+  }
   for (const session of mergedSessions()) {
     const cwd = String(session.cwd || "").trim();
     if (!cwd || seen.has(cwd)) {
@@ -975,7 +1160,14 @@ function syncSessionUrl(sessionId = state.activeSessionId) {
 
 function mergedSessions() {
   const localById = new Map(state.sessions.map((session) => [session.id, session]));
-  const codex = state.codexSessions.map((summary) => {
+  const codexById = new Map();
+  for (const summary of state.codexSessions) {
+    const current = codexById.get(summary.id);
+    if (!current || sessionUpdatedAtMs(summary) > sessionUpdatedAtMs(current)) {
+      codexById.set(summary.id, summary);
+    }
+  }
+  const codex = [...codexById.values()].map((summary) => {
     const local = localById.get(summary.id);
     const newestUpdatedAt = sessionUpdatedAtMs(local) > sessionUpdatedAtMs(summary)
       ? local.updatedAt
@@ -1241,7 +1433,30 @@ function renderShell() {
   $("[data-bottom-nav]").innerHTML = `${settingsView ? navButton(settingsView) : ""}${renderThemeToggle("rail")}`;
   $("[data-mobile-nav]").innerHTML = views.map((view) => navButton(view)).join("");
   applyTheme();
+  applyFontSize();
   applySidebarState();
+}
+
+function applyFontSize() {
+  document.documentElement.style.setProperty("--font-size-offset", `${state.fontSizeOffset}px`);
+}
+
+function changeFontSize(delta) {
+  const nextValue = Math.min(5, Math.max(-3, state.fontSizeOffset + delta));
+  if (nextValue === state.fontSizeOffset) return;
+  state.fontSizeOffset = nextValue;
+  localStorage.setItem("codex-webui:font-size-offset", String(nextValue));
+  applyFontSize();
+  if (state.terminal) {
+    state.terminal.options.fontSize = 13 + nextValue;
+    requestAnimationFrame(() => state.terminalFit?.fit());
+  }
+  $$(".markdown-preview-frame").forEach((frame) => {
+    try {
+      frame.contentDocument?.documentElement.style.setProperty("--font-size-offset", `${nextValue}px`);
+    } catch {}
+  });
+  renderSettings();
 }
 
 function renderThemeToggle(placement = "") {
@@ -1338,6 +1553,7 @@ async function refreshAll() {
     refreshRunStatuses(),
     refreshApprovals(),
     refreshModels(),
+    refreshRecentWorkspaces(),
     refreshFilePreviewSettings(),
     refreshMcp(),
     refreshPlugins()
@@ -1367,6 +1583,15 @@ async function refreshAll() {
   renderSessionDrawer();
   renderApprovalDialog();
   updateActiveComposerState();
+}
+
+async function refreshRecentWorkspaces() {
+  try {
+    const payload = await api("/api/workspaces");
+    state.recentWorkspaces = Array.isArray(payload.workspaces) ? payload.workspaces.filter(Boolean) : [];
+  } catch (error) {
+    console.warn("Recent workspaces could not be loaded", error);
+  }
 }
 
 async function refreshModels() {
@@ -1441,6 +1666,11 @@ async function refreshCodexSessions() {
   } catch (error) {
     recordEvent(`Codex session refresh failed: ${error.message}`);
   }
+}
+
+async function refreshArchivedSessions() {
+  const payload = await api("/api/codex/archived-sessions");
+  state.archivedSessions = payload.sessions || [];
 }
 
 async function refreshRunStatuses() {
@@ -1701,6 +1931,7 @@ function renderAll() {
   setView(state.activeView);
   renderSidebarContent();
   renderSessionDrawer();
+  renderArchivedSessionLayer();
   renderNewSessionSheet();
   renderApprovalDialog();
   applyBusyState();
@@ -1721,6 +1952,13 @@ function renderTopbar() {
   activeKicker.textContent = kickerText;
   activeKicker.title = kickerText;
   const browserFullscreenToggle = $(".topbar-browser-fullscreen");
+  const noteToggle = $(".topbar-note-toggle");
+  if (noteToggle) {
+    noteToggle.innerHTML = iconNote;
+    noteToggle.classList.toggle("active", state.workspaceNoteOpen);
+    noteToggle.setAttribute("aria-pressed", String(state.workspaceNoteOpen));
+    noteToggle.setAttribute("aria-label", state.workspaceNoteOpen ? "关闭工作区笔记" : "打开工作区笔记");
+  }
   if (browserFullscreenToggle) {
     const fullscreenSupported = Boolean(document.documentElement.requestFullscreen || document.documentElement.webkitRequestFullscreen);
     const browserFullscreen = Boolean(document.fullscreenElement || document.webkitFullscreenElement);
@@ -1742,6 +1980,293 @@ function renderTopbar() {
   }
 }
 
+function setWorkspaceNoteStatus(message, kind = "") {
+  const status = $("[data-workspace-note-status]");
+  if (!status) return;
+  status.textContent = message;
+  status.dataset.kind = kind;
+}
+
+function updateWorkspaceNoteCount() {
+  const editor = $("[data-workspace-note-editor]");
+  const count = $("[data-workspace-note-count]");
+  if (editor && count) count.textContent = `${Array.from(editor.value).length.toLocaleString()} 字`;
+}
+
+function storedWorkspaceNoteGeometry() {
+  const value = readJsonStorage("codex-webui:workspace-note-geometry", {});
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+
+function applyWorkspaceNoteGeometry() {
+  const panel = $("[data-workspace-note]");
+  if (!panel || isMobileViewport() || state.workspaceNoteFullscreen) return;
+  const stored = storedWorkspaceNoteGeometry();
+  const width = Math.min(Math.max(Number(stored.width) || 420, 300), Math.max(300, window.innerWidth - 24));
+  const height = Math.min(Math.max(Number(stored.height) || 420, 240), Math.max(240, window.innerHeight - 24));
+  const left = Math.min(Math.max(Number.isFinite(Number(stored.left)) ? Number(stored.left) : window.innerWidth - width - 28, 12), Math.max(12, window.innerWidth - width - 12));
+  const top = Math.min(Math.max(Number.isFinite(Number(stored.top)) ? Number(stored.top) : 88, 12), Math.max(12, window.innerHeight - height - 12));
+  Object.assign(panel.style, { width: `${width}px`, height: `${height}px`, left: `${left}px`, top: `${top}px` });
+}
+
+function persistWorkspaceNoteGeometry() {
+  const panel = $("[data-workspace-note]");
+  if (!panel || panel.hidden || isMobileViewport() || state.workspaceNoteFullscreen) return;
+  const rect = panel.getBoundingClientRect();
+  localStorage.setItem("codex-webui:workspace-note-geometry", JSON.stringify({
+    left: Math.round(rect.left),
+    top: Math.round(rect.top),
+    width: Math.round(rect.width),
+    height: Math.round(rect.height)
+  }));
+}
+
+function renderWorkspaceNote() {
+  const panel = $("[data-workspace-note]");
+  const editor = $("[data-workspace-note-editor]");
+  if (!panel || !editor) return;
+  panel.hidden = !state.workspaceNoteOpen;
+  panel.setAttribute("aria-hidden", String(!state.workspaceNoteOpen));
+  panel.classList.toggle("fullscreen", state.workspaceNoteFullscreen);
+  document.body.classList.toggle("workspace-note-open", state.workspaceNoteOpen);
+  document.body.classList.toggle("workspace-note-fullscreen", state.workspaceNoteOpen && state.workspaceNoteFullscreen);
+  const fullscreen = panel.querySelector('[data-action="toggle-workspace-note-fullscreen"]');
+  if (fullscreen) {
+    fullscreen.innerHTML = state.workspaceNoteFullscreen ? iconBrowserFullscreenExit : iconBrowserFullscreenEnter;
+    fullscreen.title = state.workspaceNoteFullscreen ? "退出全屏笔记（Esc）" : "全屏显示笔记";
+    fullscreen.setAttribute("aria-label", fullscreen.title);
+  }
+  editor.disabled = !state.workspaceNoteWorkspace;
+  editor.placeholder = state.workspaceNoteWorkspace
+    ? "记录想法…内容会自动保存，并在此工作区的设备间同步。"
+    : "请先为新任务选择一个工作目录。";
+  const scope = $("[data-workspace-note-scope]");
+  if (scope) {
+    scope.textContent = state.workspaceNoteWorkspace
+      ? `自动保存 · ${cwdLabel(state.workspaceNoteWorkspace) || state.workspaceNoteWorkspace}`
+      : "尚未选择工作区";
+    scope.title = state.workspaceNoteWorkspace;
+  }
+  if (!state.workspaceNoteDirty && document.activeElement !== editor && editor.value !== state.workspaceNote.content) {
+    editor.value = state.workspaceNote.content;
+  }
+  updateWorkspaceNoteCount();
+  renderTopbar();
+  if (state.workspaceNoteOpen && !state.workspaceNoteFullscreen) requestAnimationFrame(applyWorkspaceNoteGeometry);
+}
+
+function setWorkspaceNoteOpen(open) {
+  state.workspaceNoteOpen = Boolean(open);
+  if (!state.workspaceNoteOpen) state.workspaceNoteFullscreen = false;
+  localStorage.setItem("codex-webui:workspace-note-open", String(state.workspaceNoteOpen));
+  renderWorkspaceNote();
+}
+
+function toggleWorkspaceNoteFullscreen() {
+  if (!state.workspaceNoteOpen) return;
+  if (!state.workspaceNoteFullscreen) persistWorkspaceNoteGeometry();
+  state.workspaceNoteFullscreen = !state.workspaceNoteFullscreen;
+  renderWorkspaceNote();
+  requestAnimationFrame(() => $("[data-workspace-note-editor]")?.focus({ preventScroll: true }));
+}
+
+function applyIncomingWorkspaceNote(note, clientId = null) {
+  if (!note || typeof note.content !== "string") return;
+  const revision = Math.max(0, Number(note.revision) || 0);
+  if (revision < state.workspaceNote.revision) return;
+  state.workspaceNoteConnected = true;
+  if (clientId === state.workspaceNoteClientId) return;
+  state.workspaceNote = { content: note.content, revision, updatedAt: note.updatedAt || null };
+  if (state.workspaceNoteDirty || workspaceNoteSaving.has(state.workspaceNoteWorkspace)) {
+    setWorkspaceNoteStatus("另一设备有更新；当前输入将优先保存", "pending");
+    return;
+  }
+  const editor = $("[data-workspace-note-editor]");
+  if (editor && editor.value !== note.content) editor.value = note.content;
+  updateWorkspaceNoteCount();
+  setWorkspaceNoteStatus("已同步", "saved");
+}
+
+function currentWorkspaceNoteScope() {
+  return String(activeSession()?.cwd || state.newSessionCwd || locationWorkspace() || "").trim();
+}
+
+function persistWorkspaceNoteSnapshot(workspace, content) {
+  if (!workspace) return;
+  fetch("/api/workspace-note", {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ workspace, content, clientId: state.workspaceNoteClientId }),
+    keepalive: true
+  }).catch((error) => console.warn("Previous workspace note could not be saved", error));
+}
+
+function syncWorkspaceNoteScope(force = false) {
+  const workspace = currentWorkspaceNoteScope();
+  if (!force && workspace === state.workspaceNoteWorkspace) return;
+  const editor = $("[data-workspace-note-editor]");
+  if (state.workspaceNoteWorkspace && state.workspaceNoteDirty && editor) {
+    persistWorkspaceNoteSnapshot(state.workspaceNoteWorkspace, editor.value);
+  }
+  if (workspaceNoteSaveTimer) clearTimeout(workspaceNoteSaveTimer);
+  if (workspaceNoteRetryTimer) clearTimeout(workspaceNoteRetryTimer);
+  if (workspaceNoteReconnectTimer) clearTimeout(workspaceNoteReconnectTimer);
+  workspaceNoteSaveTimer = null;
+  workspaceNoteRetryTimer = null;
+  workspaceNoteReconnectTimer = null;
+  const previousSocket = workspaceNoteSocket;
+  workspaceNoteSocket = null;
+  previousSocket?.close();
+  state.workspaceNoteWorkspace = workspace;
+  state.workspaceNote = { content: "", revision: 0, updatedAt: null };
+  state.workspaceNoteDirty = false;
+  state.workspaceNoteConnected = false;
+  if (editor) editor.value = "";
+  renderWorkspaceNote();
+  if (!workspace) {
+    setWorkspaceNoteStatus("请先选择工作目录", "pending");
+    return;
+  }
+  setWorkspaceNoteStatus("正在加载…");
+  refreshWorkspaceNote(workspace);
+  connectWorkspaceNote(workspace);
+}
+
+async function refreshWorkspaceNote(workspace = state.workspaceNoteWorkspace) {
+  if (!workspace) return;
+  try {
+    const payload = await api(`/api/workspace-note?workspace=${encodeURIComponent(workspace)}`);
+    if (state.workspaceNoteWorkspace !== workspace) return;
+    if (payload.workspace) {
+      state.recentWorkspaces = [payload.workspace, ...state.recentWorkspaces.filter((entry) => entry !== payload.workspace)];
+      if (state.newSessionSheetOpen) renderNewSessionSheet();
+    }
+    applyIncomingWorkspaceNote(payload.note);
+  } catch (error) {
+    if (state.workspaceNoteWorkspace !== workspace) return;
+    console.warn("Workspace note could not be loaded", error);
+    setWorkspaceNoteStatus("暂时无法加载", "error");
+  }
+}
+
+function connectWorkspaceNote(workspace = state.workspaceNoteWorkspace) {
+  if (!workspace) return;
+  if (workspaceNoteSocket && [WebSocket.CONNECTING, WebSocket.OPEN].includes(workspaceNoteSocket.readyState)) return;
+  if (workspaceNoteReconnectTimer) clearTimeout(workspaceNoteReconnectTimer);
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${protocol}//${location.host}/workspace-note?workspace=${encodeURIComponent(workspace)}`);
+  workspaceNoteSocket = socket;
+  socket.addEventListener("open", () => {
+    if (workspaceNoteSocket !== socket || state.workspaceNoteWorkspace !== workspace) return;
+    state.workspaceNoteConnected = true;
+    setWorkspaceNoteStatus(state.workspaceNoteDirty ? "等待保存" : "已同步", state.workspaceNoteDirty ? "pending" : "saved");
+  });
+  socket.addEventListener("message", (event) => {
+    if (workspaceNoteSocket !== socket || state.workspaceNoteWorkspace !== workspace) return;
+    try {
+      const message = JSON.parse(event.data);
+      if (message.type === "workspace-note") applyIncomingWorkspaceNote(message.note, message.clientId);
+    } catch (error) {
+      console.warn("Invalid workspace note update", error);
+    }
+  });
+  socket.addEventListener("close", () => {
+    if (workspaceNoteSocket !== socket) return;
+    workspaceNoteSocket = null;
+    state.workspaceNoteConnected = false;
+    setWorkspaceNoteStatus(state.workspaceNoteDirty ? "离线，仍会重试保存" : "离线，正在重连", "error");
+    workspaceNoteReconnectTimer = setTimeout(() => connectWorkspaceNote(workspace), 2000);
+  });
+  socket.addEventListener("error", () => socket.close());
+}
+
+function scheduleWorkspaceNoteSave(delay = 500) {
+  state.workspaceNoteDirty = true;
+  setWorkspaceNoteStatus("等待保存", "pending");
+  if (workspaceNoteSaveTimer) clearTimeout(workspaceNoteSaveTimer);
+  workspaceNoteSaveTimer = setTimeout(() => {
+    workspaceNoteSaveTimer = null;
+    saveWorkspaceNote().catch((error) => console.warn("Workspace note save failed", error));
+  }, delay);
+}
+
+async function saveWorkspaceNote() {
+  const editor = $("[data-workspace-note-editor]");
+  const workspace = state.workspaceNoteWorkspace;
+  if (!editor || !workspace || !state.workspaceNoteDirty || workspaceNoteSaving.has(workspace)) return;
+  if (workspaceNoteRetryTimer) clearTimeout(workspaceNoteRetryTimer);
+  workspaceNoteRetryTimer = null;
+  const content = editor.value;
+  workspaceNoteSaving.add(workspace);
+  setWorkspaceNoteStatus("正在保存…", "pending");
+  try {
+    const payload = await api("/api/workspace-note", {
+      method: "PUT",
+      body: JSON.stringify({ workspace, content, clientId: state.workspaceNoteClientId })
+    });
+    if (state.workspaceNoteWorkspace !== workspace) return;
+    const remoteAhead = Number(state.workspaceNote.revision) > Number(payload.note?.revision);
+    const changedWhileSaving = editor.value !== content;
+    if (!remoteAhead) state.workspaceNote = payload.note;
+    if (remoteAhead && !changedWhileSaving) editor.value = state.workspaceNote.content;
+    state.workspaceNoteDirty = changedWhileSaving;
+    updateWorkspaceNoteCount();
+    setWorkspaceNoteStatus(
+      state.workspaceNoteDirty ? "等待保存" : (remoteAhead ? "已同步另一设备的更新" : "已保存"),
+      state.workspaceNoteDirty ? "pending" : "saved"
+    );
+  } catch (error) {
+    if (state.workspaceNoteWorkspace !== workspace) return;
+    state.workspaceNoteDirty = true;
+    setWorkspaceNoteStatus(`保存失败（${error.message || "未知错误"}），正在重试`, "error");
+    workspaceNoteRetryTimer = setTimeout(() => saveWorkspaceNote().catch(() => {}), 2000);
+    throw error;
+  } finally {
+    workspaceNoteSaving.delete(workspace);
+    if (state.workspaceNoteWorkspace === workspace && state.workspaceNoteDirty && !workspaceNoteRetryTimer) scheduleWorkspaceNoteSave(250);
+  }
+}
+
+function handleWorkspaceNoteDragStart(event) {
+  const handle = event.target instanceof Element ? event.target.closest("[data-workspace-note-drag-handle]") : null;
+  const panel = handle?.closest("[data-workspace-note]");
+  if (!panel || event.target.closest("button") || isMobileViewport() || state.workspaceNoteFullscreen || event.button !== 0) return;
+  const rect = panel.getBoundingClientRect();
+  workspaceNoteDrag = { pointerId: event.pointerId, offsetX: event.clientX - rect.left, offsetY: event.clientY - rect.top };
+  handle.setPointerCapture?.(event.pointerId);
+  panel.classList.add("dragging");
+  event.preventDefault();
+}
+
+function handleWorkspaceNoteDragMove(event) {
+  if (!workspaceNoteDrag || workspaceNoteDrag.pointerId !== event.pointerId) return;
+  const panel = $("[data-workspace-note]");
+  if (!panel) return;
+  const rect = panel.getBoundingClientRect();
+  const left = Math.min(Math.max(8, event.clientX - workspaceNoteDrag.offsetX), Math.max(8, window.innerWidth - rect.width - 8));
+  const top = Math.min(Math.max(8, event.clientY - workspaceNoteDrag.offsetY), Math.max(8, window.innerHeight - rect.height - 8));
+  panel.style.left = `${left}px`;
+  panel.style.top = `${top}px`;
+}
+
+function handleWorkspaceNoteDragEnd(event) {
+  if (!workspaceNoteDrag || workspaceNoteDrag.pointerId !== event.pointerId) return;
+  workspaceNoteDrag = null;
+  $("[data-workspace-note]")?.classList.remove("dragging");
+  persistWorkspaceNoteGeometry();
+}
+
+function initWorkspaceNote() {
+  renderWorkspaceNote();
+  applyWorkspaceNoteGeometry();
+  const panel = $("[data-workspace-note]");
+  if (panel && "ResizeObserver" in window) {
+    workspaceNoteResizeObserver = new ResizeObserver(() => persistWorkspaceNoteGeometry());
+    workspaceNoteResizeObserver.observe(panel);
+  }
+  syncWorkspaceNoteScope();
+}
+
 function renderSummary() {
   const installed = state.plugins.installed?.length || 0;
   const available = state.plugins.available?.length || 0;
@@ -1758,6 +2283,7 @@ function renderSummary() {
 function renderConsole() {
   captureVisiblePromptDraft();
   syncSessionUrl();
+  syncWorkspaceNoteScope();
   renderSidebarContent();
   const session = activeSession();
   const container = $('[data-view="console"]');
@@ -1790,6 +2316,12 @@ function renderConsole() {
               <div class="attachment-tray">
                 ${renderAttachmentChips(session.id)}
               </div>
+              ${state.editingRequest?.sessionId === session.id ? `
+                <div class="editing-request-banner" role="status">
+                  <span>发送后将替换该请求和未完成回复；已执行的文件修改不会回滚。</span>
+                  <button type="button" data-action="cancel-edit-request">取消</button>
+                </div>
+              ` : ""}
               <div class="prompt-shell ${state.promptFullscreenKey === session.id ? "prompt-fullscreen" : ""}">
                 <textarea name="prompt" placeholder="${canRun ? (sessionRunning ? "任务正在执行中" : "随心输入") : "该主机的执行适配器尚未接入。"}" rows="1" ${canRun ? "required" : "disabled"}>${escapeHtml(state.promptDrafts[session.id] || "")}</textarea>
                 ${renderPromptFullscreenButton(session.id)}
@@ -1841,7 +2373,9 @@ function renderTranscript(session) {
   if (session.messages.length) {
     return session.messages.map((message, index) => renderMessage(
       message,
-      runIsActive(sessionRun(session)) && index === session.messages.length - 1
+      runIsActive(sessionRun(session)) && index === session.messages.length - 1,
+      session,
+      index
     )).join("");
   }
   if (session.source === "codex") {
@@ -1957,6 +2491,7 @@ function renderSidebarContent() {
 function renderSessionSurfaces() {
   renderSidebarContent();
   renderSessionDrawer();
+  renderArchivedSessionLayer();
   applyBusyState();
 }
 
@@ -1989,6 +2524,7 @@ function renderSessionManager(active, placement = "content") {
           <p>按工作目录收纳 · ${filterActive ? `${visibleTotal} / ${total}` : total} 个对话</p>
         </div>
         <div class="toolbar-row session-toolbar">
+          <button class="button icon ghost archived-session-trigger ${state.archivedSessionOpen ? "active" : ""}" type="button" title="恢复已归档会话" aria-label="恢复已归档会话" aria-expanded="${state.archivedSessionOpen}" data-action="open-archived-sessions">${iconUnarchive}</button>
           <button class="button icon ghost session-filter-trigger ${filterActive ? "active" : ""}" type="button" title="筛选和搜索会话" aria-label="筛选和搜索会话${filterActive ? "，已启用" : ""}" aria-expanded="${popoverOpen}" data-action="toggle-session-filter">${iconFilter}</button>
           <button class="button icon ghost" type="button" title="新建对话" data-action="open-new-session-sheet">+</button>
         </div>
@@ -2079,6 +2615,111 @@ function renderSessionFilterLayer() {
     filteredSessions(allSessions).length,
     allSessions.length
   );
+}
+
+function archivedSessionSearchText(session) {
+  return `${displaySessionTitle(session)} ${session.title || ""} ${session.cwd || ""}`.toLocaleLowerCase();
+}
+
+function formatArchivedSessionTime(value) {
+  const date = new Date(value || 0);
+  if (!Number.isFinite(date.getTime())) return "时间未知";
+  return new Intl.DateTimeFormat("zh-CN", {
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit"
+  }).format(date);
+}
+
+function renderArchivedSessionLayer() {
+  const layer = $("[data-archived-session-layer]");
+  if (!layer) return;
+  layer.hidden = !state.archivedSessionOpen;
+  document.body.classList.toggle("archived-session-open", state.archivedSessionOpen);
+  if (!state.archivedSessionOpen) {
+    layer.innerHTML = "";
+    return;
+  }
+  const query = state.archivedSessionQuery.trim().toLocaleLowerCase();
+  const sessions = state.archivedSessions.filter((session) => !query || archivedSessionSearchText(session).includes(query));
+  layer.innerHTML = `
+    <section class="archived-session-dialog" role="dialog" aria-modal="true" aria-labelledby="archived-session-title">
+      <div class="session-filter-heading">
+        <div>
+          <strong id="archived-session-title">恢复已归档会话</strong>
+          <p>${state.archivedSessionLoading ? "正在读取归档…" : (state.archivedSessionError ? "读取失败" : `共 ${state.archivedSessions.length} 个`)}</p>
+        </div>
+        <button type="button" data-action="close-archived-sessions" aria-label="关闭归档会话">×</button>
+      </div>
+      <label class="session-filter-search">
+        ${iconSearch}
+        <input type="search" value="${escapeHtml(state.archivedSessionQuery)}" placeholder="搜索标题或工作目录" aria-label="搜索已归档会话" autocomplete="off" data-archived-session-query>
+      </label>
+      <div class="archived-session-list">
+        ${state.archivedSessionLoading
+          ? `<div class="archived-session-empty">正在加载…</div>`
+          : state.archivedSessionError
+            ? `<div class="archived-session-empty archived-session-error"><span>${escapeHtml(state.archivedSessionError)}</span><button type="button" data-action="open-archived-sessions">重试</button></div>`
+          : sessions.length
+            ? sessions.map((session) => {
+              const restoring = state.restoringArchivedSessionId === session.id;
+              const title = displaySessionTitle(session);
+              return `
+                <article class="archived-session-item">
+                  <div>
+                    <strong title="${escapeHtml(title)}">${escapeHtml(title)}</strong>
+                    <span title="${escapeHtml(session.cwd || "未指定目录")}">${escapeHtml(session.cwd || "未指定目录")}</span>
+                    <small>${formatArchivedSessionTime(session.updatedAt)}</small>
+                  </div>
+                  <button type="button" data-unarchive-session="${escapeHtml(session.id)}" ${restoring ? "disabled" : ""}>${restoring ? "恢复中…" : "恢复"}</button>
+                </article>
+              `;
+            }).join("")
+            : `<div class="archived-session-empty">${query ? "没有匹配的归档会话" : "暂无已归档会话"}</div>`}
+      </div>
+    </section>
+  `;
+}
+
+async function openArchivedSessions() {
+  state.sessionFilterOpen = false;
+  state.sessionFilterPlacement = null;
+  state.archivedSessionOpen = true;
+  state.archivedSessionLoading = true;
+  state.archivedSessionError = "";
+  renderSessionSurfaces();
+  try {
+    await refreshArchivedSessions();
+  } catch (error) {
+    state.archivedSessionError = error.message || "归档会话读取失败";
+    toast(error.message);
+  } finally {
+    state.archivedSessionLoading = false;
+    renderSessionSurfaces();
+  }
+  requestAnimationFrame(() => $("[data-archived-session-query]")?.focus());
+}
+
+function closeArchivedSessions() {
+  state.archivedSessionOpen = false;
+  state.archivedSessionQuery = "";
+  renderSessionSurfaces();
+}
+
+async function unarchiveSession(sessionId) {
+  if (!sessionId || state.restoringArchivedSessionId) return;
+  state.restoringArchivedSessionId = sessionId;
+  renderArchivedSessionLayer();
+  try {
+    await api(`/api/codex/archived-sessions/${encodeURIComponent(sessionId)}/unarchive`, { method: "POST" });
+    state.archivedSessions = state.archivedSessions.filter((session) => session.id !== sessionId);
+    await refreshCodexSessions();
+    toast("会话已恢复");
+    renderSessionSurfaces();
+  } catch (error) {
+    toast(error.message);
+  } finally {
+    state.restoringArchivedSessionId = null;
+    renderArchivedSessionLayer();
+  }
 }
 
 function renderSessionItem(item, active) {
@@ -2220,6 +2861,10 @@ function renderSettingsSidebar() {
           <span class="nav-icon">${iconInstall}</span>
           <span><strong>桌面应用</strong><small>安装与启动方式</small></span>
         </button>
+        <button class="settings-connection-button ${state.settingsSection === "appearance" ? "active" : ""}" type="button" data-settings-section="appearance" ${state.settingsSection === "appearance" ? 'aria-current="page"' : ""}>
+          <span class="nav-icon settings-font-icon" aria-hidden="true">Aa</span>
+          <span><strong>显示</strong><small>字号与界面外观</small></span>
+        </button>
         <button class="settings-connection-button ${state.settingsSection === "file-preview" ? "active" : ""}" type="button" data-settings-section="file-preview" ${state.settingsSection === "file-preview" ? 'aria-current="page"' : ""}>
           <span class="nav-icon">${iconFile}</span>
           <span><strong>文件预览</strong><small>类型与缓存规则</small></span>
@@ -2269,7 +2914,7 @@ async function toggleSettingsHost(hostId) {
 }
 
 async function selectSettingsSection(section, hostId = state.selectedHost) {
-  const nextSection = ["app", "mcp", "skills", "file-preview"].includes(section) ? section : "app";
+  const nextSection = ["app", "appearance", "mcp", "skills", "file-preview"].includes(section) ? section : "app";
   state.settingsSection = nextSection;
   state.mcpView = "list";
   state.mcpEditName = null;
@@ -2283,17 +2928,24 @@ async function selectSettingsSection(section, hostId = state.selectedHost) {
   renderAll();
 }
 
-function renderMessage(message, isRunning = false) {
+function renderMessage(message, isRunning = false, session = null, messageIndex = -1) {
   const content = message.content || (message.role === "assistant" && isRunning ? "..." : "");
+  const editable = message.role === "user" && canEditInterruptedRequest(session, messageIndex);
   const body = message.role === "assistant"
-    ? `<div class="markdown-body">${renderMarkdown(content)}</div>`
-    : `<pre>${escapeHtml(content)}</pre>`;
+    ? `<div class="markdown-body">${reserveLastMessageLine(renderMarkdown(content))}</div>`
+    : `<pre>${escapeHtml(content)}${message.role === "user" ? `<span class="message-action-spacer${editable ? " wide" : ""}" aria-hidden="true"></span>` : ""}</pre>`;
   const attachments = renderMessageAttachments(message.attachments);
   return `
-    <article class="message ${message.role}">
+    <article class="message ${message.role}${editable ? " has-edit-action" : ""}" data-message-index="${messageIndex}">
       <strong>${escapeHtml(roleName(message.role))}</strong>
       ${attachments}
       ${body}
+      ${message.role === "system" ? "" : `
+        <div class="message-actions" aria-label="消息操作">
+          <button type="button" data-action="copy-message" title="复制整条消息" aria-label="复制整条消息">复制</button>
+          ${editable ? `<button type="button" data-action="edit-interrupted-request" title="重新编辑并替换这次请求" aria-label="重新编辑并替换这次请求">重新编辑</button>` : ""}
+        </div>
+      `}
     </article>
   `;
 }
@@ -2315,6 +2967,7 @@ const iconCheck = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" s
 const iconChevron = `<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 6 6 6-6 6"/></svg>`;
 const iconFolder = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 6.5a2 2 0 0 1 2-2h4l2 2.5h7a2 2 0 0 1 2 2v8.5a2 2 0 0 1-2 2h-13a2 2 0 0 1-2-2z"/></svg>`;
 const iconArchive = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="4.5" rx="1"/><path d="M5 9v8.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M10 13h4"/></svg>`;
+const iconUnarchive = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3.5" y="4.5" width="17" height="4.5" rx="1"/><path d="M5 9v8.5a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V9M12 16v-5m-2 2 2-2 2 2"/></svg>`;
 const iconGear = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 12a7.2 7.2 0 0 0-.1-1.2l2-1.5-2-3.4-2.3 1a7.3 7.3 0 0 0-2.1-1.2L14.3 3h-4l-.4 2.7a7.3 7.3 0 0 0-2.1 1.2l-2.3-1-2 3.4 2 1.5a7.2 7.2 0 0 0 0 2.4l-2 1.5 2 3.4 2.3-1a7.3 7.3 0 0 0 2.1 1.2l.4 2.7h4l.4-2.7a7.3 7.3 0 0 0 2.1-1.2l2.3 1 2-3.4-2-1.5c.1-.4.1-.8.1-1.2z"/></svg>`;
 const iconSearch = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="6.5"/><path d="m20 20-3.8-3.8"/></svg>`;
 const iconFilter = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16M7 12h10M10 18h4"/></svg>`;
@@ -2324,6 +2977,7 @@ const iconFile = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" st
 const iconMcp = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6" cy="12" r="2.5"/><circle cx="18" cy="6" r="2.5"/><circle cx="18" cy="18" r="2.5"/><path d="m8.3 10.9 7.4-3.8M8.3 13.1l7.4 3.8"/></svg>`;
 const iconSkill = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 3 1.7 4.6L18 9.3l-4.3 1.8L12 16l-1.7-4.9L6 9.3l4.3-1.7zM18.5 15l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></svg>`;
 const iconConversationLayout = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M3 14h18M7 9h7"/></svg>`;
+const iconNote = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M5 3.5h14a2 2 0 0 1 2 2v11l-4.5 4H5a2 2 0 0 1-2-2v-13a2 2 0 0 1 2-2Z"/><path d="M16.5 20.5v-4h4M7.5 8h9M7.5 12h7"/></svg>`;
 const iconBrowserFullscreenEnter = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5"/></svg>`;
 const iconBrowserFullscreenExit = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v5H3M16 3v5h5M21 16h-5v5M3 16h5v5"/></svg>`;
 const iconBackArrow = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5m6-7-7 7 7 7"/></svg>`;
@@ -2348,6 +3002,10 @@ function sandboxOptions() {
     { value: "read-only", label: "只读", description: "只允许读取，不允许修改文件" },
     { value: "danger-full-access", label: "完全访问", description: "无沙箱限制，谨慎使用" }
   ];
+}
+
+function sandboxMeta(value = state.selectedSandbox) {
+  return sandboxOptions().find((item) => item.value === value) || sandboxOptions()[0];
 }
 
 function effortOptions() {
@@ -2377,8 +3035,7 @@ function modelDisplayName(model = state.selectedModel) {
 }
 
 function composerTriggerLabel() {
-  const effort = state.selectedEffort ? ` ${effortLabel()}` : "";
-  return `${modelDisplayName()}${effort}`;
+  return `${modelDisplayName()} ${effortLabel()}`;
 }
 
 function renderApprovalMenu(lockPermissions) {
@@ -2396,6 +3053,24 @@ function renderApprovalMenu(lockPermissions) {
         </button>
       `).join("")}
       ${lockPermissions ? `<p class="composer-menu-note">Codex 原生会话继续沿用创建时的批准策略。</p>` : ""}
+    </div>
+  `;
+}
+
+function renderSandboxMenu(lockPermissions) {
+  return `
+    <div class="composer-menu sandbox-menu" data-composer-menu>
+      <p class="composer-menu-title">Codex 命令应在哪里运行？</p>
+      ${sandboxOptions().map((option) => `
+        <button class="menu-option" type="button" data-sandbox-option="${option.value}" ${lockPermissions ? "disabled" : ""}>
+          <span class="menu-option-copy">
+            <strong>${escapeHtml(option.label)}</strong>
+            <small>${escapeHtml(option.description)}</small>
+          </span>
+          <span class="menu-option-check">${option.value === state.selectedSandbox ? iconCheck : ""}</span>
+        </button>
+      `).join("")}
+      ${lockPermissions ? `<p class="composer-menu-note">Codex 原生会话继续沿用创建时的沙箱模式。</p>` : ""}
     </div>
   `;
 }
@@ -2439,20 +3114,6 @@ function renderModelMenu(lockPermissions) {
         <span>推理强度</span>
         <span class="menu-row-value">${escapeHtml(effortLabel())}${iconChevron}</span>
       </button>
-      <div class="menu-divider"></div>
-      <button class="menu-row subtle" type="button" data-action="model-menu-advanced">
-        <span>高级</span>
-        <span class="menu-row-value">${state.modelMenuAdvanced ? "⌃" : "⌄"}</span>
-      </button>
-      ${state.modelMenuAdvanced ? `
-        <p class="composer-menu-caption">沙箱</p>
-        ${sandboxOptions().map((option) => `
-          <button class="menu-option compact" type="button" data-sandbox-option="${option.value}" ${lockPermissions ? "disabled" : ""}>
-            <span class="menu-option-copy"><strong>${escapeHtml(option.label)}</strong><small>${escapeHtml(option.description)}</small></span>
-            <span class="menu-option-check">${option.value === state.selectedSandbox ? iconCheck : ""}</span>
-          </button>
-        `).join("")}
-      ` : ""}
     </div>
   `;
 }
@@ -2463,6 +3124,7 @@ function renderComposerFooter(flags = {}) {
   const run = flags.run || null;
   const composerLocked = !canRun;
   const meta = approvalMeta();
+  const sandbox = sandboxMeta();
   return `
     <input type="hidden" name="model" value="${escapeHtml(state.selectedModel)}">
     <input type="hidden" name="approval" value="${escapeHtml(state.selectedApproval)}">
@@ -2478,6 +3140,9 @@ function renderComposerFooter(flags = {}) {
           <span class="approval-pill-icon">${meta.icon}</span>
           <span>${escapeHtml(meta.label)}</span>
         </button>
+        <button class="sandbox-pill ${state.composerMenu === "sandbox" ? "open" : ""}" type="button" data-action="toggle-sandbox-menu" title="${lockPermissions ? "Codex 原生会话沿用创建时的沙箱模式" : `沙箱：${sandbox.label}`}" ${composerLocked ? "disabled" : ""}>
+          <span>${escapeHtml(sandbox.label)}</span>
+        </button>
       </div>
       <div class="composer-toolbar-side">
         <button class="model-trigger ${state.composerMenu === "model" ? "open" : ""}" type="button" data-action="toggle-model-menu" title="${escapeHtml(state.selectedModel || "模型")}" ${composerLocked ? "disabled" : ""}>${escapeHtml(composerTriggerLabel())}</button>
@@ -2487,6 +3152,7 @@ function renderComposerFooter(flags = {}) {
       </div>
     </div>
     ${state.composerMenu === "approval" ? renderApprovalMenu(lockPermissions) : ""}
+    ${state.composerMenu === "sandbox" ? renderSandboxMenu(lockPermissions) : ""}
     ${state.composerMenu === "model" ? renderModelMenu(lockPermissions) : ""}
   `;
 }
@@ -2667,7 +3333,7 @@ function newSession() {
 }
 
 async function startSessionWithCwd(cwd) {
-  const directory = String(cwd || "").trim();
+  let directory = String(cwd || "").trim();
   state.newSessionSheetOpen = false;
   state.sessionDrawerOpen = false;
   state.directoryPicker.open = false;
@@ -2679,12 +3345,14 @@ async function startSessionWithCwd(cwd) {
     return;
   }
   try {
-    await api(`/api/cwd?path=${encodeURIComponent(directory)}`);
+    const payload = await api(`/api/cwd?path=${encodeURIComponent(directory)}`);
+    directory = payload.path || directory;
   } catch {
     toast("选择的工作目录已不存在，请重新选择。");
     return;
   }
   state.newSessionCwd = directory;
+  state.recentWorkspaces = [directory, ...state.recentWorkspaces.filter((entry) => entry !== directory)];
   localStorage.setItem("codex-webui:cwd", directory);
   discardEmptyLocalSessions();
   const session = createLocalSession("新对话", state.selectedHost, { cwd: directory, id: state.newSessionId });
@@ -2751,17 +3419,19 @@ async function submitNewSession(event, form = event.target) {
     return;
   }
   const values = formValues(form);
-  const cwd = String(values.cwd || "").trim();
+  let cwd = String(values.cwd || "").trim();
   if (!cwd) {
     toast("创建会话前需要选择工作目录。");
     return;
   }
   try {
-    await api(`/api/cwd?path=${encodeURIComponent(cwd)}`);
+    const payload = await api(`/api/cwd?path=${encodeURIComponent(cwd)}`);
+    cwd = payload.path || cwd;
   } catch {
     toast("选择的工作目录已不存在，请重新选择。");
     return;
   }
+  state.recentWorkspaces = [cwd, ...state.recentWorkspaces.filter((entry) => entry !== cwd)];
   const preferences = persistPreferences(values, cwd);
   const prompt = String(values.prompt || "").trim();
   const name = cwd.split("/").filter(Boolean).pop() || `Session ${state.sessions.length + 1}`;
@@ -2816,7 +3486,7 @@ async function deleteSession(sessionId) {
     return;
   }
   const isCodex = session.source === "codex" || state.codexSessions.some((item) => item.id === sessionId);
-  const ok = window.confirm(isCodex ? "归档这个 Codex 原生会话？可通过 Codex CLI 恢复。" : "删除这个 WebUI 本地会话？");
+  const ok = window.confirm(isCodex ? "归档这个 Codex 原生会话？之后可从会话列表上方的归档入口恢复。" : "删除这个 WebUI 本地会话？");
   if (!ok) {
     return;
   }
@@ -2998,7 +3668,7 @@ function initTerminal() {
       cursorBlink: true,
       convertEol: true,
       fontFamily: '"JetBrains Mono", "SFMono-Regular", "Cascadia Mono", Consolas, monospace',
-      fontSize: 13,
+      fontSize: 13 + state.fontSizeOffset,
       scrollback: 5000,
       theme: {
         background: "#111612",
@@ -3155,6 +3825,26 @@ async function copyTerminalSelection() {
     toast("已复制终端选区");
   } catch {
     window.prompt("复制下面的终端文本：", value);
+  }
+}
+
+async function writeClipboardText(value) {
+  const text = String(value || "");
+  if (!text) return false;
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.readOnly = true;
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    document.body.append(textarea);
+    textarea.select();
+    const copied = document.execCommand?.("copy") === true;
+    textarea.remove();
+    return copied;
   }
 }
 
@@ -3325,10 +4015,11 @@ async function submitPrompt(event, form = event.target) {
   const cwd = String(values.cwd || "").trim();
   const preferences = persistPreferences(values, cwd);
   state.composerMenu = null;
-  await sendPrompt({ prompt, cwd, ...preferences });
+  const editing = state.editingRequest?.sessionId === activeSession()?.id ? state.editingRequest : null;
+  await sendPrompt({ prompt, cwd, editing, ...preferences });
 }
 
-async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
+async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort, editing = null }) {
   const session = activeSession();
   if (!session) {
     toast("请先从左侧选择会话。");
@@ -3341,7 +4032,20 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
   session.cwd = cwd;
   const attachmentKey = attachmentKeyForSession(session);
   const runAttachments = sessionAttachments(session).slice();
-  session.messages.push({ role: "user", content: prompt, attachments: runAttachments });
+  let replacedMessages = null;
+  if (editing) {
+    const target = session.messages[editing.messageIndex];
+    if (target?.role !== "user" || (target.turnId && editing.turnId && target.turnId !== editing.turnId)) {
+      state.editingRequest = null;
+      toast("原请求已变化，请重新选择编辑。");
+      renderConsolePreservingTranscript();
+      return;
+    }
+    replacedMessages = session.messages.slice(editing.messageIndex);
+    session.messages.splice(editing.messageIndex);
+  }
+  const userMessage = { role: "user", content: prompt, attachments: runAttachments };
+  session.messages.push(userMessage);
   const assistant = { role: "assistant", content: "" };
   session.messages.push(assistant);
   session.title = humanizeSessionTitle(prompt, session.cwd);
@@ -3349,8 +4053,17 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
   saveSessionSettings(session.id);
   saveSessions();
   const sessionKey = session.id;
-  const run = { id: null, sessionKey, threadId: session.codexThreadId || null, status: "starting", controller: new AbortController() };
+  const run = {
+    id: null,
+    sessionKey,
+    threadId: session.codexThreadId || null,
+    turnId: null,
+    replacesTurnId: editing?.turnId || null,
+    status: "starting",
+    controller: new AbortController()
+  };
   state.sessionRuns[sessionKey] = run;
+  state.editingRequest = null;
   delete state.attachmentsBySession[attachmentKey];
   const visiblePrompt = $(`[data-session-key="${CSS.escape(sessionKey)}"] textarea[name='prompt']`);
   if (visiblePrompt) visiblePrompt.value = "";
@@ -3380,6 +4093,7 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
       hostId: state.selectedHost,
       sessionId: session.source === "codex" ? session.id : (session.codexThreadId || null),
       attachments: runAttachments,
+      replaceTurnId: editing?.turnId || null,
       sessionKey,
       signal: run.controller.signal,
       onEvent(eventPayload) {
@@ -3398,6 +4112,16 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
           updateActiveComposerState();
           return;
         }
+        if (eventPayload.type === "webui.turn") {
+          run.turnId = eventPayload.turnId || run.turnId;
+          userMessage.turnId = run.turnId;
+          assistant.turnId = run.turnId;
+          return;
+        }
+        if (eventPayload.type === "webui.reverted") {
+          run.revertApplied = true;
+          return;
+        }
         if (eventPayload.type === "webui.status") {
           run.status = eventPayload.status || run.status;
           updateActiveComposerState();
@@ -3405,6 +4129,7 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
         }
         if (eventPayload.type === "webui.finished") {
           run.status = eventPayload.status || (Number(eventPayload.code) === 0 ? "completed" : "failed");
+          if (run.status === "paused") markTurnInterrupted(session, run.turnId);
           return;
         }
         if (eventPayload.type === "webui.thread" && isUuid(eventPayload.threadId)) {
@@ -3436,8 +4161,15 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort }) {
       }
     });
   } catch (error) {
+    if (editing && !run.revertApplied && !run.turnId && replacedMessages) {
+      session.messages.splice(editing.messageIndex, session.messages.length - editing.messageIndex, ...replacedMessages);
+      state.attachmentsBySession[attachmentKey] = runAttachments;
+      state.editingRequest = editing;
+      savePromptDraft(sessionKey, prompt, true);
+    }
     if (run.status === "pausing") {
       run.status = "paused";
+      markTurnInterrupted(session, run.turnId);
       assistant.content = appendOutput(assistant.content, "已暂停任务。");
     } else if (run.id) {
       run.status = "reconnecting";
@@ -3486,6 +4218,47 @@ async function stopActiveRun() {
   }
 }
 
+function beginEditInterruptedRequest(messageIndex) {
+  const session = activeSession();
+  if (!canEditInterruptedRequest(session, messageIndex)) return;
+  const message = session.messages[messageIndex];
+  const key = attachmentKeyForSession(session);
+  const currentTextarea = $("[data-composer] textarea[name='prompt']");
+  const messageContent = String(message.content || "");
+  state.editingRequest = {
+    sessionId: session.id,
+    messageIndex,
+    turnId: message.turnId || sessionRun(session)?.turnId,
+    previousDraft: currentTextarea?.value ?? state.promptDrafts[session.id] ?? "",
+    previousAttachments: sessionAttachments(session).slice()
+  };
+  state.attachmentsBySession[key] = (Array.isArray(message.attachments) ? message.attachments : [])
+    .map((attachment) => ({ ...attachment }));
+  // renderConsole() captures the currently mounted textarea before replacing it,
+  // so update both the element and draft first to prevent an older draft from
+  // overwriting the request being edited.
+  if (currentTextarea) currentTextarea.value = messageContent;
+  savePromptDraft(session.id, messageContent, true);
+  renderConsolePreservingTranscript();
+  const textarea = $("[data-composer] textarea[name='prompt']");
+  if (textarea) {
+    textarea.value = messageContent;
+    savePromptDraft(session.id, messageContent, true);
+    resizePromptTextarea(textarea);
+  }
+  textarea?.focus();
+  textarea?.setSelectionRange(textarea.value.length, textarea.value.length);
+}
+
+function cancelEditInterruptedRequest() {
+  const editing = state.editingRequest;
+  if (!editing) return;
+  state.attachmentsBySession[editing.sessionId] = editing.previousAttachments || [];
+  savePromptDraft(editing.sessionId, editing.previousDraft || "", true);
+  state.editingRequest = null;
+  renderConsolePreservingTranscript();
+}
+
 function adoptCodexThread(session, threadId) {
   session.codexThreadId = threadId;
   if (session.id === threadId) return;
@@ -3525,7 +4298,7 @@ function updateLastAssistantMessage(content, session, attachments = undefined) {
   const messageNode = messages.at(-1);
   const body = messageNode?.querySelector(".markdown-body");
   if (!body) return;
-  body.innerHTML = renderMarkdown(content || "...");
+  body.innerHTML = reserveLastMessageLine(renderMarkdown(content || "..."));
   if (attachments !== undefined) {
     messageNode.querySelector(".message-attachments")?.remove();
     const attachmentHtml = renderMessageAttachments(attachments);
@@ -3545,11 +4318,11 @@ function containsConversationImageMarkup(content) {
     || /<img\b[^>]*\bsrc=(?:"|'|)(?:data:image\/|\/|\.{1,2}\/)/i.test(value);
 }
 
-async function streamCodex({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, sessionKey, attachments, signal, onEvent }) {
+async function streamCodex({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, sessionKey, attachments, replaceTurnId, signal, onEvent }) {
   const response = await fetch("/api/codex/run", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, sessionKey, attachments }),
+    body: JSON.stringify({ prompt, cwd, sandbox, approval, model, effort, hostId, sessionId, sessionKey, attachments, replaceTurnId }),
     signal
   });
   if (!response.ok || !response.body) {
@@ -3638,9 +4411,17 @@ async function attachSessionRun(session) {
       if (handleConversationImages(eventPayload, assistant, session)) return;
       if (eventPayload.type === "webui.run") run.id = eventPayload.runId || run.id;
       if (eventPayload.type === "webui.started") run.status = "running";
+      if (eventPayload.type === "webui.turn") {
+        run.turnId = eventPayload.turnId || run.turnId;
+        assistant.turnId = run.turnId;
+        const user = session.messages.slice(0, -1).findLast((message) => message.role === "user");
+        if (user) user.turnId = run.turnId;
+        return;
+      }
       if (eventPayload.type === "webui.status") run.status = eventPayload.status || run.status;
       if (eventPayload.type === "webui.finished") {
         run.status = eventPayload.status || (Number(eventPayload.code) === 0 ? "completed" : "failed");
+        if (run.status === "paused") markTurnInterrupted(session, run.turnId);
         return;
       }
       if (eventPayload.type === "webui.thread" && isUuid(eventPayload.threadId)) {
@@ -4076,6 +4857,7 @@ function renderSettings() {
   const host = hostById();
   const sectionMeta = {
     app: ["桌面应用", "安装、独立启动与移动端使用"],
+    appearance: ["显示", "调整整个工作台的阅读尺寸与外观"],
     "file-preview": ["文件预览", "会话文件目录与复制规则"],
     skills: ["Skills 与插件", `管理 ${host.name} 的本地技能与 Codex Plugin`],
     mcp: ["MCP 服务", `管理 ${host.name} 连接的外部工具与服务`]
@@ -4144,6 +4926,9 @@ function renderSettingsContent() {
   if (state.settingsSection === "app") {
     return renderAppInstallContent();
   }
+  if (state.settingsSection === "appearance") {
+    return renderAppearanceSettingsContent();
+  }
   if (state.settingsSection === "file-preview") {
     return renderFilePreviewSettingsContent();
   }
@@ -4151,6 +4936,33 @@ function renderSettingsContent() {
     return renderSkillSettingsContent();
   }
   return renderMcpSettingsContent();
+}
+
+function renderAppearanceSettingsContent() {
+  const valueLabel = state.fontSizeOffset === 0
+    ? "默认"
+    : `${state.fontSizeOffset > 0 ? "+" : ""}${state.fontSizeOffset} px`;
+  return `
+    <div class="settings-content-stack">
+      <section class="settings-surface appearance-settings">
+        <div class="settings-surface-header">
+          <div><span class="settings-kicker">文字显示</span><h3>全局字体大小</h3></div>
+        </div>
+        <div class="appearance-setting-row">
+          <div>
+            <strong>界面字号</strong>
+            <p>同步调整会话、侧栏、按钮、设置和文件预览中的字体。</p>
+          </div>
+          <div class="font-size-stepper" role="group" aria-label="调整全局字体大小">
+            <button type="button" data-action="decrease-font-size" aria-label="字体缩小 1 像素" title="字体缩小 1 像素" ${state.fontSizeOffset <= -3 ? "disabled" : ""}>−1</button>
+            <output aria-live="polite">${escapeHtml(valueLabel)}</output>
+            <button type="button" data-action="increase-font-size" aria-label="字体增大 1 像素" title="字体增大 1 像素" ${state.fontSizeOffset >= 5 ? "disabled" : ""}>+1</button>
+          </div>
+        </div>
+        <p class="font-size-range-note">可调整范围：−3 px 至 +5 px，设置会自动保存。</p>
+      </section>
+    </div>
+  `;
 }
 
 function webAppIsStandalone() {
@@ -5081,6 +5893,13 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  const previewHtml = target.closest("[data-html-preview-url]");
+  if (previewHtml && !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey) {
+    event.preventDefault();
+    openHtmlPreview(previewHtml.dataset.htmlPreviewUrl, previewHtml.dataset.htmlPreviewName);
+    return;
+  }
+
   const previewImage = target.closest("[data-preview-url]");
   if (previewImage) {
     event.preventDefault();
@@ -5107,6 +5926,11 @@ async function handleDocumentClick(event) {
     state.sessionFilterOpen = false;
     state.sessionFilterPlacement = null;
     renderSessionSurfaces();
+    return;
+  }
+
+  if (target.matches("[data-archived-session-layer]")) {
+    closeArchivedSessions();
     return;
   }
 
@@ -5179,6 +6003,7 @@ async function handleDocumentClick(event) {
     state.selectedSandbox = button.dataset.sandboxOption;
     localStorage.setItem("codex-webui:sandbox", state.selectedSandbox);
     saveSessionSettings();
+    state.composerMenu = null;
     updateComposerFooters();
     return;
   }
@@ -5293,6 +6118,11 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  if (button.dataset.unarchiveSession) {
+    await unarchiveSession(button.dataset.unarchiveSession);
+    return;
+  }
+
   if (Object.prototype.hasOwnProperty.call(button.dataset, "clearCwd")) {
     await clearCwdSessions(button.dataset.clearCwd);
     return;
@@ -5323,11 +6153,41 @@ async function handleDocumentClick(event) {
   }
 
   switch (button.dataset.action) {
+    case "copy-code": {
+      const code = button.closest(".code-block")?.querySelector("pre code");
+      const copied = await writeClipboardText(code?.textContent || "");
+      toast(copied ? "代码已复制" : "复制失败，请手动框选代码");
+      break;
+    }
+    case "copy-math": {
+      const copied = await writeClipboardText(button.dataset.mathSource || "");
+      toast(copied ? "公式源码已复制" : "复制失败，请手动框选公式");
+      break;
+    }
+    case "copy-message": {
+      const messageIndex = Number(button.closest("[data-message-index]")?.dataset.messageIndex);
+      const message = activeSession()?.messages?.[messageIndex];
+      const copied = await writeClipboardText(message?.content || "");
+      toast(copied ? "消息已复制" : "复制失败，请手动框选内容");
+      break;
+    }
+    case "edit-interrupted-request": {
+      const messageIndex = Number(button.closest("[data-message-index]")?.dataset.messageIndex);
+      beginEditInterruptedRequest(messageIndex);
+      break;
+    }
+    case "cancel-edit-request":
+      cancelEditInterruptedRequest();
+      break;
     case "stop-run":
       await stopActiveRun();
       break;
     case "toggle-approval-menu":
       state.composerMenu = state.composerMenu === "approval" ? null : "approval";
+      updateComposerFooters();
+      break;
+    case "toggle-sandbox-menu":
+      state.composerMenu = state.composerMenu === "sandbox" ? null : "sandbox";
       updateComposerFooters();
       break;
     case "toggle-model-menu":
@@ -5345,10 +6205,6 @@ async function handleDocumentClick(event) {
       break;
     case "model-menu-effort":
       state.modelMenuPanel = "effort";
-      updateComposerFooters();
-      break;
-    case "model-menu-advanced":
-      state.modelMenuAdvanced = !state.modelMenuAdvanced;
       updateComposerFooters();
       break;
     case "refresh":
@@ -5373,9 +6229,17 @@ async function handleDocumentClick(event) {
     case "clear-all-sessions":
       await clearAllSessions();
       break;
+    case "open-archived-sessions":
+      await openArchivedSessions();
+      break;
+    case "close-archived-sessions":
+      closeArchivedSessions();
+      break;
     case "toggle-session-filter": {
       const placement = button.closest("[data-session-placement]")?.dataset.sessionPlacement || "sidebar";
       const opening = !state.sessionFilterOpen || state.sessionFilterPlacement !== placement;
+      state.archivedSessionOpen = false;
+      state.archivedSessionQuery = "";
       state.sessionFilterOpen = opening;
       state.sessionFilterPlacement = opening ? placement : null;
       renderSessionSurfaces();
@@ -5423,8 +6287,23 @@ async function handleDocumentClick(event) {
     case "install-app":
       await requestWebAppInstall();
       break;
+    case "decrease-font-size":
+      changeFontSize(-1);
+      break;
+    case "increase-font-size":
+      changeFontSize(1);
+      break;
     case "toggle-browser-fullscreen":
       await toggleBrowserFullscreen();
+      break;
+    case "toggle-workspace-note":
+      setWorkspaceNoteOpen(!state.workspaceNoteOpen);
+      break;
+    case "close-workspace-note":
+      setWorkspaceNoteOpen(false);
+      break;
+    case "toggle-workspace-note-fullscreen":
+      toggleWorkspaceNoteFullscreen();
       break;
     case "toggle-prompt-fullscreen": {
       const shell = button.closest(".prompt-shell");
@@ -5541,6 +6420,20 @@ async function handleDocumentSubmit(event) {
 
 function handleDocumentInput(event) {
   const target = event.target;
+  if (target.matches("[data-workspace-note-editor]")) {
+    state.workspaceNote.content = target.value;
+    updateWorkspaceNoteCount();
+    scheduleWorkspaceNoteSave();
+    return;
+  }
+  if (target.matches("[data-archived-session-query]")) {
+    state.archivedSessionQuery = target.value;
+    renderArchivedSessionLayer();
+    const queryInput = $("[data-archived-session-query]");
+    queryInput?.focus();
+    queryInput?.setSelectionRange(queryInput.value.length, queryInput.value.length);
+    return;
+  }
   if (target.matches("[data-session-query]")) {
     const placement = target.closest("[data-filter-placement]")?.dataset.filterPlacement || state.sessionFilterPlacement;
     state.sessionQuery = target.value;
@@ -5740,8 +6633,23 @@ document.addEventListener("touchcancel", () => {
   pullUpRefreshGesture = null;
   resetPullUpRefreshIndicator();
 }, { passive: true });
+document.addEventListener("pointerdown", handleWorkspaceNoteDragStart);
+document.addEventListener("pointermove", handleWorkspaceNoteDragMove);
+document.addEventListener("pointerup", handleWorkspaceNoteDragEnd);
+document.addEventListener("pointercancel", handleWorkspaceNoteDragEnd);
 document.addEventListener("keydown", (event) => {
   const target = event.target instanceof Element ? event.target : null;
+  if (event.key === "Escape" && state.workspaceNoteOpen) {
+    event.preventDefault();
+    if (state.workspaceNoteFullscreen && !isMobileViewport()) toggleWorkspaceNoteFullscreen();
+    else setWorkspaceNoteOpen(false);
+    return;
+  }
+  if (event.key === "Escape" && state.archivedSessionOpen) {
+    closeArchivedSessions();
+    requestAnimationFrame(() => $("[data-action='open-archived-sessions']")?.focus());
+    return;
+  }
   if (event.key === "Escape" && state.sessionFilterOpen) {
     const placement = state.sessionFilterPlacement;
     state.sessionFilterOpen = false;
@@ -5803,6 +6711,7 @@ window.addEventListener("message", handlePreviewMessage);
 window.addEventListener("resize", () => {
   syncMobileViewport();
   syncNavigationToggleLabel();
+  applyWorkspaceNoteGeometry();
   $$('textarea[name="prompt"]').forEach(resizePromptTextarea);
   fitTerminal();
 });
@@ -5864,6 +6773,12 @@ window.addEventListener("focus", () => {
 });
 window.addEventListener("pagehide", () => {
   persistPromptDrafts();
+  const noteEditor = $("[data-workspace-note-editor]");
+  if (state.workspaceNoteDirty && noteEditor && navigator.sendBeacon) {
+    navigator.sendBeacon("/api/workspace-note", new Blob([
+      JSON.stringify({ workspace: state.workspaceNoteWorkspace, content: noteEditor.value, clientId: state.workspaceNoteClientId })
+    ], { type: "application/json" }));
+  }
   flushActionLogs(true);
 });
 window.addEventListener("error", (event) => reportClientError(event.error || event.message));
@@ -5871,6 +6786,7 @@ window.addEventListener("unhandledrejection", (event) => reportClientError(event
 
 renderShell();
 renderAll();
+initWorkspaceNote();
 syncMobileViewport();
 startSignalCanvas();
 if (actionLogBuffer.length && !actionLogTimer) actionLogTimer = setTimeout(flushActionLogs, 500);

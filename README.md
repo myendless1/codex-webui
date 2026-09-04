@@ -24,6 +24,12 @@
 - 提供当前项目目录下的 PTY 终端，以及 MCP、Skill 和 Plugin 管理。
 - 桌面与移动端响应式布局，支持安装为桌面或主屏幕应用。
 
+## 与 ChatGPT Remote 的区别
+
+官方 ChatGPT 手机 App 的 Remote 功能可以控制已配对 Mac 或 Windows 上的 ChatGPT/Codex 对话；桌面端也可以先通过 SSH 连接远程开发服务器，再由手机间接操作。这个官方流程需要一台保持在线的 ChatGPT 桌面端作为主机，并不是让手机直接连接任意 Linux 服务器上的 Codex CLI session。详见 [OpenAI Remote connections 文档](https://learn.chatgpt.com/docs/remote-connections)。
+
+Codex WebUI 则直接运行在 Codex CLI 所在的机器上，读取该机器的原生 Codex 会话并提供浏览器界面。因此它尤其适合 Linux 服务器、NAS、无桌面开发机，以及希望通过自托管方式从手机或其他设备访问本机 Codex 工作流的场景。
+
 ## 快速开始
 
 需要 Node.js 20+，并已安装、登录 Codex CLI：

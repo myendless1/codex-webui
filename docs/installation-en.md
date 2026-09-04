@@ -52,6 +52,29 @@ npm start
 | `CODEX_WEBUI_USER` | `codex` | HTTP Basic Auth username |
 | `CODEX_WEBUI_PASSWORD` | empty | HTTP Basic Auth password |
 | `ENABLE_TERMINAL` | `1` | Set to `0` to disable the built-in terminal |
+| `CODEX_WEBUI_TUNNEL_PORTS` | empty | Comma-separated local TCP ports allowed as WebSocket tunnel targets |
+
+## WebSocket TCP tunnel
+
+The server only forwards to explicitly allowed loopback ports. For example, expose the server's `127.0.0.1:8765`:
+
+```bash
+HOST=0.0.0.0 \
+CODEX_WEBUI_PASSWORD='use-a-strong-password' \
+CODEX_WEBUI_TUNNEL_PORTS=8765 \
+npm start
+```
+
+On the remote client, map that service to the client's `127.0.0.1:8765`:
+
+```bash
+CODEX_WEBUI_PASSWORD='the-server-password' \
+node tunnel-client.js \
+  --server https://server.example:8787 \
+  --remote-port 8765
+```
+
+Then open `http://127.0.0.1:8765` on the client. Public deployments must use HTTPS/WSS. The client listens on loopback by default; add `--local-port 18765` if port 8765 is already in use locally.
 
 ## Working-directory boundaries
 
