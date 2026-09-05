@@ -154,6 +154,51 @@ body {
 .math-overset { display: inline-flex; flex-direction: column; align-items: center; vertical-align: middle; line-height: 1; }
 .math-over { min-height: 1em; font-size: 0.58em; line-height: 1; }
 .math-over-base { font-size: 1em; line-height: 0.8; }
+.math-bold { font-weight: 700; }
+.math-upright,
+.math-operator { font-style: normal; }
+.math-operator { padding: 0 0.08em; font-family: "Times New Roman", serif; }
+.math-italic { font-style: italic; }
+.math-sans { font-family: var(--sans); }
+.math-mono { font-family: var(--mono); }
+.math-cal { font-family: "URW Chancery L", "Apple Chancery", cursive; font-style: italic; }
+.math-space-wide { min-width: 0.7em; }
+.math-delimiter { font-size: 1.16em; }
+.math-norm-delimiter,
+.math-vert-delimiter { padding: 0 0.04em; }
+.math-norm-delimiter { font-size: 1.22em; }
+.math-fraction { display: inline-grid; grid-template-rows: auto auto; align-items: center; margin: 0 0.16em; vertical-align: middle; line-height: 1.05; text-align: center; }
+.math-numerator { padding: 0.04em 0.2em 0.1em; border-bottom: 1px solid currentColor; }
+.math-denominator { padding: 0.1em 0.2em 0.04em; }
+.math-root { position: relative; display: inline-flex; align-items: stretch; vertical-align: middle; }
+.math-root-degree { position: absolute; top: -0.18em; left: -0.15em; font-size: 0.5em; }
+.math-radical { align-self: stretch; font-size: 1.35em; line-height: 1; transform: scaleY(1.08); transform-origin: right center; }
+.math-radicand { padding: 0.06em 0.08em 0 0.05em; border-top: 1px solid currentColor; }
+.math-underset { display: inline-flex; flex-direction: column-reverse; align-items: center; vertical-align: middle; line-height: 1; }
+.math-accent { position: relative; display: inline-block; padding-top: 0.26em; }
+.math-accent::before { position: absolute; top: -0.42em; left: 50%; content: attr(data-accent); font-size: 0.76em; transform: translateX(-50%); }
+.math-accent-underline { padding-top: 0; padding-bottom: 0.12em; border-bottom: 1px solid currentColor; }
+.math-accent-underline::before { content: none; }
+.math-matrix { display: inline-flex; align-items: stretch; vertical-align: middle; }
+.math-matrix::before,
+.math-matrix::after { display: flex; align-items: center; font-size: 2.15em; font-style: normal; font-weight: 300; line-height: 1; transform: scaleY(1.08); }
+.math-matrix-bmatrix::before { content: "["; }
+.math-matrix-bmatrix::after { content: "]"; }
+.math-matrix-pmatrix::before { content: "("; }
+.math-matrix-pmatrix::after { content: ")"; }
+.math-matrix-Bmatrix::before { content: "{"; }
+.math-matrix-Bmatrix::after { content: "}"; }
+.math-matrix-vmatrix::before,
+.math-matrix-vmatrix::after { content: "|"; }
+.math-matrix-Vmatrix::before,
+.math-matrix-Vmatrix::after { content: "‖"; }
+.math-matrix-cases::before { content: "{"; }
+.math-matrix-table { display: table; align-self: center; padding: 0.06em 0.18em; }
+.math-matrix-row { display: table-row; }
+.math-matrix-cell { display: table-cell; min-width: 1.2em; padding: 0.13em 0.34em; text-align: center; }
+.math-matrix-cases .math-matrix-cell,
+.math-matrix-aligned .math-matrix-cell { text-align: left; }
+.math-render-fallback { color: var(--muted); font-family: var(--mono); white-space: pre-wrap; }
 .math-copy-button {
   position: absolute;
   top: 9px;

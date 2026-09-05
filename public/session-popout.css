@@ -1,0 +1,132 @@
+:root {
+  color-scheme: light dark;
+  --paper: #fff;
+  --surface: #f7f7f8;
+  --ink: #171717;
+  --muted: #71717a;
+  --line: #e4e4e7;
+  --accent: #0d8a68;
+  font-family: "Aptos", "IBM Plex Sans", "Segoe UI", sans-serif;
+}
+
+* { box-sizing: border-box; }
+
+html,
+body {
+  width: 100%;
+  min-width: 280px;
+  height: 100%;
+  min-height: 170px;
+  margin: 0;
+  overflow: hidden;
+  color: var(--ink);
+  background: var(--paper);
+}
+
+.popout-shell {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  gap: 12px;
+  height: 100%;
+  padding: 14px 16px 12px;
+}
+
+header {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 9px;
+  align-items: center;
+}
+
+.document-pip header {
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  background: var(--muted);
+  border-radius: 50%;
+}
+
+.status-dot.running,
+.status-dot.waiting {
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.status-dot.waiting { background: #b06b16; }
+.status-dot.failed { background: #b42318; }
+
+@keyframes pulse { 50% { opacity: 0.35; } }
+
+.heading {
+  display: grid;
+  min-width: 0;
+}
+
+.heading strong,
+.heading span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.heading strong { font-size: 14px; }
+.heading span { color: var(--muted); font-size: 11px; }
+
+button {
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  color: var(--ink);
+  font: inherit;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.response {
+  align-self: center;
+  max-height: 7.5em;
+  margin: 0;
+  overflow: hidden;
+  font-size: 15px;
+  font-weight: 560;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+footer {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 10px;
+}
+
+html.theme-dark {
+  --paper: #20201f;
+  --surface: #2a2a28;
+  --ink: #f1f1ee;
+  --muted: #a1a1aa;
+  --line: #444440;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not(.theme-light) {
+    --paper: #20201f;
+    --surface: #2a2a28;
+    --ink: #f1f1ee;
+    --muted: #a1a1aa;
+    --line: #444440;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot { animation: none; }
+}

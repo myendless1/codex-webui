@@ -29,8 +29,8 @@
     "dev": "node server.js",
     "dev:lan": "HOST=0.0.0.0 node server.js",
     "start": "node server.js",
-    "check": "node --check server.js && node --check tunnel-client.js && node --check public/app.js && node --check public/markdown-preview.js && node --check public/math-render.js",
-    "test": "npm run check",
+    "check": "node --check server.js && node --check tunnel-client.js && node --check public/app.js && node --check public/session-popout.js && node --check public/markdown-preview.js && node --check public/math-render.js",
+    "test": "npm run check && node --test",
     "prepack": "npm test"
   },
   "engines": {

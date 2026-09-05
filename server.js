@@ -15,6 +15,7 @@ import pty from "node-pty";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const publicDir = path.join(__dirname, "public");
 const nodeModulesDir = path.join(__dirname, "node_modules");
+const mediaDownloadRoot = path.resolve(path.sep, "media");
 const dataDir = process.env.CODEX_WEBUI_DATA_DIR || path.join(os.homedir(), ".codex-webui");
 const stateFile = path.join(dataDir, "webui-state.json");
 const workspaceNotesFile = path.join(dataDir, "workspace-notes.json");
@@ -64,6 +65,7 @@ const mimeTypes = new Map([
   [".webmanifest", "application/manifest+json; charset=utf-8"],
   [".svg", "image/svg+xml"],
   [".png", "image/png"],
+  [".mp4", "video/mp4"],
   [".ico", "image/x-icon"]
 ]);
 
@@ -580,6 +582,58 @@ async function previewWorkspaceFile(req, res) {
   res.writeHead(range ? 206 : 200, headers);
   if (req.method === "HEAD") return res.end();
   createReadStream(cachedPath, { start, end }).pipe(res);
+}
+
+async function downloadMediaZip(req, res) {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  let requestedPath;
+  try {
+    requestedPath = decodeURIComponent(url.pathname);
+  } catch {
+    return sendError(res, 400, "Invalid download path.");
+  }
+
+  const filePath = path.resolve(requestedPath);
+  if (!isWithinDirectoryRoot(filePath, mediaDownloadRoot) || path.extname(filePath).toLowerCase() !== ".zip") {
+    return sendError(res, 403, "Only ZIP files under /media can be downloaded.");
+  }
+
+  let realFilePath;
+  let stat;
+  try {
+    realFilePath = await fs.realpath(filePath);
+    stat = await fs.stat(realFilePath);
+  } catch {
+    return sendError(res, 404, "Download file was not found.");
+  }
+  if (!isWithinDirectoryRoot(realFilePath, mediaDownloadRoot) || !stat.isFile()) {
+    return sendError(res, 403, "Invalid download file.");
+  }
+
+  const range = parseByteRange(req.headers.range, stat.size);
+  if (req.headers.range && !range) {
+    res.writeHead(416, {
+      "content-range": `bytes */${stat.size}`,
+      "accept-ranges": "bytes",
+      "cache-control": "private, no-store"
+    });
+    return res.end();
+  }
+
+  const start = range?.start ?? 0;
+  const end = range?.end ?? Math.max(0, stat.size - 1);
+  const headers = {
+    "content-type": "application/zip",
+    "content-length": range ? end - start + 1 : stat.size,
+    "content-disposition": `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(realFilePath))}`,
+    "cache-control": "private, no-store",
+    "x-content-type-options": "nosniff",
+    "accept-ranges": "bytes"
+  };
+  if (range) headers["content-range"] = `bytes ${start}-${end}/${stat.size}`;
+  res.writeHead(range ? 206 : 200, headers);
+  if (req.method === "HEAD" || stat.size === 0) return res.end();
+  createReadStream(realFilePath, range ? { start, end } : undefined).pipe(res);
 }
 
 function visualizationHostStyle(theme) {
@@ -3158,6 +3212,30 @@ async function serveStatic(req, res) {
   }
 
   const ext = path.extname(filePath);
+  if (ext === ".mp4") {
+    const stat = await fs.stat(filePath);
+    const range = parseByteRange(req.headers.range, stat.size);
+    if (req.headers.range && !range) {
+      res.writeHead(416, {
+        "content-range": `bytes */${stat.size}`,
+        "accept-ranges": "bytes",
+        "cache-control": "no-store"
+      });
+      return res.end();
+    }
+    const start = range?.start ?? 0;
+    const end = range?.end ?? Math.max(0, stat.size - 1);
+    const headers = {
+      "content-type": "video/mp4",
+      "content-length": range ? end - start + 1 : stat.size,
+      "accept-ranges": "bytes",
+      "cache-control": "no-store"
+    };
+    if (range) headers["content-range"] = `bytes ${start}-${end}/${stat.size}`;
+    res.writeHead(range ? 206 : 200, headers);
+    if (req.method === "HEAD") return res.end();
+    return createReadStream(filePath, range ? { start, end } : undefined).pipe(res);
+  }
   res.writeHead(200, {
     "content-type": mimeTypes.get(ext) || "application/octet-stream",
     "cache-control": "no-store"
@@ -3248,6 +3326,9 @@ async function route(req, res) {
     if (req.method === "POST" && pathname === "/api/terminal/run") return await runTerminalCommand(req, res);
     if (req.method === "POST" && pathname === "/api/codex/run") return await runCodexStream(req, res);
     if (pathname.startsWith("/api/")) return sendError(res, 404, "Unknown API route.");
+    if (["GET", "HEAD"].includes(req.method) && pathname.startsWith("/media/")) {
+      return await downloadMediaZip(req, res);
+    }
     return await serveStatic(req, res);
   } catch (error) {
     if (res.headersSent) {

@@ -573,6 +573,14 @@ const state = {
   editingRequest: null
 };
 
+const sessionPopouts = new Map();
+const sessionPopoutChannel = typeof BroadcastChannel === "function"
+  ? new BroadcastChannel("codex-webui:session-popouts")
+  : null;
+let sessionPictureInPicture = null;
+let sessionPictureInPictureFailure = "";
+let sessionDocumentPictureInPicture = null;
+
 let deferredInstallPrompt = null;
 let appInstallCompleted = false;
 let workspaceNoteSaveTimer = null;
@@ -582,6 +590,8 @@ let workspaceNoteSocket = null;
 let workspaceNoteReconnectTimer = null;
 let workspaceNoteDrag = null;
 let workspaceNoteResizeObserver = null;
+let sessionDrawerSwipe = null;
+let sessionDrawerHideTimer = null;
 
 if (!["mcp", "skills"].includes(state.settingsTab)) {
   state.settingsTab = "mcp";
@@ -747,6 +757,350 @@ function sessionRun(session = activeSession()) {
   if (!session) return null;
   return state.sessionRuns[session.id] || (session.codexThreadId ? state.sessionRuns[session.codexThreadId] : null) || null;
 }
+
+function latestAssistantText(session) {
+  return String((session?.messages || []).findLast((message) => message.role === "assistant")?.content || "");
+}
+
+function sessionPopoutSnapshot(session) {
+  const presentation = sessionRunPresentation(session);
+  const responseTail = Array.from(latestAssistantText(session)).slice(-512).join("");
+  return {
+    type: "codex-webui:session-popout",
+    sessionId: session.id,
+    title: displaySessionTitle(session),
+    status: presentation.label,
+    statusKey: presentation.key,
+    text: responseTail,
+    updatedAt: session.updatedAt || new Date().toISOString()
+  };
+}
+
+function appleMobileBrowser() {
+  return /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+}
+
+function plainPopoutText(value) {
+  return String(value || "")
+    .replace(/\uE200visualize\uE202[^\r\n]*\uE201/g, "")
+    .replace(/```[^\n]*\n?/g, "")
+    .replace(/[`*_>#~-]+/g, " ")
+    .replace(/\[([^\]]*)\]\([^)]+\)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function recentPopoutText(value, limit = 96) {
+  const characters = Array.from(plainPopoutText(value));
+  return characters.length > limit ? `…${characters.slice(-limit).join("")}` : characters.join("");
+}
+
+function documentPictureInPictureSupported() {
+  return !appleMobileBrowser() && "documentPictureInPicture" in window;
+}
+
+function drawSessionDocumentPictureInPicture(snapshot) {
+  const pip = sessionDocumentPictureInPicture;
+  if (!pip || pip.sessionId !== snapshot.sessionId || pip.window.closed) return;
+  const documentNode = pip.window.document;
+  const titleNode = documentNode.querySelector("[data-session-title]");
+  const statusNode = documentNode.querySelector("[data-session-status]");
+  const statusDot = documentNode.querySelector("[data-status-dot]");
+  const responseNode = documentNode.querySelector("[data-response]");
+  const updatedNode = documentNode.querySelector("[data-updated-at]");
+  const text = recentPopoutText(snapshot.text);
+  documentNode.documentElement.classList.toggle("theme-dark", state.theme === "dark");
+  documentNode.documentElement.classList.toggle("theme-light", state.theme !== "dark");
+  documentNode.title = `${snapshot.title || "Codex 回复"} · Codex`;
+  if (titleNode) titleNode.textContent = snapshot.title || "Codex 会话";
+  if (statusNode) statusNode.textContent = snapshot.status || "已完成";
+  if (statusDot) statusDot.className = `status-dot ${snapshot.statusKey || "completed"}`;
+  if (responseNode) responseNode.textContent = text || (snapshot.statusKey === "running" ? "Codex 正在思考…" : "暂无回复");
+  const updatedAt = new Date(snapshot.updatedAt || Date.now());
+  if (updatedNode) {
+    updatedNode.textContent = Number.isFinite(updatedAt.getTime())
+      ? updatedAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+      : "";
+  }
+}
+
+async function openSessionDocumentPictureInPicture(session) {
+  if (!documentPictureInPictureSupported()) return false;
+  if (sessionDocumentPictureInPicture && !sessionDocumentPictureInPicture.window.closed) {
+    sessionDocumentPictureInPicture.sessionId = session.id;
+    drawSessionDocumentPictureInPicture(sessionPopoutSnapshot(session));
+    sessionDocumentPictureInPicture.window.focus();
+    return true;
+  }
+  try {
+    const pipWindow = await window.documentPictureInPicture.requestWindow({
+      width: 380,
+      height: 230,
+      disallowReturnToOpener: true
+    });
+    const pipDocument = pipWindow.document;
+    pipDocument.documentElement.lang = "zh-CN";
+    pipDocument.documentElement.classList.add(state.theme === "dark" ? "theme-dark" : "theme-light");
+    pipDocument.head.innerHTML = `
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <meta name="color-scheme" content="light dark">
+      <title>Codex 回复</title>
+      <link rel="stylesheet" href="/session-popout.css">`;
+    pipDocument.body.innerHTML = `
+      <main class="popout-shell document-pip">
+        <header>
+          <span class="status-dot" data-status-dot aria-hidden="true"></span>
+          <div class="heading">
+            <strong data-session-title>Codex 会话</strong>
+            <span data-session-status role="status">正在连接…</span>
+          </div>
+        </header>
+        <p class="response" data-response aria-live="polite">等待 Codex 回复…</p>
+        <footer><time data-updated-at></time><span>最近 96 字</span></footer>
+      </main>`;
+    const pip = { window: pipWindow, sessionId: session.id };
+    sessionDocumentPictureInPicture = pip;
+    pipWindow.addEventListener("pagehide", () => {
+      if (sessionDocumentPictureInPicture === pip) sessionDocumentPictureInPicture = null;
+    }, { once: true });
+    drawSessionDocumentPictureInPicture(sessionPopoutSnapshot(session));
+    return true;
+  } catch (error) {
+    console.warn("Codex Document Picture in Picture could not start", error);
+    return false;
+  }
+}
+
+function drawSessionPictureInPicture(snapshot) {
+  const pip = sessionPictureInPicture;
+  if (!pip || pip.sessionId !== snapshot.sessionId) return;
+  const title = Array.from(String(snapshot.title || "Codex 会话")).slice(0, 24).join("");
+  const reply = recentPopoutText(snapshot.text, 88)
+    || (snapshot.statusKey === "running" ? "Codex 正在思考…" : "暂无回复");
+  const cueText = `${title} · ${snapshot.status || "已完成"}\n${reply}`;
+  try {
+    if (pip.cue) pip.textTrack.removeCue(pip.cue);
+    const cue = new VTTCue(0, 60 * 60, cueText);
+    cue.align = "center";
+    cue.position = 50;
+    cue.size = 92;
+    pip.textTrack.addCue(cue);
+    pip.textTrack.mode = "showing";
+    pip.cue = cue;
+  } catch (error) {
+    console.warn("Codex Picture in Picture captions could not update", error);
+  }
+}
+
+function releaseSessionPictureInPicture(pip = sessionPictureInPicture) {
+  if (!pip || pip !== sessionPictureInPicture) return;
+  sessionPictureInPicture = null;
+  pip.video.pause();
+  pip.video.removeAttribute("src");
+  pip.video.load();
+  pip.video.remove();
+}
+
+function prepareSessionPictureInPicture(session) {
+  const snapshot = sessionPopoutSnapshot(session);
+  if (sessionPictureInPicture) {
+    sessionPictureInPicture.sessionId = session.id;
+    drawSessionPictureInPicture(snapshot);
+    return sessionPictureInPicture;
+  }
+
+  const video = document.createElement("video");
+  video.className = "session-pip-source";
+  video.muted = true;
+  video.autoplay = true;
+  video.loop = true;
+  video.preload = "auto";
+  video.playsInline = true;
+  video.setAttribute("playsinline", "");
+  video.src = "/session-pip.mp4";
+  const textTrack = video.addTextTrack("captions", "Codex 回复", "zh-CN");
+  textTrack.mode = "showing";
+  document.body.append(video);
+  const pip = { sessionId: session.id, video, textTrack, cue: null, playPromise: null };
+  sessionPictureInPicture = pip;
+  drawSessionPictureInPicture(snapshot);
+  pip.playPromise = video.play();
+  pip.playPromise.catch(() => {});
+  return pip;
+}
+
+async function openSessionPictureInPicture(session) {
+  sessionPictureInPictureFailure = "";
+  const pip = prepareSessionPictureInPicture(session);
+  if (!pip) {
+    sessionPictureInPictureFailure = "NotSupportedError";
+    return false;
+  }
+  const { video } = pip;
+  const active = document.pictureInPictureElement === video
+    || video.webkitPresentationMode === "picture-in-picture";
+  if (active) return true;
+
+  try {
+    if (typeof video.requestPictureInPicture === "function" && document.pictureInPictureEnabled !== false) {
+      try {
+        const pictureInPicturePromise = video.requestPictureInPicture();
+        await Promise.all([pip.playPromise, pictureInPicturePromise]);
+      } catch (standardError) {
+        if (
+          typeof video.webkitSupportsPresentationMode === "function"
+          && video.webkitSupportsPresentationMode("picture-in-picture")
+          && typeof video.webkitSetPresentationMode === "function"
+        ) {
+          video.webkitSetPresentationMode("picture-in-picture");
+          await pip.playPromise;
+        } else {
+          throw standardError;
+        }
+      }
+    } else if (
+      typeof video.webkitSupportsPresentationMode === "function"
+      && video.webkitSupportsPresentationMode("picture-in-picture")
+      && typeof video.webkitSetPresentationMode === "function"
+    ) {
+      video.webkitSetPresentationMode("picture-in-picture");
+      await pip.playPromise;
+    } else {
+      sessionPictureInPictureFailure = "NotSupportedError";
+      releaseSessionPictureInPicture(pip);
+      return false;
+    }
+  } catch (error) {
+    sessionPictureInPictureFailure = error?.name || "UnknownError";
+    releaseSessionPictureInPicture(pip);
+    console.warn("Codex Picture in Picture could not start", error);
+    return false;
+  }
+
+  video.addEventListener("leavepictureinpicture", () => releaseSessionPictureInPicture(pip), { once: true });
+  video.addEventListener("webkitpresentationmodechanged", () => {
+    if (video.webkitPresentationMode !== "picture-in-picture") releaseSessionPictureInPicture(pip);
+  });
+  return true;
+}
+
+function prepareSessionPictureInPictureFromPointer(event) {
+  if (!appleMobileBrowser()) return;
+  const button = event.target instanceof Element
+    ? event.target.closest("[data-popout-session], [data-action='open-session-popout']")
+    : null;
+  if (!button) return;
+  const sessionId = button.dataset.popoutSession || activeSession()?.id;
+  const session = mergedSessions().find((item) => item.id === sessionId);
+  if (session) prepareSessionPictureInPicture(session);
+}
+
+function publishSessionPopout(session) {
+  if (!session?.id) return;
+  const snapshot = sessionPopoutSnapshot(session);
+  drawSessionDocumentPictureInPicture(snapshot);
+  drawSessionPictureInPicture(snapshot);
+  sessionPopoutChannel?.postMessage(snapshot);
+  const popup = sessionPopouts.get(session.id);
+  if (!popup || popup.closed) {
+    sessionPopouts.delete(session.id);
+    return;
+  }
+  try {
+    popup.postMessage(snapshot, location.origin);
+  } catch {
+    // BroadcastChannel remains available when direct opener messaging is blocked.
+  }
+}
+
+async function syncSessionPopout(sessionId) {
+  let session = state.sessions.find((item) => item.id === sessionId);
+  if ((!session || !session.messages?.length) && isUuid(sessionId)) {
+    try {
+      const payload = await api(`/api/codex/sessions/${encodeURIComponent(sessionId)}`);
+      if (session) Object.assign(session, payload.session, { hostId: "local-codex", source: "codex" });
+      else {
+        session = { ...payload.session, hostId: "local-codex", source: "codex" };
+        state.sessions.unshift(session);
+      }
+    } catch {
+      // A just-created Codex session may not have reached disk yet.
+    }
+  }
+  session ||= mergedSessions().find((item) => item.id === sessionId);
+  if (!session) return;
+  publishSessionPopout(session);
+  if (runIsActive(sessionRun(session))) {
+    attachSessionRun(session).catch((error) => console.warn("Codex popout run reconnect failed", error));
+  }
+}
+
+async function openSessionPopout(sessionId = activeSession()?.id) {
+  const session = mergedSessions().find((item) => item.id === sessionId);
+  if (!session) {
+    toast("请先选择一个会话");
+    return;
+  }
+  if (appleMobileBrowser()) {
+    const opened = await openSessionPictureInPicture(session);
+    if (!opened) {
+      const message = sessionPictureInPictureFailure === "InvalidStateError"
+        ? "画中画视频正在准备，请再点一次"
+        : sessionPictureInPictureFailure === "NotAllowedError"
+          ? "Safari 未允许此次画中画，请直接再点一次"
+          : sessionPictureInPictureFailure === "NotSupportedError"
+            ? "当前打开方式不支持画中画，请使用 Safari 打开"
+            : `画中画启动失败（${sessionPictureInPictureFailure || "未知原因"}）`;
+      toast(message);
+      return;
+    }
+    toast("已进入画中画；iPhone 同时显示一个会话");
+    syncSessionPopout(session.id).catch((error) => console.warn("Codex popout sync failed", error));
+    return;
+  }
+  if (documentPictureInPictureSupported()) {
+    const opened = await openSessionDocumentPictureInPicture(session);
+    if (!opened) {
+      toast("无法启动无地址栏悬浮窗，请检查浏览器的画中画权限");
+      return;
+    }
+    syncSessionPopout(session.id).catch((error) => console.warn("Codex popout sync failed", error));
+    return;
+  }
+  const existing = sessionPopouts.get(session.id);
+  if (existing && !existing.closed) {
+    existing.focus();
+    publishSessionPopout(session);
+    return;
+  }
+  const width = 380;
+  const height = 230;
+  const left = Math.max(0, (window.screenX || 0) + window.outerWidth - width - 24);
+  const top = Math.max(0, (window.screenY || 0) + 72);
+  const url = `/session-popout.html?session=${encodeURIComponent(session.id)}`;
+  const name = `codex-session-${String(session.id).replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+  const popup = window.open(url, name, `popup=yes,width=${width},height=${height},left=${left},top=${top},resizable=yes,scrollbars=no`);
+  if (!popup) {
+    toast("浏览器阻止了弹窗，请允许此站点打开弹窗");
+    return;
+  }
+  sessionPopouts.set(session.id, popup);
+  popup.focus();
+  setTimeout(() => publishSessionPopout(session), 150);
+  syncSessionPopout(session.id).catch((error) => console.warn("Codex popout sync failed", error));
+}
+
+function handleSessionPopoutMessage(event) {
+  if (event.data?.type !== "codex-webui:session-popout-ready") return;
+  syncSessionPopout(event.data.sessionId).catch((error) => console.warn("Codex popout sync failed", error));
+}
+
+sessionPopoutChannel?.addEventListener("message", handleSessionPopoutMessage);
+window.addEventListener("message", (event) => {
+  if (event.origin === location.origin) handleSessionPopoutMessage(event);
+});
 
 function runIsActive(run = sessionRun()) {
   return ["starting", "running", "pausing", "reconnecting"].includes(run?.status);
@@ -1969,6 +2323,15 @@ function renderTopbar() {
     browserFullscreenToggle.setAttribute("aria-pressed", String(browserFullscreen));
     browserFullscreenToggle.innerHTML = browserFullscreen ? iconBrowserFullscreenExit : iconBrowserFullscreenEnter;
   }
+  const popoutToggle = $(".topbar-popout-toggle");
+  if (popoutToggle) {
+    const label = appleMobileBrowser() ? "画中画显示当前会话"
+      : documentPictureInPictureSupported() ? "悬浮显示当前会话" : "弹出当前会话";
+    popoutToggle.hidden = state.activeView !== "console" || !session;
+    popoutToggle.innerHTML = iconPopout;
+    popoutToggle.title = label;
+    popoutToggle.setAttribute("aria-label", label);
+  }
   const terminalToggle = $(".topbar-terminal-toggle");
   if (terminalToggle) {
     const showTerminalToggle = state.activeView === "console" && Boolean(session);
@@ -2729,11 +3092,16 @@ function renderSessionItem(item, active) {
   const presentation = sessionRunPresentation(item);
   const runStatus = presentation.label;
   const runClass = presentation.className;
+  const popoutLabel = appleMobileBrowser() ? "画中画显示"
+    : documentPictureInPictureSupported() ? "悬浮显示" : "弹出回复小窗";
   return `
     <div class="session-item ${item.id === active?.id ? "active" : ""}" data-run-status="${runClass}">
       <button class="session-item-select" type="button" data-session-id="${item.id}" title="${escapeHtml(title)}">
         <span class="session-title">${escapeHtml(title)}</span>
         <span class="session-run-status ${runClass}">${runStatus}</span>
+      </button>
+      <button class="session-item-action session-popout-action" type="button" data-popout-session="${escapeHtml(item.id)}" data-keep-enabled="true" title="${popoutLabel}" aria-label="${popoutLabel}：${escapeHtml(title)}">
+        ${iconPopout}
       </button>
       <button class="session-item-action" type="button" data-delete-session="${escapeHtml(item.id)}" title="${actionLabel}" aria-label="${actionLabel}">
         ${isCodex ? iconArchive : iconTrash}
@@ -2759,6 +3127,10 @@ function renderSessionDrawer() {
       <button class="button ghost" type="button" data-nav="true" data-nav-target="settings">设置</button>
     </div>
   `, ".session-drawer-body");
+  if (sessionDrawerSwipe?.dragging) {
+    renderSessionFilterLayer();
+    return;
+  }
   drawer.classList.toggle("open", state.sessionDrawerOpen);
   drawer.setAttribute("aria-hidden", state.sessionDrawerOpen ? "false" : "true");
   backdrop.hidden = !state.sessionDrawerOpen;
@@ -2813,8 +3185,149 @@ function isMobileViewport() {
 }
 
 function setSessionDrawerOpen(open) {
+  if (sessionDrawerHideTimer) {
+    clearTimeout(sessionDrawerHideTimer);
+    sessionDrawerHideTimer = null;
+  }
   state.sessionDrawerOpen = Boolean(open);
   renderSessionDrawer();
+}
+
+function sessionDrawerSwipeTarget(target, mode) {
+  if (!(target instanceof Element)) return null;
+  if (mode === "closing") {
+    const drawer = target.closest("[data-session-drawer]");
+    if (!drawer || target.closest("input, textarea, select, [contenteditable='true']")) return null;
+    return drawer;
+  }
+  const transcript = target.closest(".transcript");
+  if (!transcript?.closest('[data-view="console"].active')) return null;
+  if (target.closest("button, a, input, textarea, select, [contenteditable='true'], pre, code, iframe, .visualization-embed")) return null;
+  return transcript;
+}
+
+function canStartSessionDrawerSwipe(event) {
+  const mode = state.sessionDrawerOpen ? "closing" : "opening";
+  return event.touches.length === 1
+    && isMobileViewport()
+    && state.activeView === "console"
+    && !state.newSessionSheetOpen
+    && !state.directoryPicker.open
+    && !state.promptFullscreenKey
+    && !state.workspaceNoteOpen
+    && !state.approvals.length
+    && Boolean(sessionDrawerSwipeTarget(event.target, mode));
+}
+
+function beginSessionDrawerSwipe(event) {
+  if (!canStartSessionDrawerSwipe(event)) return;
+  const touch = event.touches[0];
+  const mode = state.sessionDrawerOpen ? "closing" : "opening";
+  sessionDrawerSwipe = {
+    mode,
+    identifier: touch.identifier,
+    startX: touch.clientX,
+    startY: touch.clientY,
+    lastX: touch.clientX,
+    lastTime: event.timeStamp,
+    velocityX: 0,
+    distance: 0,
+    width: 0,
+    dragging: false
+  };
+}
+
+function activateSessionDrawerSwipe() {
+  if (!sessionDrawerSwipe || sessionDrawerSwipe.dragging) return;
+  const drawer = $("[data-session-drawer]");
+  const backdrop = $("[data-session-drawer-backdrop]");
+  if (!drawer || !backdrop) {
+    sessionDrawerSwipe = null;
+    return;
+  }
+  if (sessionDrawerHideTimer) {
+    clearTimeout(sessionDrawerHideTimer);
+    sessionDrawerHideTimer = null;
+  }
+  sessionDrawerSwipe.dragging = true;
+  sessionDrawerSwipe.width = drawer.getBoundingClientRect().width || Math.min(window.innerWidth * 0.86, 360);
+  drawer.classList.add("dragging");
+  drawer.setAttribute("aria-hidden", "false");
+  backdrop.hidden = false;
+  backdrop.classList.add("dragging");
+  document.body.classList.add("session-drawer-dragging");
+}
+
+function updateSessionDrawerSwipe(event) {
+  if (!sessionDrawerSwipe) return;
+  const touch = touchByIdentifier(event.touches, sessionDrawerSwipe.identifier);
+  if (!touch) return;
+  const deltaX = touch.clientX - sessionDrawerSwipe.startX;
+  const deltaY = touch.clientY - sessionDrawerSwipe.startY;
+  if (!sessionDrawerSwipe.dragging) {
+    if (Math.hypot(deltaX, deltaY) < 10) return;
+    const expectedDirection = sessionDrawerSwipe.mode === "opening" ? deltaX > 0 : deltaX < 0;
+    if (!expectedDirection || Math.abs(deltaX) < Math.abs(deltaY) * 1.15) {
+      sessionDrawerSwipe = null;
+      return;
+    }
+    activateSessionDrawerSwipe();
+    if (!sessionDrawerSwipe) return;
+  }
+  event.preventDefault();
+  const now = event.timeStamp;
+  const elapsed = Math.max(1, now - sessionDrawerSwipe.lastTime);
+  sessionDrawerSwipe.velocityX = (touch.clientX - sessionDrawerSwipe.lastX) / elapsed;
+  sessionDrawerSwipe.lastX = touch.clientX;
+  sessionDrawerSwipe.lastTime = now;
+  const revealedDistance = sessionDrawerSwipe.mode === "opening"
+    ? deltaX
+    : sessionDrawerSwipe.width + deltaX;
+  sessionDrawerSwipe.distance = Math.min(sessionDrawerSwipe.width, Math.max(0, revealedDistance));
+  const progress = sessionDrawerSwipe.width ? sessionDrawerSwipe.distance / sessionDrawerSwipe.width : 0;
+  const drawer = $("[data-session-drawer]");
+  const backdrop = $("[data-session-drawer-backdrop]");
+  drawer?.style.setProperty("--session-drawer-drag-x", `${sessionDrawerSwipe.distance}px`);
+  backdrop?.style.setProperty("--session-drawer-drag-progress", String(progress));
+}
+
+function finishSessionDrawerSwipe(event, cancelled = false) {
+  if (!sessionDrawerSwipe) return;
+  const endedTouch = event?.changedTouches
+    ? touchByIdentifier(event.changedTouches, sessionDrawerSwipe.identifier)
+    : null;
+  if (event?.changedTouches && !endedTouch) return;
+  const gesture = sessionDrawerSwipe;
+  sessionDrawerSwipe = null;
+  if (!gesture.dragging) return;
+  event?.preventDefault?.();
+  const releaseVelocity = event && event.timeStamp - gesture.lastTime > 100 ? 0 : gesture.velocityX;
+  const hiddenDistance = gesture.width - gesture.distance;
+  const shouldOpen = cancelled
+    ? gesture.mode === "closing"
+    : gesture.mode === "opening"
+      ? gesture.distance >= gesture.width * 0.34
+        || (gesture.distance >= 24 && releaseVelocity >= 0.5)
+      : !(hiddenDistance >= gesture.width * 0.34
+        || (hiddenDistance >= 24 && releaseVelocity <= -0.5));
+  const drawer = $("[data-session-drawer]");
+  const backdrop = $("[data-session-drawer-backdrop]");
+  drawer?.classList.remove("dragging");
+  drawer?.style.removeProperty("--session-drawer-drag-x");
+  drawer?.classList.toggle("open", shouldOpen);
+  drawer?.setAttribute("aria-hidden", shouldOpen ? "false" : "true");
+  backdrop?.classList.remove("dragging");
+  backdrop?.style.removeProperty("--session-drawer-drag-progress");
+  backdrop?.classList.toggle("open", shouldOpen);
+  document.body.classList.remove("session-drawer-dragging");
+  document.body.classList.toggle("session-drawer-open", shouldOpen);
+  state.sessionDrawerOpen = shouldOpen;
+  if (!shouldOpen && backdrop) {
+    sessionDrawerHideTimer = setTimeout(() => {
+      sessionDrawerHideTimer = null;
+      if (!state.sessionDrawerOpen && !sessionDrawerSwipe) backdrop.hidden = true;
+    }, 190);
+  }
 }
 
 function toggleSessionDrawer() {
@@ -2982,6 +3495,7 @@ const iconBrowserFullscreenEnter = `<svg viewBox="0 0 24 24" width="17" height="
 const iconBrowserFullscreenExit = `<svg viewBox="0 0 24 24" width="17" height="17" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3v5H3M16 3v5h5M21 16h-5v5M3 16h5v5"/></svg>`;
 const iconBackArrow = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5m6-7-7 7 7 7"/></svg>`;
 const iconTrash = `<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4.5 6.5h15M9.5 6.5v-1a1.5 1.5 0 0 1 1.5-1.5h2a1.5 1.5 0 0 1 1.5 1.5v1M6.5 6.5l.8 12a2 2 0 0 0 2 1.9h5.4a2 2 0 0 0 2-1.9l.8-12M10 10.5v6M14 10.5v6"/></svg>`;
+const iconPopout = `<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="7" width="13" height="13" rx="2"/><path d="M10 4h10v10M20 4l-9 9"/></svg>`;
 
 function approvalOptions() {
   return [
@@ -4070,6 +4584,7 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort, editi
   savePromptDraft(sessionKey, "");
   state.promptFullscreenKey = null;
   renderConsole();
+  publishSessionPopout(session);
 
   const streamedItemIds = new Set();
   let activeDeltaItemId = null;
@@ -4079,6 +4594,7 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort, editi
     renderTimer = setTimeout(() => {
       renderTimer = null;
       updateLastAssistantMessage(assistant.content, session);
+      publishSessionPopout(session);
     }, 100);
   };
 
@@ -4098,17 +4614,22 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort, editi
       signal: run.controller.signal,
       onEvent(eventPayload) {
         if (eventPayload.sequence) run.lastSequence = eventPayload.sequence;
-        if (handleApprovalEvent(eventPayload)) return;
+        if (handleApprovalEvent(eventPayload)) {
+          publishSessionPopout(session);
+          return;
+        }
         if (handleConversationImages(eventPayload, assistant, session)) return;
         if (eventPayload.type === "webui.run") {
           run.id = eventPayload.runId;
           run.status = eventPayload.status || "starting";
+          publishSessionPopout(session);
           renderSidebarContent();
           renderSessionDrawer();
           return;
         }
         if (eventPayload.type === "webui.started") {
           run.status = "running";
+          publishSessionPopout(session);
           updateActiveComposerState();
           return;
         }
@@ -4124,12 +4645,14 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort, editi
         }
         if (eventPayload.type === "webui.status") {
           run.status = eventPayload.status || run.status;
+          publishSessionPopout(session);
           updateActiveComposerState();
           return;
         }
         if (eventPayload.type === "webui.finished") {
           run.status = eventPayload.status || (Number(eventPayload.code) === 0 ? "completed" : "failed");
           if (run.status === "paused") markTurnInterrupted(session, run.turnId);
+          publishSessionPopout(session);
           return;
         }
         if (eventPayload.type === "webui.thread" && isUuid(eventPayload.threadId)) {
@@ -4181,6 +4704,7 @@ async function sendPrompt({ prompt, cwd, sandbox, approval, model, effort, editi
     if (renderTimer) clearTimeout(renderTimer);
     renderTimer = null;
     updateLastAssistantMessage(assistant.content, session);
+    publishSessionPopout(session);
     run.controller = null;
     await refreshRunStatuses();
     saveSessions();
@@ -4202,6 +4726,7 @@ async function stopActiveRun() {
     return;
   }
   run.status = "pausing";
+  publishSessionPopout(activeSession());
   updateActiveComposerState();
   renderSidebarContent();
   renderSessionDrawer();
@@ -4263,6 +4788,7 @@ function adoptCodexThread(session, threadId) {
   session.codexThreadId = threadId;
   if (session.id === threadId) return;
   const previousId = session.id;
+  const previousPopup = sessionPopouts.get(previousId);
   const wasActive = state.activeSessionId === previousId;
   const run = state.sessionRuns[previousId];
   session.id = threadId;
@@ -4274,6 +4800,30 @@ function adoptCodexThread(session, threadId) {
     run.threadId = threadId;
     state.sessionRuns[threadId] = run;
     delete state.sessionRuns[previousId];
+  }
+  if (previousPopup && !previousPopup.closed) {
+    sessionPopouts.delete(previousId);
+    sessionPopouts.set(threadId, previousPopup);
+  }
+  if (sessionPictureInPicture?.sessionId === previousId) {
+    sessionPictureInPicture.sessionId = threadId;
+  }
+  if (sessionDocumentPictureInPicture?.sessionId === previousId) {
+    sessionDocumentPictureInPicture.sessionId = threadId;
+  }
+  sessionPopoutChannel?.postMessage({
+    type: "codex-webui:session-popout-moved",
+    fromSessionId: previousId,
+    sessionId: threadId
+  });
+  try {
+    previousPopup?.postMessage({
+      type: "codex-webui:session-popout-moved",
+      fromSessionId: previousId,
+      sessionId: threadId
+    }, location.origin);
+  } catch {
+    // BroadcastChannel normally carries the migration message.
   }
   moveSessionAttachments(previousId, threadId);
   if (Object.prototype.hasOwnProperty.call(state.promptDrafts, previousId)) {
@@ -4400,6 +4950,7 @@ async function attachSessionRun(session) {
     renderTimer = setTimeout(() => {
       renderTimer = null;
       updateLastAssistantMessage(assistant.content, session);
+      publishSessionPopout(session);
     }, 100);
   };
   try {
@@ -4407,10 +4958,16 @@ async function attachSessionRun(session) {
     if (!response.ok || !response.body) throw new Error("无法重新连接后台任务。");
     await consumeCodexEventResponse(response, (eventPayload) => {
       if (eventPayload.sequence) run.lastSequence = eventPayload.sequence;
-      if (handleApprovalEvent(eventPayload)) return;
+      if (handleApprovalEvent(eventPayload)) {
+        publishSessionPopout(session);
+        return;
+      }
       if (handleConversationImages(eventPayload, assistant, session)) return;
       if (eventPayload.type === "webui.run") run.id = eventPayload.runId || run.id;
-      if (eventPayload.type === "webui.started") run.status = "running";
+      if (eventPayload.type === "webui.started") {
+        run.status = "running";
+        publishSessionPopout(session);
+      }
       if (eventPayload.type === "webui.turn") {
         run.turnId = eventPayload.turnId || run.turnId;
         assistant.turnId = run.turnId;
@@ -4418,10 +4975,14 @@ async function attachSessionRun(session) {
         if (user) user.turnId = run.turnId;
         return;
       }
-      if (eventPayload.type === "webui.status") run.status = eventPayload.status || run.status;
+      if (eventPayload.type === "webui.status") {
+        run.status = eventPayload.status || run.status;
+        publishSessionPopout(session);
+      }
       if (eventPayload.type === "webui.finished") {
         run.status = eventPayload.status || (Number(eventPayload.code) === 0 ? "completed" : "failed");
         if (run.status === "paused") markTurnInterrupted(session, run.turnId);
+        publishSessionPopout(session);
         return;
       }
       if (eventPayload.type === "webui.thread" && isUuid(eventPayload.threadId)) {
@@ -4459,6 +5020,7 @@ async function attachSessionRun(session) {
     if (renderTimer) clearTimeout(renderTimer);
     renderTimer = null;
     updateLastAssistantMessage(assistant.content, session);
+    publishSessionPopout(session);
     run.attaching = false;
     if (runIsActive(run)) await refreshRunStatuses();
     if (!runIsActive(run)) {
@@ -4534,6 +5096,7 @@ function handleConversationImages(eventPayload, message, session) {
     .filter((attachment, index, items) => items.findIndex((item) => item.url === attachment.url) === index);
   session.updatedAt = new Date().toISOString();
   updateLastAssistantMessage(message.content, session, message.attachments);
+  publishSessionPopout(session);
   return true;
 }
 
@@ -6013,6 +6576,11 @@ async function handleDocumentClick(event) {
     return;
   }
 
+  if (button.dataset.popoutSession) {
+    await openSessionPopout(button.dataset.popoutSession);
+    return;
+  }
+
   if (button.dataset.sessionActivityFilter) {
     state.sessionActivityFilter = button.dataset.sessionActivityFilter;
     renderSessionSurfaces();
@@ -6295,6 +6863,9 @@ async function handleDocumentClick(event) {
       break;
     case "toggle-browser-fullscreen":
       await toggleBrowserFullscreen();
+      break;
+    case "open-session-popout":
+      await openSessionPopout();
       break;
     case "toggle-workspace-note":
       setWorkspaceNoteOpen(!state.workspaceNoteOpen);
@@ -6581,6 +7152,7 @@ function syncMobileViewport() {
 }
 
 document.addEventListener("click", recordOperationControlClick, true);
+document.addEventListener("pointerdown", prepareSessionPictureInPictureFromPointer, true);
 document.addEventListener("click", (event) => {
   handleDocumentClick(event).catch(reportClientError);
 });
@@ -6629,9 +7201,13 @@ document.addEventListener("cancel", (event) => {
 document.addEventListener("touchstart", handleTranscriptTouchStart, { passive: true });
 document.addEventListener("touchmove", handleTranscriptTouchMove, { passive: true });
 document.addEventListener("touchend", handleTranscriptTouchEnd, { passive: true });
+document.addEventListener("touchstart", beginSessionDrawerSwipe, { passive: true });
+document.addEventListener("touchmove", updateSessionDrawerSwipe, { passive: false });
+document.addEventListener("touchend", finishSessionDrawerSwipe, { passive: false });
 document.addEventListener("touchcancel", () => {
   pullUpRefreshGesture = null;
   resetPullUpRefreshIndicator();
+  finishSessionDrawerSwipe(null, true);
 }, { passive: true });
 document.addEventListener("pointerdown", handleWorkspaceNoteDragStart);
 document.addEventListener("pointermove", handleWorkspaceNoteDragMove);

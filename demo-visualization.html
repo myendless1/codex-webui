@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <title>HTML 可视化示例</title>
+    <style>
+      body {
+        margin: 0;
+        color: var(--foreground, #1a1c1f);
+        background: transparent;
+        font-family: system-ui, sans-serif;
+      }
+      .demo { padding: 14px; }
+      h2 { margin: 0 0 14px; font-size: 17px; }
+      .row {
+        display: grid;
+        grid-template-columns: 64px 1fr 48px;
+        gap: 10px;
+        align-items: center;
+        margin: 12px 0;
+      }
+      .track {
+        height: 12px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: var(--muted, #ececec);
+      }
+      .bar {
+        width: var(--value);
+        height: 100%;
+        border-radius: inherit;
+        background: var(--viz-series-1, #339cff);
+        transition: width 300ms ease;
+      }
+      button {
+        margin-top: 8px;
+        padding: 7px 12px;
+        color: var(--primary-foreground, white);
+        background: var(--primary, #339cff);
+        border: 0;
+        border-radius: 7px;
+        cursor: pointer;
+      }
+    </style>
+  </head>
+  <body>
+    <main class="demo">
+      <h2>模型正确率</h2>
+      <div class="row"><span>模型 A</span><div class="track"><div class="bar" style="--value: 82%"></div></div><strong>82%</strong></div>
+      <div class="row"><span>模型 B</span><div class="track"><div class="bar" style="--value: 71%"></div></div><strong>71%</strong></div>
+      <div class="row"><span>模型 C</span><div class="track"><div class="bar" style="--value: 64%"></div></div><strong>64%</strong></div>
+      <button type="button">切换一组数据</button>
+    </main>
+    <script>
+      const groups = [[82, 71, 64], [88, 76, 69]];
+      let selected = 0;
+      document.querySelector("button").addEventListener("click", () => {
+        selected = 1 - selected;
+        document.querySelectorAll(".bar").forEach((bar, index) => {
+          const value = groups[selected][index];
+          bar.style.setProperty("--value", `${value}%`);
+          bar.closest(".row").querySelector("strong").textContent = `${value}%`;
+        });
+      });
+    </script>
+  </body>
+</html>

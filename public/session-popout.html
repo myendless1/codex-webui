@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="light dark">
+    <script>
+      try {
+        const theme = localStorage.getItem("codex-webui:theme");
+        if (theme) document.documentElement.classList.add(theme === "dark" ? "theme-dark" : "theme-light");
+      } catch {}
+    </script>
+    <title>Codex 回复</title>
+    <link rel="icon" href="/app-icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/session-popout.css">
+  </head>
+  <body>
+    <main class="popout-shell">
+      <header>
+        <span class="status-dot" data-status-dot aria-hidden="true"></span>
+        <div class="heading">
+          <strong data-session-title>Codex 会话</strong>
+          <span data-session-status role="status">正在连接…</span>
+        </div>
+        <button type="button" data-action="open-session" title="在主窗口中打开" aria-label="在主窗口中打开会话">↗</button>
+      </header>
+      <p class="response" data-response aria-live="polite">等待 Codex 回复…</p>
+      <footer><time data-updated-at></time><span>最近 96 字</span></footer>
+    </main>
+    <script src="/session-popout.js" type="module"></script>
+  </body>
+</html>
